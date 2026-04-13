@@ -1,0 +1,13 @@
+grammar{
+    language:"test",
+    externals:[ext_a,ext_b],
+    conflicts:[
+        // Group A
+        [foo,bar],
+        // Group B
+        [baz,qux],
+    ],
+    inline:[x,y],
+}
+
+rule program{"x"}

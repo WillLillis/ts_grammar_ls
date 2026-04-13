@@ -1,0 +1,6 @@
+grammar {
+    language: "test",
+}
+
+rule program { "x" }
+// end of file comment

@@ -1,0 +1,10 @@
+grammar{language:"test"}
+
+rule   formatted_rule   {   "x"   }
+
+// tsg-format: off
+rule   unformatted   {    "keep"     }
+rule another_unformatted{   "this"   }
+// tsg-format: on
+
+rule   also_formatted   {   "y"   }

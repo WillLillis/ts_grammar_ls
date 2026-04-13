@@ -1,0 +1,13 @@
+grammar {
+    language: "test",
+    // The word token
+    word: identifier,
+    // Extra whitespace and comments
+    extras: [regexp(r"\s"), comment],
+}
+
+rule program { "x" }
+
+rule identifier { regexp(r"[a-z]+") }
+
+rule comment { token(seq("//", regexp("[^\n]*"))) }

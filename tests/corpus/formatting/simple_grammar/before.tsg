@@ -1,0 +1,10 @@
+grammar{language:"test",word:identifier,extras:[regexp(r"\s"),comment],}
+
+rule   program{repeat(_statement)}
+
+rule _statement{choice(expression,   return_statement)}
+
+rule expression { "x" }
+rule return_statement{"return"}
+rule identifier{regexp(r"[a-z]+")}
+rule comment{token(seq("//",regexp("[^\n]*")))}

@@ -1,0 +1,10 @@
+grammar {
+    language: "test",
+    precedences: [["member", call, "binary_exp"], [unary, "assign"]],
+}
+
+rule program { "x" }
+
+rule call { "c" }
+
+rule unary { "u" }

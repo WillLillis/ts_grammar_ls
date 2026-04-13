@@ -1,0 +1,12 @@
+grammar{language:"test"}
+rule _statement {
+    choice(
+        if_statement, // control flow
+        let_statement, // declarations
+        expression_statement, // expressions
+    )
+}
+rule if_statement{"if"}
+rule let_statement{"let"} // let bindings
+rule expression_statement{"expr"}
+rule program{"x"}

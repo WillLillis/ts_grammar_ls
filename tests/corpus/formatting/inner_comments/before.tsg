@@ -1,0 +1,16 @@
+grammar { language: "test" }
+rule _statement {
+    choice(
+        // Control flow
+        if_statement,
+        for_loop,
+        while_loop,
+        // Declarations
+        let_statement,
+        const_statement,
+        // Expressions
+        expression_statement,
+        return_statement,
+    )
+}
+rule program { "x" }

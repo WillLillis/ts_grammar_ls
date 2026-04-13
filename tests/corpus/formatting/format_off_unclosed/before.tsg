@@ -1,0 +1,7 @@
+grammar{language:"test"}
+
+rule   formatted   {   "x"   }
+
+// tsg-format: off
+rule   stay_messy   {    "y"     }
+rule also_messy{   "z"   }

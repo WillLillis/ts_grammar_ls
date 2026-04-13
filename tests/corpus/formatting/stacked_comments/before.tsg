@@ -1,0 +1,11 @@
+grammar{language:"test"}
+// First comment
+// Second comment
+// Third comment
+rule program{"x"}
+
+// Group A
+// More about group A
+
+// Group B
+rule identifier{regexp(r"[a-z]+")}

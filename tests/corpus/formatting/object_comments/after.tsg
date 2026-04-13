@@ -1,0 +1,12 @@
+grammar {
+    language: "test",
+}
+
+let PREC = {
+    // Arithmetic
+    ADD: 10, MUL: 11,
+    // Comparison
+    EQUAL: 6, RELATIONAL: 7,
+}
+
+rule program { "x" }
