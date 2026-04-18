@@ -319,7 +319,8 @@ fn object_field_completions(
 /// Check if the `)` at `rparen_end` closes a `grammar_config(...)` call.
 /// Walks back through the tokens to find the matching `(`, then checks
 /// if the identifier before it is `grammar_config`.
-fn is_grammar_config_call(tokens: &[Token], rparen_end: u32) -> bool {
+#[must_use]
+pub fn is_grammar_config_call(tokens: &[Token], rparen_end: u32) -> bool {
     // Find the RParen token ending at rparen_end.
     let rp_idx = tokens
         .iter()
@@ -361,6 +362,15 @@ const GRAMMAR_CONFIG_FIELDS: &[(&str, &str)] = &[
     ("word", "rule_t"),
     ("reserved", "{ [context]: list_rule_t }"),
 ];
+
+/// Look up the type of a grammar config field by name.
+#[must_use]
+pub fn grammar_config_field_type(name: &str) -> Option<&'static str> {
+    GRAMMAR_CONFIG_FIELDS
+        .iter()
+        .find(|&&(n, _)| n == name)
+        .map(|&(_, ty)| ty)
+}
 
 fn grammar_config_field_completions() -> Vec<CompletionItem> {
     GRAMMAR_CONFIG_FIELDS

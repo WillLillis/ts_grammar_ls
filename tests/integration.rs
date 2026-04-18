@@ -3098,3 +3098,29 @@ async fn hover_grammar_config_builtin() {
         ts_grammar_ls::hover_docs::GRAMMAR_CONFIG
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn hover_grammar_config_field_access() {
+    let fix = create_grammar_config_fixture();
+    let derived_uri = Url::from_file_path(&fix.derived_path).unwrap();
+
+    let mut service = init(&[(derived_uri.clone(), &fix.derived_text)]).await;
+
+    // Cursor on "extras" in `grammar_config(base).extras`
+    let gc_offset = fix.derived_text.find("grammar_config(base).extras").unwrap();
+    let offset = gc_offset + "grammar_config(base).".len();
+    let rope = ropey::Rope::from_str(&fix.derived_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    // Should show the same docs as hovering on `extras:` inside a grammar block.
+    assert_eq!(
+        hover_at(&mut service, derived_uri, pos).await,
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: ts_grammar_ls::hover_docs::CFG_EXTRAS.into(),
+            }),
+            range: None,
+        })
+    );
+}

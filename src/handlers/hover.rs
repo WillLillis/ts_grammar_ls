@@ -47,6 +47,13 @@ fn identifier_hover(
     word: &str,
     offset: u32,
 ) -> Option<Hover> {
+    // grammar_config(x).field - show the field type from the known config schema.
+    if let Some(tokens) = analysis.tokens.as_deref()
+        && let Some(content) = grammar_config_field_hover(tokens, text, word, offset)
+    {
+        return Some(make_hover(content));
+    }
+
     // Object field access (e.g. `CALL` in `PREC.CALL`) - show the field's value.
     if let Some(RefKind::ObjectField { field, object }) = analysis
         .references
@@ -119,6 +126,42 @@ fn imported_member_hover(
         _ => format!("```\n{} {}\n```", def.kind.label(), def.name),
     };
     Some(make_hover(content))
+}
+
+/// Check if the identifier at `offset` is a field access on `grammar_config(...)`.
+/// If so, return a hover string with the field's type.
+fn grammar_config_field_hover(
+    tokens: &[tree_sitter_generate::nativedsl::lexer::Token],
+    _text: &str,
+    word: &str,
+    offset: u32,
+) -> Option<String> {
+    use tree_sitter_generate::nativedsl::lexer::TokenKind;
+
+    // Find the ident token at the cursor.
+    let idx = tokens
+        .iter()
+        .position(|t| t.kind == TokenKind::Ident && offset >= t.span.start && offset < t.span.end)?;
+
+    // Must be preceded by `.`
+    if idx < 2 || tokens[idx - 1].kind != TokenKind::Dot {
+        return None;
+    }
+
+    // The token before `.` must be `)` closing a `grammar_config(...)` call.
+    let before_dot = &tokens[idx - 2];
+    if before_dot.kind != TokenKind::RParen {
+        return None;
+    }
+
+    // Walk back through parens to find `grammar_config`.
+    let dot_start = tokens[idx - 1].span.start;
+    if !crate::handlers::completion::is_grammar_config_call(tokens, dot_start) {
+        return None;
+    }
+
+    // Show the same docs as hovering over the field inside the grammar block.
+    Some(hover_docs::grammar_field_hover(word)?.to_owned())
 }
 
 const fn make_hover(value: String) -> Hover {
