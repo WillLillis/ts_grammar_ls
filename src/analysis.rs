@@ -745,32 +745,17 @@ pub fn find_object_field(
 }
 
 /// Run the pipeline through typecheck on the given source text, calling `f`
-/// with the resolved AST and type environment.
-#[expect(clippy::missing_panics_doc, reason = "file always has a parent")]
+/// with the resolved AST and type environment. Uses the core's `load_module`
+/// to properly handle module loading, index tagging, and recursive typecheck.
 pub fn with_type_env<T>(
     text: &str,
     uri: &Url,
     f: impl FnOnce(&ast::Ast, &nativedsl::typecheck::TypeEnv<'_>) -> T,
 ) -> Option<T> {
     let grammar_path = uri_to_grammar_path(uri);
-    let tokens = nativedsl::lexer::Lexer::new(text).tokenize().ok()?;
-    let mut parsed_ast = nativedsl::parser::Parser::new(&tokens, text.to_owned(), &grammar_path)
-        .parse()
-        .ok()?;
-    nativedsl::validate_grammar(&parsed_ast).ok()?;
-
-    let grammar_dir = grammar_path.parent().unwrap();
-    let (base_rule_names, _base_path) = resolve_base_grammar(&parsed_ast, grammar_dir);
-    let inherit_span = nativedsl::find_inherit_node(&parsed_ast).map(|id| parsed_ast.span(id));
-
-    nativedsl::resolve::resolve(
-        &mut parsed_ast,
-        &base_rule_names,
-        inherit_span,
-        &grammar_path,
-    )
-    .ok()?;
-    let env = nativedsl::typecheck::check(&parsed_ast, vec![]).ok()?;
-
-    Some(f(&parsed_ast, &env))
+    let module =
+        nativedsl::load_module(text, &grammar_path, nativedsl::ModuleKind::Grammar, &[]).ok()?;
+    let module_envs = nativedsl::typecheck_modules(&module.sub_modules).ok()?;
+    let env = nativedsl::typecheck::check(&module.ast, module_envs).ok()?;
+    Some(f(&module.ast, &env))
 }
