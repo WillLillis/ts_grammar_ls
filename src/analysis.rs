@@ -744,9 +744,11 @@ pub fn find_object_field(
     None
 }
 
-/// Run the pipeline through typecheck on the given source text, calling `f`
-/// with the resolved AST and type environment. Uses the core's `load_module`
-/// to properly handle module loading, index tagging, and recursive typecheck.
+/// Run the pipeline through typecheck on the given source text.
+///
+/// Calls `f` with the resolved AST and type environment. Uses the core's
+/// `load_module` for proper module loading, index tagging, and recursive
+/// typecheck.
 pub fn with_type_env<T>(
     text: &str,
     uri: &Url,

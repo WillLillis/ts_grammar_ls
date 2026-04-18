@@ -95,7 +95,7 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
 
         // `grammar_config(x).` -> complete grammar config fields.
         if before_dot.is_some_and(|t| t.kind == TokenKind::RParen)
-            && is_grammar_config_call(tokens, &doc.text, dot_span.start)
+            && is_grammar_config_call(tokens, dot_span.start)
         {
             return Some(CompletionResponse::Array(grammar_config_field_completions()));
         }
@@ -319,7 +319,7 @@ fn object_field_completions(
 /// Check if the `)` at `rparen_end` closes a `grammar_config(...)` call.
 /// Walks back through the tokens to find the matching `(`, then checks
 /// if the identifier before it is `grammar_config`.
-fn is_grammar_config_call(tokens: &[Token], text: &str, rparen_end: u32) -> bool {
+fn is_grammar_config_call(tokens: &[Token], rparen_end: u32) -> bool {
     // Find the RParen token ending at rparen_end.
     let rp_idx = tokens
         .iter()
@@ -346,10 +346,8 @@ fn is_grammar_config_call(tokens: &[Token], text: &str, rparen_end: u32) -> bool
     if depth != 0 || i == 0 {
         return false;
     }
-    // Check the token before the LParen.
-    let prev = &tokens[i - 1];
-    prev.kind == TokenKind::Ident
-        && &text[prev.span.start as usize..prev.span.end as usize] == "grammar_config"
+    // Check the token before the LParen is the grammar_config keyword.
+    i > 0 && tokens[i - 1].kind == TokenKind::KwGrammarConfig
 }
 
 /// Grammar config fields with their types, matching the typecheck module's field access.

@@ -2992,3 +2992,109 @@ async fn hover_import_variable() {
         })
     );
 }
+
+// ---------------------------------------------------------------------------
+// grammar_config tests
+// ---------------------------------------------------------------------------
+
+fn create_grammar_config_fixture() -> InheritFixture {
+    let dir = tempfile::tempdir().unwrap();
+
+    let base_text = r#"
+grammar { language: "base_lang" }
+rule program { repeat(_statement) }
+rule _statement { choice(expression, "x") }
+rule expression { choice(identifier, number) }
+rule identifier { regexp(r"[a-z]+") }
+rule number { regexp(r"[0-9]+") }
+"#;
+    let base_path = dir.path().join("base.tsg");
+    std::fs::write(&base_path, base_text).unwrap();
+
+    let derived_text = format!(
+        r#"
+let base = inherit("{}")
+grammar {{
+    language: "derived_lang",
+    inherits: base,
+    extras: grammar_config(base).extras,
+}}
+rule new_rule {{ "new" }}
+"#,
+        base_path.display()
+    );
+    let derived_path = dir.path().join("derived.tsg");
+    std::fs::write(&derived_path, &derived_text).unwrap();
+
+    InheritFixture {
+        _dir: dir,
+        base_path,
+        _base_text: base_text.to_string(),
+        derived_path,
+        derived_text,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn completion_grammar_config_dot_fields() {
+    let fix = create_grammar_config_fixture();
+    let derived_uri = Url::from_file_path(&fix.derived_path).unwrap();
+
+    let mut service = init(&[(derived_uri.clone(), &fix.derived_text)]).await;
+
+    // Cursor right after `grammar_config(base).` before "extras"
+    let offset = fix
+        .derived_text
+        .find("grammar_config(base).extras")
+        .unwrap()
+        + "grammar_config(base).".len();
+    let rope = ropey::Rope::from_str(&fix.derived_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    let mut items = completions_at(&mut service, derived_uri, pos).await;
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+
+    let ci = |label: &str, ty: &str| CompletionItem {
+        label: label.into(),
+        kind: Some(CompletionItemKind::FIELD),
+        detail: Some(format!("{label}: {ty}")),
+        ..Default::default()
+    };
+    assert_eq!(
+        items,
+        vec![
+            ci("conflicts", "list_list_rule_t"),
+            ci("externals", "list_rule_t"),
+            ci("extras", "list_rule_t"),
+            ci("inline", "list_rule_t"),
+            ci("precedences", "list_list_rule_t"),
+            ci("reserved", "{ [context]: list_rule_t }"),
+            ci("supertypes", "list_rule_t"),
+            ci("word", "rule_t"),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hover_grammar_config_builtin() {
+    let fix = create_grammar_config_fixture();
+    let derived_uri = Url::from_file_path(&fix.derived_path).unwrap();
+
+    let mut service = init(&[(derived_uri.clone(), &fix.derived_text)]).await;
+
+    // Cursor on "grammar_config" keyword
+    let offset = fix.derived_text.find("grammar_config(base)").unwrap();
+    let rope = ropey::Rope::from_str(&fix.derived_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    let result = hover_at(&mut service, derived_uri, pos).await;
+    let hover = result.unwrap();
+    let HoverContents::Markup(markup) = hover.contents else {
+        panic!("expected markup");
+    };
+    // Should show the grammar_config builtin docs
+    assert_eq!(
+        markup.value,
+        ts_grammar_ls::hover_docs::GRAMMAR_CONFIG
+    );
+}
