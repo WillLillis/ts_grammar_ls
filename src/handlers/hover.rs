@@ -18,7 +18,7 @@ pub fn hover(backend: &Backend, params: &HoverParams) -> Option<Hover> {
     let ctx = backend.analysis_context();
     let analysis = analysis::analyze(&doc.text, uri, Some(&ctx));
 
-    match analysis.cursor_context(offset) {
+    match analysis.cursor_context(offset, &doc.text) {
         // On `reserved:`, show the config field docs, not the builtin combinator docs.
         CursorContext::GrammarConfigField => {
             hover_docs::grammar_field_hover(word).map(|info| make_hover(info.to_string()))
@@ -30,6 +30,10 @@ pub fn hover(backend: &Backend, params: &HoverParams) -> Option<Hover> {
             .flatten()
             .find(|d| d.name == word)
             .map(|def| make_hover(format!("```\n{} {}\n```", def.kind.label(), def.name))),
+        // On a member accessed through an imported module (`mod::fn_name`).
+        CursorContext::ImportModuleAccess { .. } => {
+            imported_member_hover(&analysis, &doc.text, word, offset)
+        }
         CursorContext::Identifier { .. } => {
             identifier_hover(&analysis, &doc.text, uri, word, offset)
         }
@@ -66,10 +70,8 @@ fn identifier_hover(
             DefKind::Function { signature } => format!("```\n{signature}\n```"),
             DefKind::Let { .. } => {
                 // Run the pipeline to get the type from the type environment.
-                let ty = analysis::with_type_env(text, uri, |_ast, env| {
-                    env.var_scopes[0].get(word).copied()
-                })
-                .flatten();
+                let ty =
+                    analysis::with_type_env(text, uri, |_ast, env| env.vars.get(word)).flatten();
                 ty.map_or_else(
                     || format!("```\nlet {}\n```", def.name),
                     |ty| format!("```\nlet {}: {ty}\n```", def.name),
@@ -98,6 +100,25 @@ fn field_value_hover(
             "```\n{object_name}.{field_name} = {value_text}\n```"
         ))
     })?
+}
+
+/// Show hover info for a member accessed through an imported module.
+fn imported_member_hover(
+    analysis: &crate::document::Analysis,
+    source: &str,
+    word: &str,
+    offset: u32,
+) -> Option<Hover> {
+    // Find which import module this access belongs to.
+    let tokens = analysis.tokens.as_deref()?;
+    let module_name = crate::text::qualified_access_module(tokens, source, offset)?;
+    let module_info = analysis.import_modules.get(module_name)?;
+    let def = module_info.definitions.iter().find(|d| d.name == word)?;
+    let content = match &def.kind {
+        DefKind::Function { signature } => format!("```\n{signature}\n```"),
+        _ => format!("```\n{} {}\n```", def.kind.label(), def.name),
+    };
+    Some(make_hover(content))
 }
 
 const fn make_hover(value: String) -> Hover {

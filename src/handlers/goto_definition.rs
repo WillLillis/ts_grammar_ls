@@ -1,7 +1,7 @@
 use tower_lsp::lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location, Range, Url};
 
 use crate::analysis;
-use crate::document::{Analysis, RefKind};
+use crate::document::{Analysis, DefKind, RefKind};
 use crate::server::Backend;
 use crate::text;
 
@@ -65,6 +65,14 @@ pub fn goto_definition(
                     range: Range::default(),
                 }));
             }
+            RefKind::ImportPath => {
+                // Jump to the imported file.
+                return goto_import_file(&analysis, offset);
+            }
+            RefKind::ImportedMember { path, member } => {
+                // Jump to the member definition in the imported module.
+                return goto_imported_member(&analysis, path, member);
+            }
             RefKind::Builtin => {}
         }
     }
@@ -116,4 +124,60 @@ fn goto_object_field(
             range: text::span_to_range(&rope, key_span),
         }))
     })?
+}
+
+/// Jump to the file referenced by an `import("path")` call.
+fn goto_import_file(analysis: &Analysis, offset: u32) -> Option<GotoDefinitionResponse> {
+    // Find which import definition contains this offset, then use its module info.
+    let reference = analysis.references.iter().flatten().find(|r| {
+        offset >= r.span.start && offset < r.span.end && matches!(r.kind, RefKind::ImportPath)
+    })?;
+
+    // Find the let binding that owns this import by matching spans.
+    let defs = analysis.definitions.as_ref()?;
+    let import_def = defs.iter().find(|d| {
+        matches!(d.kind, DefKind::Import)
+            && reference.span.start >= d.full_span.start
+            && reference.span.end <= d.full_span.end
+    })?;
+    let module_info = analysis.import_modules.get(&import_def.name)?;
+    let uri = Url::from_file_path(&module_info.path).ok()?;
+    Some(GotoDefinitionResponse::Scalar(Location {
+        uri,
+        range: Range::default(),
+    }))
+}
+
+/// Jump to a member definition inside an imported module.
+/// For `a::b::c`, path is `["a", "b"]` and member is `"c"`. Walks the
+/// chain through nested imports to find the target module.
+///
+/// TODO: nested imports (`path.len()` > 1) require recursive module loading
+/// in `ExternalModuleInfo` - currently only single-level imports resolve.
+fn goto_imported_member(
+    analysis: &Analysis,
+    path: &[String],
+    member: &str,
+) -> Option<GotoDefinitionResponse> {
+    let module_info = resolve_import_chain(analysis, path)?;
+    let def = module_info.definitions.iter().find(|d| d.name == member)?;
+    let uri = Url::from_file_path(&module_info.path).ok()?;
+    let range = text::span_to_range(&module_info.rope, def.name_span);
+    Some(GotoDefinitionResponse::Scalar(Location { uri, range }))
+}
+
+/// Walk an import path chain to find the target module info.
+/// Currently only resolves the first segment from `analysis.import_modules`.
+fn resolve_import_chain<'a>(
+    analysis: &'a Analysis,
+    path: &[String],
+) -> Option<&'a crate::document::ExternalModuleInfo> {
+    let first = path.first()?;
+    let module_info = analysis.import_modules.get(first.as_str())?;
+    if path.len() > 1 {
+        // Nested imports require ExternalModuleInfo to carry its own
+        // import_modules for sub-imports. Not yet implemented.
+        return None;
+    }
+    Some(module_info)
 }

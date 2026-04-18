@@ -18,11 +18,14 @@ pub fn references(backend: &Backend, params: &ReferenceParams) -> Option<Vec<Loc
     let ctx = backend.analysis_context();
     let analysis = analysis::analyze(&doc.text, uri, Some(&ctx));
 
-    match analysis.cursor_context(offset) {
+    match analysis.cursor_context(offset, &doc.text) {
         // Grammar config fields aren't referenceable.
         CursorContext::GrammarConfigField => None,
         CursorContext::BaseRuleAccess => {
             base_rule_references(&analysis, uri, &doc.rope, word, include_declaration)
+        }
+        CursorContext::ImportModuleAccess { scope } => {
+            import_member_references(&analysis, uri, &doc, word, scope, include_declaration)
         }
         CursorContext::Identifier { scope } => {
             local_references(&analysis, uri, &doc, word, scope, include_declaration)
@@ -105,12 +108,55 @@ fn local_references(
     }
 
     for reference in analysis.references.iter().flatten() {
-        // Exclude BaseRule references - they refer to the base grammar's
-        // version, not the local override.
-        if matches!(reference.kind, RefKind::BaseRule(_)) {
+        // Exclude BaseRule and ImportedMember references - they refer to
+        // external modules, not local definitions.
+        if matches!(
+            reference.kind,
+            RefKind::BaseRule(_) | RefKind::ImportedMember { .. }
+        ) {
             continue;
         }
         if reference.matches_word(word, &doc.text, cursor_scope) {
+            locations.push(Location {
+                uri: uri.clone(),
+                range: text::span_to_range(&doc.rope, reference.span),
+            });
+        }
+    }
+
+    (!locations.is_empty()).then_some(locations)
+}
+
+/// References for a member accessed through an imported module (`mod::fn_name`).
+fn import_member_references(
+    analysis: &crate::document::Analysis,
+    uri: &Url,
+    doc: &crate::document::Document,
+    word: &str,
+    _cursor_scope: Option<tree_sitter_generate::nativedsl::ast::Span>,
+    include_declaration: bool,
+) -> Option<Vec<Location>> {
+    let mut locations = Vec::new();
+
+    if include_declaration {
+        // Find the import module that contains this member and include the
+        // declaration from the imported file.
+        for module_info in analysis.import_modules.values() {
+            if let Some(def) = module_info.definitions.iter().find(|d| d.name == word)
+                && let Ok(module_uri) = Url::from_file_path(&module_info.path)
+            {
+                locations.push(Location {
+                    uri: module_uri,
+                    range: text::span_to_range(&module_info.rope, def.name_span),
+                });
+                break;
+            }
+        }
+    }
+
+    // Find all ImportedMember references with the same member name in this file.
+    for reference in analysis.references.iter().flatten() {
+        if matches!(&reference.kind, RefKind::ImportedMember { member, .. } if member == word) {
             locations.push(Location {
                 uri: uri.clone(),
                 range: text::span_to_range(&doc.rope, reference.span),

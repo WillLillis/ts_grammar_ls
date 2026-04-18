@@ -108,6 +108,31 @@ pub fn is_base_rule_access(
     idx > 0 && tokens[idx - 1].kind == TokenKind::ColonColon
 }
 
+/// Return the name of the qualifier identifier before `::` at the cursor.
+///
+/// For `foo::bar`, when the cursor is on `bar`, this returns `"foo"`.
+/// Requires `is_base_rule_access` to be true.
+#[must_use]
+pub fn qualified_access_module<'src>(
+    tokens: &[tree_sitter_generate::nativedsl::lexer::Token],
+    source: &'src str,
+    offset: u32,
+) -> Option<&'src str> {
+    use tree_sitter_generate::nativedsl::lexer::TokenKind;
+    let idx = tokens.iter().position(|t| {
+        t.kind == TokenKind::Ident && offset >= t.span.start && offset < t.span.end
+    })?;
+    // Walk back: expect `::` then an identifier.
+    if idx < 2 || tokens[idx - 1].kind != TokenKind::ColonColon {
+        return None;
+    }
+    let qual = &tokens[idx - 2];
+    if qual.kind != TokenKind::Ident {
+        return None;
+    }
+    Some(&source[qual.span.start as usize..qual.span.end as usize])
+}
+
 #[must_use]
 pub fn span_to_range(rope: &Rope, span: Span) -> Range {
     Range::new(

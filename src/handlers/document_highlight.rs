@@ -20,10 +20,13 @@ pub fn document_highlight(
     let ctx = backend.analysis_context();
     let analysis = analysis::analyze(&doc.text, uri, Some(&ctx));
 
-    match analysis.cursor_context(offset) {
+    match analysis.cursor_context(offset, &doc.text) {
         // Grammar config fields aren't highlightable.
         CursorContext::GrammarConfigField => None,
         CursorContext::BaseRuleAccess => base_rule_highlights(&analysis, &doc.rope, word),
+        CursorContext::ImportModuleAccess { .. } => {
+            import_member_highlights(&analysis, &doc.rope, word)
+        }
         CursorContext::Identifier { scope } => local_highlights(&analysis, &doc, word, scope),
     }
 }
@@ -83,5 +86,24 @@ fn local_highlights(
         }
     }
 
+    (!highlights.is_empty()).then_some(highlights)
+}
+
+/// Highlight all `ImportedMember` references with the same member name.
+fn import_member_highlights(
+    analysis: &Analysis,
+    rope: &ropey::Rope,
+    word: &str,
+) -> Option<Vec<DocumentHighlight>> {
+    let highlights: Vec<DocumentHighlight> = analysis
+        .references
+        .iter()
+        .flatten()
+        .filter(|r| matches!(&r.kind, RefKind::ImportedMember { member, .. } if member == word))
+        .map(|r| DocumentHighlight {
+            range: text::span_to_range(rope, r.span),
+            kind: Some(DocumentHighlightKind::READ),
+        })
+        .collect();
     (!highlights.is_empty()).then_some(highlights)
 }

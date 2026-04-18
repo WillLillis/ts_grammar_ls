@@ -11,9 +11,10 @@ use crate::config::FormattingConfig;
 #[must_use]
 pub fn format(source: &str, path: &Path, config: &FormattingConfig) -> Option<String> {
     let tokens = lexer::Lexer::new(source).tokenize().ok()?;
-    let ast = tree_sitter_generate::nativedsl::parser::Parser::new(&tokens, source, path)
-        .parse()
-        .ok()?;
+    let ast =
+        tree_sitter_generate::nativedsl::parser::Parser::new(&tokens, source.to_owned(), path)
+            .parse()
+            .ok()?;
 
     let line_starts = compute_line_starts(source);
 
@@ -194,7 +195,7 @@ impl CommentMap {
 
 struct Formatter<'a> {
     source: &'a str,
-    ast: &'a Ast<'a>,
+    ast: &'a Ast,
     tokens: &'a [Token],
     config: &'a FormattingConfig,
     comments: CommentMap,
@@ -599,9 +600,19 @@ impl<'a> Formatter<'a> {
             Node::Reserved { context, content } => {
                 self.format_binary("reserved", *context, *content);
             }
-            Node::Inherit { path } => {
+            Node::Inherit { path, .. } => {
                 self.out.push_str("inherit(");
                 self.format_expr(*path);
+                self.out.push(')');
+            }
+            Node::Import { path, .. } => {
+                self.out.push_str("import(");
+                self.format_expr(*path);
+                self.out.push(')');
+            }
+            Node::GrammarConfig(inner) => {
+                self.out.push_str("grammar_config(");
+                self.format_expr(*inner);
                 self.out.push(')');
             }
             Node::FieldAccess { obj, field } => {
@@ -609,10 +620,17 @@ impl<'a> Formatter<'a> {
                 self.out.push('.');
                 self.out.push_str(self.text(self.ast.span(*field)));
             }
-            Node::RuleInline { obj, rule } => {
+            Node::QualifiedAccess { obj, member } => {
                 self.format_expr(*obj);
                 self.out.push_str("::");
-                self.out.push_str(self.text(self.ast.span(*rule)));
+                self.out.push_str(self.text(self.ast.span(*member)));
+            }
+            Node::QualifiedCall(range) => {
+                let (obj, name, args) = self.ast.get_qualified_call(*range);
+                self.format_expr(obj);
+                self.out.push_str("::");
+                self.out.push_str(self.text(self.ast.span(name)));
+                self.format_call_args(args);
             }
             Node::Call { name, args } => {
                 self.out.push_str(self.text(self.ast.span(*name)));
@@ -903,7 +921,7 @@ enum ItemKind {
     Other,
 }
 
-fn item_kind(ast: &Ast<'_>, id: NodeId) -> ItemKind {
+fn item_kind(ast: &Ast, id: NodeId) -> ItemKind {
     match ast.node(id) {
         ast::Node::Fn(_) => ItemKind::Fn,
         ast::Node::Let { .. } => ItemKind::Let,

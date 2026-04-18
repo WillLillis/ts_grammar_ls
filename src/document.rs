@@ -1,4 +1,7 @@
+use std::path::PathBuf;
+
 use ropey::Rope;
+use rustc_hash::FxHashMap;
 use tower_lsp::lsp_types::Diagnostic;
 
 use tree_sitter_generate::nativedsl::ast::Span;
@@ -44,6 +47,8 @@ pub enum DefKind {
     Let {
         scope: Option<Span>,
     },
+    /// An import binding (e.g. `helpers` in `let helpers = import("helpers.tsg")`).
+    Import,
     /// A key in an object literal (e.g. `ADD` in `{ ADD: 1 }`).
     ObjectKey,
     /// A function parameter.
@@ -60,6 +65,7 @@ impl DefKind {
             Self::OverrideRule => "override rule",
             Self::Function { .. } => "fn",
             Self::Let { .. } => "let",
+            Self::Import => "import",
             Self::ObjectKey => "field",
             Self::Parameter { .. } => "parameter",
         }
@@ -70,7 +76,11 @@ impl DefKind {
         match self {
             Self::Let { scope } => *scope,
             Self::Parameter { scope } => Some(*scope),
-            Self::Rule | Self::OverrideRule | Self::Function { .. } | Self::ObjectKey => None,
+            Self::Rule
+            | Self::OverrideRule
+            | Self::Function { .. }
+            | Self::Import
+            | Self::ObjectKey => None,
         }
     }
 }
@@ -98,6 +108,14 @@ pub enum RefKind {
     },
     /// The path argument to `inherit("path")`.
     InheritPath,
+    /// The path argument to `import("path")`.
+    ImportPath,
+    /// A member accessed through an imported module (e.g. `fn_name` in `mod::fn_name(args)`).
+    /// For nested access like `a::b::c`, path is `["a", "b"]` and member is `"c"`.
+    ImportedMember {
+        path: Vec<String>,
+        member: String,
+    },
     /// A builtin combinator keyword (e.g. `seq`, `choice`, `repeat`).
     Builtin,
 }
@@ -112,11 +130,12 @@ impl Reference {
         let name_matches = match &self.kind {
             RefKind::Rule(name) | RefKind::BaseRule(name) | RefKind::Variable(name) => name == word,
             RefKind::ObjectField { field, .. } => field == word,
+            RefKind::ImportedMember { member, .. } => member == word,
             RefKind::Builtin => {
                 let s = self.span;
                 &source[s.start as usize..s.end as usize] == word
             }
-            RefKind::InheritPath => false,
+            RefKind::InheritPath | RefKind::ImportPath => false,
         };
         if !name_matches {
             return false;
@@ -128,6 +147,15 @@ impl Reference {
             _ => true,
         }
     }
+}
+
+/// Cached info about an external module (inherited or imported), for IDE features.
+#[derive(Clone)]
+pub struct ExternalModuleInfo {
+    pub path: PathBuf,
+    pub definitions: Vec<Definition>,
+    pub references: Vec<Reference>,
+    pub rope: Rope,
 }
 
 /// On-demand analysis results from a pipeline run.
@@ -160,6 +188,9 @@ pub struct Analysis {
     pub base_references: Option<Vec<Reference>>,
     /// Cached rope for the base grammar source (for span-to-range conversion).
     pub base_rope: Option<Rope>,
+    /// Imported modules, keyed by the let-binding name (e.g. `"helpers"` for
+    /// `let helpers = import("helpers.tsg")`).
+    pub import_modules: FxHashMap<String, ExternalModuleInfo>,
 }
 
 impl Analysis {
@@ -190,7 +221,7 @@ impl Analysis {
     /// Classify what kind of identifier the cursor is on, based on token context.
     /// Use this to route handler logic uniformly across hover/references/highlight.
     #[must_use]
-    pub fn cursor_context(&self, offset: u32) -> CursorContext {
+    pub fn cursor_context(&self, offset: u32, source: &str) -> CursorContext {
         let Some(tokens) = self.tokens.as_deref() else {
             return CursorContext::Identifier {
                 scope: self.scope_at(offset),
@@ -202,6 +233,18 @@ impl Analysis {
             return CursorContext::GrammarConfigField;
         }
         if crate::text::is_base_rule_access(tokens, offset) {
+            // Distinguish base rule access from import module access by checking
+            // whether the qualifier is an import definition.
+            if let Some(qualifier) = crate::text::qualified_access_module(tokens, source, offset)
+                && self.definitions.as_ref().is_some_and(|defs| {
+                    defs.iter()
+                        .any(|d| d.name == qualifier && d.kind == DefKind::Import)
+                })
+            {
+                return CursorContext::ImportModuleAccess {
+                    scope: self.scope_at(offset),
+                };
+            }
             return CursorContext::BaseRuleAccess;
         }
         CursorContext::Identifier {
@@ -219,6 +262,8 @@ pub enum CursorContext {
     /// Cursor is on the rule part of `base::rule_name`.
     /// References/highlights should look at base grammar usages, not local overrides.
     BaseRuleAccess,
+    /// Cursor is on a member accessed through an imported module (`mod::fn_name`).
+    ImportModuleAccess { scope: Option<Span> },
     /// Cursor is on a regular identifier (rule, fn, let, parameter, etc.).
     Identifier { scope: Option<Span> },
 }

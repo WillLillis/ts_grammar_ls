@@ -12,7 +12,7 @@ use crate::document::{Analysis, DefKind, Definition, Document, RefKind, Referenc
 // ---------------------------------------------------------------------------
 
 /// Extract definitions from an AST's root items.
-fn extract_definitions(parsed_ast: &ast::Ast<'_>) -> Vec<Definition> {
+fn extract_definitions(parsed_ast: &ast::Ast) -> Vec<Definition> {
     let mut definitions = Vec::new();
     for &item_id in &parsed_ast.root_items {
         match parsed_ast.node(item_id) {
@@ -60,9 +60,14 @@ fn extract_definitions(parsed_ast: &ast::Ast<'_>) -> Vec<Definition> {
             ast::Node::Let { name, value, .. } => {
                 let name_span = parsed_ast.span(*name);
                 let full_span = parsed_ast.span(item_id);
+                let kind = if matches!(parsed_ast.node(*value), ast::Node::Import { .. }) {
+                    DefKind::Import
+                } else {
+                    DefKind::Let { scope: None }
+                };
                 definitions.push(Definition {
                     name: parsed_ast.text(name_span).to_owned(),
-                    kind: DefKind::Let { scope: None },
+                    kind,
                     name_span,
                     full_span,
                 });
@@ -103,7 +108,7 @@ fn extract_definitions(parsed_ast: &ast::Ast<'_>) -> Vec<Definition> {
 }
 
 /// Determine the narrowest enclosing scope (function or for-loop) for a span.
-fn find_scope(span: ast::Span, parsed_ast: &ast::Ast<'_>) -> Option<ast::Span> {
+fn find_scope(span: ast::Span, parsed_ast: &ast::Ast) -> Option<ast::Span> {
     let mut best: Option<ast::Span> = None;
     // Check functions.
     for &item_id in &parsed_ast.root_items {
@@ -130,8 +135,46 @@ fn find_scope(span: ast::Span, parsed_ast: &ast::Ast<'_>) -> Option<ast::Span> {
     best
 }
 
+/// Collect the names of import variables from the AST (`let x = import(...)`).
+fn collect_import_names(parsed_ast: &ast::Ast) -> rustc_hash::FxHashSet<String> {
+    let mut names = rustc_hash::FxHashSet::default();
+    for &item_id in &parsed_ast.root_items {
+        if let ast::Node::Let { name, value, .. } = parsed_ast.node(item_id)
+            && matches!(parsed_ast.node(*value), ast::Node::Import { .. })
+        {
+            names.insert(parsed_ast.text(parsed_ast.span(*name)).to_owned());
+        }
+    }
+    names
+}
+
+/// Resolve the qualified access path segments from an obj node.
+/// For `a::b::c`, given the `c` node's obj (which is `a::b`), returns `["a", "b"]`.
+fn collect_qualified_path(parsed_ast: &ast::Ast, obj_id: ast::NodeId) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut current = obj_id;
+    loop {
+        match parsed_ast.node(current) {
+            ast::Node::VarRef | ast::Node::Ident => {
+                path.push(parsed_ast.text(parsed_ast.span(current)).to_owned());
+                break;
+            }
+            ast::Node::QualifiedAccess { obj, member } => {
+                path.push(parsed_ast.text(parsed_ast.span(*member)).to_owned());
+                current = *obj;
+            }
+            _ => break,
+        }
+    }
+    path.reverse();
+    path
+}
+
 /// Extract resolved references from all nodes in the AST.
-fn extract_references(parsed_ast: &ast::Ast<'_>) -> Vec<Reference> {
+fn extract_references(
+    parsed_ast: &ast::Ast,
+    import_names: &rustc_hash::FxHashSet<String>,
+) -> Vec<Reference> {
     let mut references = Vec::new();
 
     for (i, node) in parsed_ast.nodes.iter().enumerate().skip(1) {
@@ -152,15 +195,44 @@ fn extract_references(parsed_ast: &ast::Ast<'_>) -> Vec<Reference> {
                     scope: find_scope(span, parsed_ast),
                 });
             }
-            // The `rule` child of RuleInline stays as Ident (not resolved),
-            // so we extract it directly as a BaseRule reference.
-            ast::Node::RuleInline { rule, .. } => {
-                let rule_span = parsed_ast.span(*rule);
+            // `expr::member` qualified access - could be base rule or import access.
+            ast::Node::QualifiedAccess { obj, member } => {
+                let member_span = parsed_ast.span(*member);
+                let member_name = parsed_ast.text(member_span).to_owned();
+                // Check if the root of the access chain is an import variable.
+                let path = collect_qualified_path(parsed_ast, *obj);
+                let is_import = path.first().is_some_and(|root| import_names.contains(root));
+                let kind = if is_import {
+                    RefKind::ImportedMember {
+                        path,
+                        member: member_name,
+                    }
+                } else {
+                    RefKind::BaseRule(member_name)
+                };
                 references.push(Reference {
-                    span: rule_span,
-                    kind: RefKind::BaseRule(parsed_ast.text(rule_span).to_owned()),
-                    scope: find_scope(rule_span, parsed_ast),
+                    span: member_span,
+                    kind,
+                    scope: find_scope(member_span, parsed_ast),
                 });
+            }
+            // `expr::fn_name(args)` qualified call - import function call.
+            ast::Node::QualifiedCall(range) => {
+                let (obj, name, _args) = parsed_ast.get_qualified_call(*range);
+                let name_span = parsed_ast.span(name);
+                let member_name = parsed_ast.text(name_span).to_owned();
+                let path = collect_qualified_path(parsed_ast, obj);
+                let is_import = path.first().is_some_and(|root| import_names.contains(root));
+                if is_import {
+                    references.push(Reference {
+                        span: name_span,
+                        kind: RefKind::ImportedMember {
+                            path,
+                            member: member_name,
+                        },
+                        scope: find_scope(name_span, parsed_ast),
+                    });
+                }
             }
             // Field access: `obj.field` - extract the field as an ObjectField ref.
             ast::Node::FieldAccess { obj, field } => {
@@ -176,11 +248,20 @@ fn extract_references(parsed_ast: &ast::Ast<'_>) -> Vec<Reference> {
                 });
             }
             // inherit("path") - the path string literal.
-            ast::Node::Inherit { path } => {
+            ast::Node::Inherit { path, .. } => {
                 let path_span = parsed_ast.span(*path);
                 references.push(Reference {
                     span: path_span,
                     kind: RefKind::InheritPath,
+                    scope: None,
+                });
+            }
+            // import("path") - the path string literal.
+            ast::Node::Import { path, .. } => {
+                let path_span = parsed_ast.span(*path);
+                references.push(Reference {
+                    span: path_span,
+                    kind: RefKind::ImportPath,
                     scope: None,
                 });
             }
@@ -217,19 +298,76 @@ pub struct AnalysisContext<'a> {
     pub document_map: &'a dashmap::DashMap<Url, Document>,
 }
 
+/// Resolve the inherit path from the AST and read the base grammar to extract rule names.
+/// Returns (`rule_names`, `canonical_path`).
+fn resolve_base_grammar(
+    parsed_ast: &ast::Ast,
+    grammar_dir: &Path,
+) -> (Vec<String>, Option<PathBuf>) {
+    let Some(inherit_id) = nativedsl::find_inherit_node(parsed_ast) else {
+        return (Vec::new(), None);
+    };
+    let ast::Node::Inherit { path, .. } = parsed_ast.node(inherit_id) else {
+        return (Vec::new(), None);
+    };
+    let path_str = parsed_ast.node_text(*path);
+    let full_path = grammar_dir.join(path_str);
+    let canonical = dunce::canonicalize(&full_path).ok().unwrap_or(full_path);
+
+    // Read and parse the base grammar to get rule names.
+    let Ok(content) = std::fs::read_to_string(&canonical) else {
+        return (Vec::new(), Some(canonical));
+    };
+
+    let ext = canonical.extension().and_then(|e| e.to_str());
+    let rule_names = match ext {
+        Some("tsg") => {
+            let Ok(tokens) = nativedsl::lexer::Lexer::new(&content).tokenize() else {
+                return (Vec::new(), Some(canonical));
+            };
+            let Ok(base_ast) = nativedsl::parser::Parser::new(&tokens, content, &canonical).parse()
+            else {
+                return (Vec::new(), Some(canonical));
+            };
+            base_ast
+                .root_items
+                .iter()
+                .filter_map(|&id| {
+                    if let ast::Node::Rule { name, .. } = base_ast.node(id) {
+                        Some(base_ast.text(base_ast.span(*name)).to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+        Some("json") => {
+            // Extract rule names from grammar.json by parsing the "rules" keys.
+            serde_json::from_str::<serde_json::Value>(&content)
+                .ok()
+                .and_then(|v| Some(v.get("rules")?.as_object()?.keys().cloned().collect()))
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+
+    (rule_names, Some(canonical))
+}
+
 /// Parse and resolve a base grammar file to extract definitions, references, and a rope.
 fn parse_base_grammar(
     path: &Path,
     content: &str,
 ) -> Option<(Vec<Definition>, Vec<Reference>, Rope)> {
     let tokens = nativedsl::lexer::Lexer::new(content).tokenize().ok()?;
-    let mut parsed_ast = nativedsl::parser::Parser::new(&tokens, content, path)
+    let mut parsed_ast = nativedsl::parser::Parser::new(&tokens, content.to_owned(), path)
         .parse()
         .ok()?;
     // Resolve so that Ident nodes become RuleRef/VarRef (needed for extract_references).
     let _ = nativedsl::resolve::resolve(&mut parsed_ast, &[], None, path);
     let definitions = extract_definitions(&parsed_ast);
-    let references = extract_references(&parsed_ast);
+    let import_names = collect_import_names(&parsed_ast);
+    let references = extract_references(&parsed_ast, &import_names);
     Some((definitions, references, Rope::from_str(content)))
 }
 
@@ -290,7 +428,8 @@ fn extract_base_grammar_info(
 
 fn extract_analysis(
     tokens: &[nativedsl::lexer::Token],
-    parsed_ast: &ast::Ast<'_>,
+    parsed_ast: &ast::Ast,
+    grammar_dir: &Path,
     base_grammar_path: Option<PathBuf>,
     ctx: Option<&AnalysisContext<'_>>,
 ) -> Analysis {
@@ -301,7 +440,8 @@ fn extract_analysis(
         .map(|&id| parsed_ast.span(id));
 
     let definitions = extract_definitions(parsed_ast);
-    let mut references = extract_references(parsed_ast);
+    let import_names = collect_import_names(parsed_ast);
+    let mut references = extract_references(parsed_ast, &import_names);
     extract_builtin_references(tokens, grammar_span, &mut references);
     let (base_definitions, base_references, base_rope) = base_grammar_path
         .as_ref()
@@ -309,6 +449,9 @@ fn extract_analysis(
         .map_or((Vec::new(), Vec::new(), None), |(defs, refs, rope)| {
             (defs, refs, Some(rope))
         });
+
+    // Load imported modules.
+    let import_modules = extract_import_modules(parsed_ast, grammar_dir, ctx);
 
     Analysis {
         tokens: Some(tokens.to_vec()),
@@ -319,7 +462,49 @@ fn extract_analysis(
         base_definitions: Some(base_definitions),
         base_references: Some(base_references),
         base_rope,
+        import_modules,
     }
+}
+
+/// Load imported module info for all `let x = import("path")` bindings.
+/// Resolves each import path relative to `grammar_dir`, parses the module,
+/// and caches results using the same `BaseGrammarCache` infrastructure.
+fn extract_import_modules(
+    parsed_ast: &ast::Ast,
+    grammar_dir: &Path,
+    ctx: Option<&AnalysisContext<'_>>,
+) -> rustc_hash::FxHashMap<String, crate::document::ExternalModuleInfo> {
+    use crate::document::ExternalModuleInfo;
+
+    let mut modules = rustc_hash::FxHashMap::default();
+
+    for &item_id in &parsed_ast.root_items {
+        let ast::Node::Let { name, value, .. } = parsed_ast.node(item_id) else {
+            continue;
+        };
+        let ast::Node::Import { path, .. } = parsed_ast.node(*value) else {
+            continue;
+        };
+        let var_name = parsed_ast.text(parsed_ast.span(*name)).to_owned();
+        let path_str = parsed_ast.node_text(*path);
+
+        let full_path = grammar_dir.join(path_str);
+        let canonical = dunce::canonicalize(&full_path).ok().unwrap_or(full_path);
+
+        if let Some((defs, refs, rope)) = extract_base_grammar_info(&canonical, ctx) {
+            modules.insert(
+                var_name,
+                ExternalModuleInfo {
+                    path: canonical,
+                    definitions: defs,
+                    references: refs,
+                    rope,
+                },
+            );
+        }
+    }
+
+    modules
 }
 
 /// Scan lexer tokens for builtin combinator keywords and add them as references.
@@ -365,7 +550,7 @@ fn extract_builtin_references(
     }
 }
 
-fn build_fn_signature(parsed_ast: &ast::Ast<'_>, config: &ast::FnConfig, fn_name: &str) -> String {
+fn build_fn_signature(parsed_ast: &ast::Ast, config: &ast::FnConfig, fn_name: &str) -> String {
     let mut sig = format!("fn {fn_name}(");
     for (i, param) in config.params.iter().enumerate() {
         if i > 0 {
@@ -382,7 +567,7 @@ fn build_fn_signature(parsed_ast: &ast::Ast<'_>, config: &ast::FnConfig, fn_name
     sig
 }
 
-fn type_node_to_str(parsed_ast: &ast::Ast<'_>, ty_id: ast::NodeId) -> String {
+fn type_node_to_str(parsed_ast: &ast::Ast, ty_id: ast::NodeId) -> String {
     match parsed_ast.node(ty_id) {
         ast::Node::TypeRule => "rule_t".into(),
         ast::Node::TypeStr => "str_t".into(),
@@ -421,7 +606,8 @@ pub fn analyze(text: &str, uri: &Url, ctx: Option<&AnalysisContext<'_>>) -> Anal
     };
 
     // Stage 2: Parse
-    let Ok(mut parsed_ast) = nativedsl::parser::Parser::new(&tokens, text, &grammar_path).parse()
+    let Ok(mut parsed_ast) =
+        nativedsl::parser::Parser::new(&tokens, text.to_owned(), &grammar_path).parse()
     else {
         return Analysis {
             tokens: Some(tokens),
@@ -429,23 +615,15 @@ pub fn analyze(text: &str, uri: &Url, ctx: Option<&AnalysisContext<'_>>) -> Anal
         };
     };
 
+    let grammar_dir = grammar_path.parent().unwrap();
+
     // Stage 3: Validate inheritance
-    if nativedsl::validate_inherit(&parsed_ast).is_err() {
-        return extract_analysis(&tokens, &parsed_ast, None, ctx);
+    if nativedsl::validate_grammar(&parsed_ast).is_err() {
+        return extract_analysis(&tokens, &parsed_ast, grammar_dir, None, ctx);
     }
 
-    // Stage 4: Load base grammar (for inheritance)
-    let grammar_dir = grammar_path.parent().unwrap();
-    let (base, base_path) = match nativedsl::load_base_grammar(&parsed_ast, grammar_dir, &[]) {
-        Ok(Some((g, p))) => (Some(g), Some(p)),
-        Ok(None) => (None, None),
-        Err(_) => return extract_analysis(&tokens, &parsed_ast, None, ctx),
-    };
-
-    let base_rule_names: Vec<String> = base
-        .as_ref()
-        .map(|g| g.variables.iter().map(|v| v.name.clone()).collect())
-        .unwrap_or_default();
+    // Stage 4: Resolve the base grammar path and rule names from inherit()
+    let (base_rule_names, base_path) = resolve_base_grammar(&parsed_ast, grammar_dir);
 
     let inherit_span = nativedsl::find_inherit_node(&parsed_ast).map(|id| parsed_ast.span(id));
 
@@ -458,19 +636,19 @@ pub fn analyze(text: &str, uri: &Url, ctx: Option<&AnalysisContext<'_>>) -> Anal
     )
     .is_err()
     {
-        return extract_analysis(&tokens, &parsed_ast, base_path, ctx);
+        return extract_analysis(&tokens, &parsed_ast, grammar_dir, base_path, ctx);
     }
 
     // Full success through resolve - extract analysis.
-    extract_analysis(&tokens, &parsed_ast, base_path, ctx)
+    extract_analysis(&tokens, &parsed_ast, grammar_dir, base_path, ctx)
 }
 
 /// Run lex+parse and invoke `f` with the parsed AST. Returns `None` if either stage fails.
 /// Use this when you need AST access but don't need type information.
-pub fn with_ast<T>(text: &str, uri: &Url, f: impl FnOnce(&ast::Ast<'_>) -> T) -> Option<T> {
+pub fn with_ast<T>(text: &str, uri: &Url, f: impl FnOnce(&ast::Ast) -> T) -> Option<T> {
     let grammar_path = uri_to_grammar_path(uri);
     let tokens = nativedsl::lexer::Lexer::new(text).tokenize().ok()?;
-    let parsed_ast = nativedsl::parser::Parser::new(&tokens, text, &grammar_path)
+    let parsed_ast = nativedsl::parser::Parser::new(&tokens, text.to_owned(), &grammar_path)
         .parse()
         .ok()?;
     Some(f(&parsed_ast))
@@ -481,7 +659,7 @@ pub fn with_ast<T>(text: &str, uri: &Url, f: impl FnOnce(&ast::Ast<'_>) -> T) ->
 /// literal value.
 #[must_use]
 pub fn find_object_field(
-    parsed_ast: &ast::Ast<'_>,
+    parsed_ast: &ast::Ast,
     object_name: &str,
     field_name: &str,
 ) -> Option<(ast::Span, ast::NodeId)> {
@@ -506,23 +684,17 @@ pub fn find_object_field(
 pub fn with_type_env<T>(
     text: &str,
     uri: &Url,
-    f: impl FnOnce(&ast::Ast<'_>, &nativedsl::typecheck::TypeEnv<'_>) -> T,
+    f: impl FnOnce(&ast::Ast, &nativedsl::typecheck::TypeEnv<'_>) -> T,
 ) -> Option<T> {
     let grammar_path = uri_to_grammar_path(uri);
     let tokens = nativedsl::lexer::Lexer::new(text).tokenize().ok()?;
-    let mut parsed_ast = nativedsl::parser::Parser::new(&tokens, text, &grammar_path)
+    let mut parsed_ast = nativedsl::parser::Parser::new(&tokens, text.to_owned(), &grammar_path)
         .parse()
         .ok()?;
-    nativedsl::validate_inherit(&parsed_ast).ok()?;
+    nativedsl::validate_grammar(&parsed_ast).ok()?;
 
     let grammar_dir = grammar_path.parent().unwrap();
-    let base = nativedsl::load_base_grammar(&parsed_ast, grammar_dir, &[])
-        .ok()?
-        .map(|(g, _)| g);
-    let base_rule_names: Vec<String> = base
-        .as_ref()
-        .map(|g| g.variables.iter().map(|v| v.name.clone()).collect())
-        .unwrap_or_default();
+    let (base_rule_names, _base_path) = resolve_base_grammar(&parsed_ast, grammar_dir);
     let inherit_span = nativedsl::find_inherit_node(&parsed_ast).map(|id| parsed_ast.span(id));
 
     nativedsl::resolve::resolve(
@@ -532,7 +704,7 @@ pub fn with_type_env<T>(
         &grammar_path,
     )
     .ok()?;
-    let env = nativedsl::typecheck::check(&parsed_ast).ok()?;
+    let env = nativedsl::typecheck::check(&parsed_ast, vec![]).ok()?;
 
     Some(f(&parsed_ast, &env))
 }

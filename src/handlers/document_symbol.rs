@@ -31,6 +31,7 @@ pub fn document_symbol(
                 DefKind::Rule | DefKind::OverrideRule => SymbolKind::CLASS,
                 DefKind::Function { .. } => SymbolKind::FUNCTION,
                 DefKind::Let { .. } => SymbolKind::VARIABLE,
+                DefKind::Import => SymbolKind::MODULE,
                 DefKind::ObjectKey | DefKind::Parameter { .. } => return None,
             };
             let range = text::span_to_range(&doc.rope, def.full_span);

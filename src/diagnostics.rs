@@ -20,7 +20,7 @@ use tree_sitter_generate::nativedsl::{self, DslError};
 use crate::analysis::uri_to_grammar_path;
 use crate::document::Document;
 use crate::text;
-use tree_sitter_generate::nativedsl::lower::grammar_to_json;
+use tree_sitter_generate::nativedsl::serialize::grammar_to_json;
 use tree_sitter_generate::parse_grammar::normalize_grammar;
 
 // ---------------------------------------------------------------------------
@@ -60,63 +60,13 @@ fn dsl_error_to_diagnostics(error: &DslError, rope: &Rope) -> Vec<Diagnostic> {
 // Pipeline runner
 // ---------------------------------------------------------------------------
 
-/// Run the full DSL pipeline stages and return diagnostics only.
+/// Run the full DSL pipeline and return diagnostics only.
 /// Analysis data is computed on demand by handlers via `analysis::analyze()`.
 fn run_dsl_pipeline(text: &str, rope: &Rope, grammar_path: &Path) -> Vec<Diagnostic> {
-    // Stage 1: Lex
-    let tokens = match nativedsl::lexer::Lexer::new(text).tokenize() {
-        Ok(t) => t,
-        Err(e) => return dsl_error_to_diagnostics(&e.into(), rope),
-    };
-
-    // Stage 2: Parse
-    let mut parsed_ast = match nativedsl::parser::Parser::new(&tokens, text, grammar_path).parse() {
-        Ok(a) => a,
-        Err(e) => return dsl_error_to_diagnostics(&e.into(), rope),
-    };
-
-    // Stage 3: Validate inheritance
-    if let Err(e) = nativedsl::validate_inherit(&parsed_ast) {
-        return dsl_error_to_diagnostics(&e, rope);
+    match nativedsl::parse_native_dsl(text, grammar_path) {
+        Ok(_) => vec![],
+        Err(e) => dsl_error_to_diagnostics(&e, rope),
     }
-
-    // Stage 4: Load base grammar (for inheritance)
-    let grammar_dir = grammar_path.parent().unwrap();
-    let (base, _base_path) = match nativedsl::load_base_grammar(&parsed_ast, grammar_dir, &[]) {
-        Ok(Some((g, p))) => (Some(g), Some(p)),
-        Ok(None) => (None, None),
-        Err(e) => return dsl_error_to_diagnostics(&e, rope),
-    };
-
-    let base_rule_names: Vec<String> = base
-        .as_ref()
-        .map(|g| g.variables.iter().map(|v| v.name.clone()).collect())
-        .unwrap_or_default();
-
-    let inherit_span = nativedsl::find_inherit_node(&parsed_ast).map(|id| parsed_ast.span(id));
-
-    // Stage 5: Resolve
-    if let Err(e) = nativedsl::resolve::resolve(
-        &mut parsed_ast,
-        &base_rule_names,
-        inherit_span,
-        grammar_path,
-    ) {
-        return dsl_error_to_diagnostics(&e.into(), rope);
-    }
-
-    // Stage 6: Typecheck
-    if let Err(e) = nativedsl::typecheck::check(&parsed_ast) {
-        return dsl_error_to_diagnostics(&e.into(), rope);
-    }
-
-    // Stage 7: Lower
-    if let Err(e) = nativedsl::lower::lower_with_base(&parsed_ast, base, grammar_path) {
-        return dsl_error_to_diagnostics(&e.into(), rope);
-    }
-
-    // Full pipeline success.
-    vec![]
 }
 
 // ---------------------------------------------------------------------------

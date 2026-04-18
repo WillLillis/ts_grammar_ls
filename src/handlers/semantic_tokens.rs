@@ -72,7 +72,11 @@ fn compute_semantic_tokens(text: &str, rope: &Rope, analysis: &Analysis) -> Vec<
         let value = match &reference.kind {
             RefKind::Rule(_) | RefKind::BaseRule(_) => (TYPE_CLASS, 0),
             RefKind::Variable(_) => (TYPE_VARIABLE, 0),
-            RefKind::ObjectField { .. } | RefKind::InheritPath | RefKind::Builtin => continue,
+            RefKind::ObjectField { .. }
+            | RefKind::InheritPath
+            | RefKind::ImportPath
+            | RefKind::ImportedMember { .. }
+            | RefKind::Builtin => continue,
         };
         index.insert(reference.span.start, value);
     }
@@ -80,7 +84,7 @@ fn compute_semantic_tokens(text: &str, rope: &Rope, analysis: &Analysis) -> Vec<
         let value = match def.kind {
             DefKind::Rule | DefKind::OverrideRule => (TYPE_CLASS, MOD_DECLARATION),
             DefKind::Function { .. } => (TYPE_FUNCTION, MOD_DECLARATION),
-            DefKind::Let { .. } => (TYPE_VARIABLE, MOD_DECLARATION),
+            DefKind::Let { .. } | DefKind::Import => (TYPE_VARIABLE, MOD_DECLARATION),
             DefKind::ObjectKey | DefKind::Parameter { .. } => continue,
         };
         // Defs override refs (e.g. parameter declaration site).

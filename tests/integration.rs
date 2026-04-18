@@ -2560,3 +2560,211 @@ async fn code_action_not_offered_on_identifier() {
 
     assert_eq!(result, None);
 }
+
+// ---------------------------------------------------------------------------
+// Import tests
+// ---------------------------------------------------------------------------
+
+struct ImportFixture {
+    _dir: tempfile::TempDir,
+    helper_path: std::path::PathBuf,
+    grammar_path: std::path::PathBuf,
+    grammar_text: String,
+}
+
+fn create_import_fixture() -> ImportFixture {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Helper module:
+    // line 1: fn commaSep(item: rule_t) -> rule_t {
+    //         col 3 = "commaSep"
+    // line 5: let PREC = { DEFAULT: 0, CALL: 1 }
+    //         col 4 = "PREC"
+    let helper_text = r#"
+fn commaSep(item: rule_t) -> rule_t {
+    seq(item, repeat(seq(",", item)))
+}
+
+let PREC = { DEFAULT: 0, CALL: 1 }
+"#;
+    let helper_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helper_path, helper_text).unwrap();
+
+    let grammar_text = format!(
+        r#"
+let helpers = import("{}")
+grammar {{ language: "test" }}
+rule program {{ repeat(expression) }}
+rule expression {{ helpers::commaSep("x") }}
+"#,
+        helper_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &grammar_text).unwrap();
+
+    ImportFixture {
+        _dir: dir,
+        helper_path,
+        grammar_path,
+        grammar_text,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn goto_def_import_path() {
+    let fix = create_import_fixture();
+    let grammar_uri = Url::from_file_path(&fix.grammar_path).unwrap();
+    let helper_uri = Url::from_file_path(&fix.helper_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &fix.grammar_text)]).await;
+
+    let path_offset = fix
+        .grammar_text
+        .find(&fix.helper_path.display().to_string())
+        .unwrap();
+    let rope = ropey::Rope::from_str(&fix.grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, path_offset as u32);
+
+    let result = goto_def_at(&mut service, grammar_uri, pos).await;
+    assert_eq!(
+        result,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: helper_uri,
+            range: Range::default(),
+        }))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn goto_def_import_function() {
+    let fix = create_import_fixture();
+    let grammar_uri = Url::from_file_path(&fix.grammar_path).unwrap();
+    let helper_uri = Url::from_file_path(&fix.helper_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &fix.grammar_text)]).await;
+
+    // Cursor on "commaSep" in `helpers::commaSep("x")`
+    let call_offset = fix.grammar_text.find("helpers::commaSep").unwrap() + "helpers::".len();
+    let rope = ropey::Rope::from_str(&fix.grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, call_offset as u32);
+
+    let result = goto_def_at(&mut service, grammar_uri, pos).await;
+    // "commaSep" is at line 1, col 3 in the helper file.
+    assert_eq!(
+        result,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: helper_uri,
+            range: Range::new(Position::new(1, 3), Position::new(1, 11)),
+        }))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hover_import_function() {
+    let fix = create_import_fixture();
+    let grammar_uri = Url::from_file_path(&fix.grammar_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &fix.grammar_text)]).await;
+
+    let call_offset = fix.grammar_text.find("helpers::commaSep").unwrap() + "helpers::".len();
+    let rope = ropey::Rope::from_str(&fix.grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, call_offset as u32);
+
+    let result = hover_at(&mut service, grammar_uri, pos).await;
+    assert_eq!(
+        result,
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "```\nfn commaSep(item: rule_t) -> rule_t\n```".into(),
+            }),
+            range: None,
+        })
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn completion_import_members_after_double_colon() {
+    let fix = create_import_fixture();
+    let grammar_uri = Url::from_file_path(&fix.grammar_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &fix.grammar_text)]).await;
+
+    let colon_offset = fix.grammar_text.find("helpers::commaSep").unwrap() + "helpers::".len();
+    let rope = ropey::Rope::from_str(&fix.grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, colon_offset as u32);
+
+    let mut items = completions_at(&mut service, grammar_uri, pos).await;
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+
+    assert_eq!(
+        items,
+        vec![
+            CompletionItem {
+                label: "PREC".into(),
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some("let PREC".into()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "commaSep".into(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some("fn commaSep(item: rule_t) -> rule_t".into()),
+                ..Default::default()
+            },
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn document_symbol_import_shows_as_module() {
+    let fix = create_import_fixture();
+    let grammar_uri = Url::from_file_path(&fix.grammar_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &fix.grammar_text)]).await;
+
+    let result: Option<DocumentSymbolResponse> = lsp_request::<DocumentSymbolRequest>(
+        &mut service,
+        DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri: grammar_uri },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        },
+    )
+    .await;
+
+    let DocumentSymbolResponse::Nested(symbols) = result.unwrap() else {
+        panic!("expected nested symbols");
+    };
+
+    let helpers_sym = symbols.iter().find(|s| s.name == "helpers").unwrap();
+    assert_eq!(helpers_sym.kind, SymbolKind::MODULE);
+}
+
+// Verify that the inherit fixture's `base` let binding is still classified
+// as a variable (not a module) in document symbols since inherit is not import.
+#[tokio::test(flavor = "current_thread")]
+async fn document_symbol_inherit_binding_is_variable() {
+    let fix = create_inherit_fixture();
+    let derived_uri = Url::from_file_path(&fix.derived_path).unwrap();
+
+    let mut service = init(&[(derived_uri.clone(), &fix.derived_text)]).await;
+
+    let result: Option<DocumentSymbolResponse> = lsp_request::<DocumentSymbolRequest>(
+        &mut service,
+        DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri: derived_uri },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        },
+    )
+    .await;
+
+    let DocumentSymbolResponse::Nested(symbols) = result.unwrap() else {
+        panic!("expected nested symbols");
+    };
+
+    // `let base = inherit(...)` should still be VARIABLE, not MODULE.
+    let base_sym = symbols.iter().find(|s| s.name == "base").unwrap();
+    assert_eq!(base_sym.kind, SymbolKind::VARIABLE);
+}

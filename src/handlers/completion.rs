@@ -65,6 +65,7 @@ const TYPE_KEYWORDS: &[(&str, &str)] = &[
 ];
 
 #[must_use]
+#[expect(clippy::too_many_lines)]
 pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<CompletionResponse> {
     let uri = &params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
@@ -104,8 +105,53 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
         }
     }
 
-    // `IDENT::` -> complete base grammar rules
-    if prev_token.is_some_and(|t| t.kind == TokenKind::ColonColon) {
+    // `IDENT::` -> complete module members (import or base grammar rules).
+    if let Some(cc_token) = prev_token.filter(|t| t.kind == TokenKind::ColonColon) {
+        // Find the identifier immediately before the `::` token.
+        let qualifier = tokens
+            .iter()
+            .take_while(|t| t.span.end <= cc_token.span.start)
+            .last()
+            .filter(|t| t.kind == TokenKind::Ident);
+        let qualifier_name =
+            qualifier.map(|t| &doc.text[t.span.start as usize..t.span.end as usize]);
+
+        // Check if the qualifier is an import variable.
+        if let Some(name) = qualifier_name
+            && let Some(module_info) = analysis.import_modules.get(name)
+        {
+            return Some(CompletionResponse::Array(
+                module_info
+                    .definitions
+                    .iter()
+                    .filter_map(|d| {
+                        let (kind, detail) = match &d.kind {
+                            DefKind::Rule | DefKind::OverrideRule => {
+                                (CompletionItemKind::CLASS, format!("rule {}", d.name))
+                            }
+                            DefKind::Function { signature } => {
+                                (CompletionItemKind::FUNCTION, signature.clone())
+                            }
+                            DefKind::Let { .. } => {
+                                (CompletionItemKind::VARIABLE, format!("let {}", d.name))
+                            }
+                            DefKind::Import => {
+                                (CompletionItemKind::MODULE, format!("import {}", d.name))
+                            }
+                            DefKind::ObjectKey | DefKind::Parameter { .. } => return None,
+                        };
+                        Some(CompletionItem {
+                            label: d.name.clone(),
+                            kind: Some(kind),
+                            detail: Some(detail),
+                            ..Default::default()
+                        })
+                    })
+                    .collect(),
+            ));
+        }
+
+        // Fall back to base grammar rules.
         return Some(CompletionResponse::Array(
             analysis
                 .base_definitions
@@ -132,7 +178,7 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             }
             DefKind::Function { signature } => (CompletionItemKind::FUNCTION, signature.clone()),
             DefKind::Let { .. } => (CompletionItemKind::VARIABLE, format!("let {}", def.name)),
-            DefKind::ObjectKey | DefKind::Parameter { .. } => continue,
+            DefKind::Import | DefKind::ObjectKey | DefKind::Parameter { .. } => continue,
         };
         items.push(CompletionItem {
             label: def.name.clone(),
