@@ -212,6 +212,30 @@ grammar { inherits: base, extras: base.extras }
 override rule expression { choice(base::expression, new_variant) }
 ```";
 
+pub const IMPORT: &str = "\
+```
+import(path: str_t) -> module_t
+```
+Import a helper module at `path` (relative to this file's directory). \
+The imported module's functions, let bindings, and sub-imports are \
+accessible via `module::member` syntax.
+```
+let h = import(\"helpers.tsg\")
+rule expression { h::commaSep(identifier) }
+```";
+
+pub const GRAMMAR_CONFIG: &str = "\
+```
+grammar_config(module: module_t) -> grammar_config_t
+```
+Access the grammar configuration of an inherited or imported module. \
+Returns an object with fields: `extras`, `externals`, `inline`, \
+`supertypes`, `conflicts`, `precedences`, `word`, `reserved`.
+```
+let base = inherit(\"base.tsg\")
+grammar { inherits: base, extras: grammar_config(base).extras }
+```";
+
 // ---------------------------------------------------------------------------
 // Keywords
 // ---------------------------------------------------------------------------
@@ -496,6 +520,8 @@ pub fn builtin_hover(name: &str) -> Option<&'static str> {
         "concat" => CONCAT,
         "append" => APPEND,
         "inherit" => INHERIT,
+        "import" => IMPORT,
+        "grammar_config" => GRAMMAR_CONFIG,
         "grammar" => KW_GRAMMAR,
         "rule" => KW_RULE,
         "override" => KW_OVERRIDE,

@@ -140,7 +140,7 @@ fn goto_import_file(analysis: &Analysis, offset: u32) -> Option<GotoDefinitionRe
             && reference.span.start >= d.full_span.start
             && reference.span.end <= d.full_span.end
     })?;
-    let module_info = analysis.import_modules.get(&import_def.name)?;
+    let module_info = analysis.get_import(&import_def.name)?;
     let uri = Url::from_file_path(&module_info.path).ok()?;
     Some(GotoDefinitionResponse::Scalar(Location {
         uri,
@@ -167,17 +167,16 @@ fn goto_imported_member(
 }
 
 /// Walk an import path chain to find the target module info.
-/// Currently only resolves the first segment from `analysis.import_modules`.
+/// For `a::b::c`, path is `["a", "b"]` - looks up `a` in the analysis,
+/// then `b` in `a`'s sub-imports.
 fn resolve_import_chain<'a>(
     analysis: &'a Analysis,
     path: &[String],
 ) -> Option<&'a crate::document::ExternalModuleInfo> {
     let first = path.first()?;
-    let module_info = analysis.import_modules.get(first.as_str())?;
-    if path.len() > 1 {
-        // Nested imports require ExternalModuleInfo to carry its own
-        // import_modules for sub-imports. Not yet implemented.
-        return None;
+    let mut module_info = analysis.get_import(first.as_str())?;
+    for segment in &path[1..] {
+        module_info = module_info.get_import(segment)?;
     }
     Some(module_info)
 }

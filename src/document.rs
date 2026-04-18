@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use ropey::Rope;
-use rustc_hash::FxHashMap;
 use tower_lsp::lsp_types::Diagnostic;
 
 use tree_sitter_generate::nativedsl::ast::Span;
@@ -156,6 +155,19 @@ pub struct ExternalModuleInfo {
     pub definitions: Vec<Definition>,
     pub references: Vec<Reference>,
     pub rope: Rope,
+    /// Sub-imports within this module, for resolving nested `a::b::c` access.
+    pub import_modules: Vec<(String, Self)>,
+}
+
+impl ExternalModuleInfo {
+    /// Look up a sub-import by variable name.
+    #[must_use]
+    pub fn get_import(&self, name: &str) -> Option<&Self> {
+        self.import_modules
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, info)| info)
+    }
 }
 
 /// On-demand analysis results from a pipeline run.
@@ -188,12 +200,21 @@ pub struct Analysis {
     pub base_references: Option<Vec<Reference>>,
     /// Cached rope for the base grammar source (for span-to-range conversion).
     pub base_rope: Option<Rope>,
-    /// Imported modules, keyed by the let-binding name (e.g. `"helpers"` for
+    /// Imported modules, paired with their let-binding name (e.g. `"helpers"` for
     /// `let helpers = import("helpers.tsg")`).
-    pub import_modules: FxHashMap<String, ExternalModuleInfo>,
+    pub import_modules: Vec<(String, ExternalModuleInfo)>,
 }
 
 impl Analysis {
+    /// Look up an imported module by variable name.
+    #[must_use]
+    pub fn get_import(&self, name: &str) -> Option<&ExternalModuleInfo> {
+        self.import_modules
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, info)| info)
+    }
+
     /// Find the narrowest enclosing scope for a given byte offset.
     /// Checks both function spans and for-loop scopes from parameter definitions.
     #[must_use]

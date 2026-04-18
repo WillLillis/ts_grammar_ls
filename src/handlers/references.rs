@@ -141,7 +141,7 @@ fn import_member_references(
     if include_declaration {
         // Find the import module that contains this member and include the
         // declaration from the imported file.
-        for module_info in analysis.import_modules.values() {
+        for (_, module_info) in &analysis.import_modules {
             if let Some(def) = module_info.definitions.iter().find(|d| d.name == word)
                 && let Ok(module_uri) = Url::from_file_path(&module_info.path)
             {

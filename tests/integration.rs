@@ -2768,3 +2768,227 @@ async fn document_symbol_inherit_binding_is_variable() {
     let base_sym = symbols.iter().find(|s| s.name == "base").unwrap();
     assert_eq!(base_sym.kind, SymbolKind::VARIABLE);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn goto_def_nested_import() {
+    // Setup: grammar imports helpers, helpers imports utils.
+    // grammar uses helpers::utils_fn which is actually utils::utils_fn.
+    let dir = tempfile::tempdir().unwrap();
+
+    // utils.tsg: defines utils_fn
+    let utils_text = r#"
+fn utils_fn(x: rule_t) -> rule_t { x }
+"#;
+    let utils_path = dir.path().join("utils.tsg");
+    std::fs::write(&utils_path, utils_text).unwrap();
+
+    // helpers.tsg: imports utils
+    let helpers_text = format!(
+        r#"
+let utils = import("{}")
+fn helper_fn(x: rule_t) -> rule_t {{ utils::utils_fn(x) }}
+"#,
+        utils_path.display()
+    );
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, &helpers_text).unwrap();
+
+    // grammar.tsg: imports helpers, uses helpers::helper_fn
+    let grammar_text = format!(
+        r#"
+let h = import("{}")
+grammar {{ language: "test" }}
+rule program {{ h::helper_fn("x") }}
+"#,
+        helpers_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &grammar_text).unwrap();
+
+    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
+    let helpers_uri = Url::from_file_path(&helpers_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &grammar_text)]).await;
+
+    // Goto-def on "helper_fn" in `h::helper_fn("x")` should jump to helpers.tsg.
+    // "helper_fn" is at line 2, col 3 in helpers.tsg.
+    let offset = grammar_text.find("h::helper_fn").unwrap() + "h::".len();
+    let rope = ropey::Rope::from_str(&grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    assert_eq!(
+        goto_def_at(&mut service, grammar_uri.clone(), pos).await,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: helpers_uri,
+            range: Range::new(Position::new(2, 3), Position::new(2, 12)),
+        }))
+    );
+
+    // Completion after `h::` should include both helper_fn and utils (the sub-import).
+    let cc_pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+    let mut items = completions_at(&mut service, grammar_uri, cc_pos).await;
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+
+    assert_eq!(
+        items,
+        vec![
+            CompletionItem {
+                label: "helper_fn".into(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some("fn helper_fn(x: rule_t) -> rule_t".into()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "utils".into(),
+                kind: Some(CompletionItemKind::MODULE),
+                detail: Some("import utils".into()),
+                ..Default::default()
+            },
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn import_cycle_does_not_hang() {
+    // Two files that import each other. The LSP should not hang or crash.
+    let dir = tempfile::tempdir().unwrap();
+
+    let a_path = dir.path().join("a.tsg");
+    let b_path = dir.path().join("b.tsg");
+
+    let a_text = format!(
+        "let b = import(\"{}\")\nfn a_fn(x: rule_t) -> rule_t {{ x }}\n",
+        b_path.display()
+    );
+    let b_text = format!(
+        "let a = import(\"{}\")\nfn b_fn(x: rule_t) -> rule_t {{ x }}\n",
+        a_path.display()
+    );
+    std::fs::write(&a_path, &a_text).unwrap();
+    std::fs::write(&b_path, &b_text).unwrap();
+
+    let grammar_text = format!(
+        r#"
+let moda = import("{}")
+grammar {{ language: "test" }}
+rule program {{ moda::a_fn("x") }}
+"#,
+        a_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &grammar_text).unwrap();
+
+    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
+    let a_uri = Url::from_file_path(&a_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &grammar_text)]).await;
+
+    // Should still be able to goto-def on a_fn despite the cycle.
+    // "a_fn" is at line 1, col 3 in a.tsg.
+    let offset = grammar_text.find("moda::a_fn").unwrap() + "moda::".len();
+    let rope = ropey::Rope::from_str(&grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    assert_eq!(
+        goto_def_at(&mut service, grammar_uri, pos).await,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: a_uri,
+            range: Range::new(Position::new(1, 3), Position::new(1, 7)),
+        }))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn references_imported_member() {
+    let fix = create_import_fixture();
+    let grammar_uri = Url::from_file_path(&fix.grammar_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &fix.grammar_text)]).await;
+
+    // Cursor on "commaSep" in `helpers::commaSep("x")`
+    let offset = fix.grammar_text.find("helpers::commaSep").unwrap() + "helpers::".len();
+    let rope = ropey::Rope::from_str(&fix.grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    // Without declaration: just the usage in this file.
+    let result = references_at(&mut service, grammar_uri.clone(), pos, false).await;
+    assert_eq!(
+        result,
+        Some(vec![Location {
+            uri: grammar_uri.clone(),
+            range: Range::new(Position::new(4, 27), Position::new(4, 35)),
+        }])
+    );
+
+    // With declaration: usage in grammar + definition in helper.
+    let helper_uri = Url::from_file_path(&fix.helper_path).unwrap();
+    let mut result = references_at(&mut service, grammar_uri, pos, true)
+        .await
+        .unwrap();
+    result.sort_by(|a, b| {
+        a.uri
+            .as_str()
+            .cmp(b.uri.as_str())
+            .then(a.range.start.line.cmp(&b.range.start.line))
+    });
+    assert_eq!(
+        result,
+        vec![
+            // grammar.tsg usage
+            Location {
+                uri: Url::from_file_path(&fix.grammar_path).unwrap(),
+                range: Range::new(Position::new(4, 27), Position::new(4, 35)),
+            },
+            // helpers.tsg declaration - "commaSep" at line 1, col 3
+            Location {
+                uri: helper_uri,
+                range: Range::new(Position::new(1, 3), Position::new(1, 11)),
+            },
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn highlight_imported_member() {
+    let fix = create_import_fixture();
+    let grammar_uri = Url::from_file_path(&fix.grammar_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &fix.grammar_text)]).await;
+
+    // Cursor on "commaSep" in `helpers::commaSep("x")`
+    let offset = fix.grammar_text.find("helpers::commaSep").unwrap() + "helpers::".len();
+    let rope = ropey::Rope::from_str(&fix.grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    assert_eq!(
+        highlights_at(&mut service, grammar_uri, pos).await,
+        Some(vec![DocumentHighlight {
+            range: Range::new(Position::new(4, 27), Position::new(4, 35)),
+            kind: Some(DocumentHighlightKind::READ),
+        }])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hover_import_variable() {
+    let fix = create_import_fixture();
+    let grammar_uri = Url::from_file_path(&fix.grammar_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &fix.grammar_text)]).await;
+
+    // Cursor on "helpers" in `let helpers = import("...")`
+    let offset = fix.grammar_text.find("let helpers").unwrap() + "let ".len();
+    let rope = ropey::Rope::from_str(&fix.grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    assert_eq!(
+        hover_at(&mut service, grammar_uri, pos).await,
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "```\nimport helpers\n```".into(),
+            }),
+            range: None,
+        })
+    );
+}

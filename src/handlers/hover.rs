@@ -112,7 +112,7 @@ fn imported_member_hover(
     // Find which import module this access belongs to.
     let tokens = analysis.tokens.as_deref()?;
     let module_name = crate::text::qualified_access_module(tokens, source, offset)?;
-    let module_info = analysis.import_modules.get(module_name)?;
+    let module_info = analysis.get_import(module_name)?;
     let def = module_info.definitions.iter().find(|d| d.name == word)?;
     let content = match &def.kind {
         DefKind::Function { signature } => format!("```\n{signature}\n```"),

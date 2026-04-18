@@ -28,6 +28,8 @@ const BUILTIN_COMBINATORS: &[(&str, &str)] = &[
     ("append", "Concatenate lists"),
     ("reserved", "Reserved word context"),
     ("inherit", "Inherit from base grammar"),
+    ("import", "Import a helper module"),
+    ("grammar_config", "Access a module's grammar configuration"),
 ];
 
 const KEYWORDS: &[(&str, &str)] = &[
@@ -86,11 +88,20 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
         span: dot_span,
     }) = prev_token
     {
-        let ident = tokens
+        let before_dot = tokens
             .iter()
             .take_while(|t| t.span.end <= dot_span.start)
             .last();
-        if let Some(ident) = ident.filter(|t| t.kind == TokenKind::Ident) {
+
+        // `grammar_config(x).` -> complete grammar config fields.
+        if before_dot.is_some_and(|t| t.kind == TokenKind::RParen)
+            && is_grammar_config_call(tokens, &doc.text, dot_span.start)
+        {
+            return Some(CompletionResponse::Array(grammar_config_field_completions()));
+        }
+
+        // `IDENT.` -> complete object fields.
+        if let Some(ident) = before_dot.filter(|t| t.kind == TokenKind::Ident) {
             let obj_name = &doc.text[ident.span.start as usize..ident.span.end as usize];
             if let Some(defs) = &analysis.definitions {
                 return Some(CompletionResponse::Array(object_field_completions(
@@ -118,7 +129,7 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
 
         // Check if the qualifier is an import variable.
         if let Some(name) = qualifier_name
-            && let Some(module_info) = analysis.import_modules.get(name)
+            && let Some(module_info) = analysis.get_import(name)
         {
             return Some(CompletionResponse::Array(
                 module_info
@@ -300,6 +311,66 @@ fn object_field_completions(
             label: d.name.clone(),
             kind: Some(CompletionItemKind::FIELD),
             detail: Some(format!("{obj_name}.{}", d.name)),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Check if the `)` at `rparen_end` closes a `grammar_config(...)` call.
+/// Walks back through the tokens to find the matching `(`, then checks
+/// if the identifier before it is `grammar_config`.
+fn is_grammar_config_call(tokens: &[Token], text: &str, rparen_end: u32) -> bool {
+    // Find the RParen token ending at rparen_end.
+    let rp_idx = tokens
+        .iter()
+        .position(|t| t.kind == TokenKind::RParen && t.span.end == rparen_end);
+    let Some(rp_idx) = rp_idx else {
+        return false;
+    };
+    // Walk backwards to find the matching LParen.
+    let mut depth = 1u32;
+    let mut i = rp_idx;
+    while i > 0 {
+        i -= 1;
+        match tokens[i].kind {
+            TokenKind::RParen => depth += 1,
+            TokenKind::LParen => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 || i == 0 {
+        return false;
+    }
+    // Check the token before the LParen.
+    let prev = &tokens[i - 1];
+    prev.kind == TokenKind::Ident
+        && &text[prev.span.start as usize..prev.span.end as usize] == "grammar_config"
+}
+
+/// Grammar config fields with their types, matching the typecheck module's field access.
+const GRAMMAR_CONFIG_FIELDS: &[(&str, &str)] = &[
+    ("extras", "list_rule_t"),
+    ("externals", "list_rule_t"),
+    ("inline", "list_rule_t"),
+    ("supertypes", "list_rule_t"),
+    ("conflicts", "list_list_rule_t"),
+    ("precedences", "list_list_rule_t"),
+    ("word", "rule_t"),
+    ("reserved", "{ [context]: list_rule_t }"),
+];
+
+fn grammar_config_field_completions() -> Vec<CompletionItem> {
+    GRAMMAR_CONFIG_FIELDS
+        .iter()
+        .map(|&(name, ty)| CompletionItem {
+            label: name.into(),
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some(format!("{name}: {ty}")),
             ..Default::default()
         })
         .collect()

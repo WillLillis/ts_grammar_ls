@@ -466,17 +466,41 @@ fn extract_analysis(
     }
 }
 
+/// Shared state for recursive import loading: cycle detection and deduplication.
+struct ImportLoadContext<'a> {
+    analysis_ctx: Option<&'a AnalysisContext<'a>>,
+    /// Ancestor chain for cycle detection (canonical paths of files being loaded).
+    ancestor_paths: Vec<PathBuf>,
+    /// Deduplication cache: canonical path -> already-loaded module info.
+    /// When the same file is imported by multiple modules, we clone from
+    /// here instead of re-parsing.
+    loaded: rustc_hash::FxHashMap<PathBuf, crate::document::ExternalModuleInfo>,
+}
+
 /// Load imported module info for all `let x = import("path")` bindings.
 /// Resolves each import path relative to `grammar_dir`, parses the module,
-/// and caches results using the same `BaseGrammarCache` infrastructure.
+/// and recursively loads sub-imports with cycle detection and deduplication.
 fn extract_import_modules(
     parsed_ast: &ast::Ast,
     grammar_dir: &Path,
     ctx: Option<&AnalysisContext<'_>>,
-) -> rustc_hash::FxHashMap<String, crate::document::ExternalModuleInfo> {
+) -> Vec<(String, crate::document::ExternalModuleInfo)> {
+    let mut load_ctx = ImportLoadContext {
+        analysis_ctx: ctx,
+        ancestor_paths: Vec::new(),
+        loaded: rustc_hash::FxHashMap::default(),
+    };
+    extract_import_modules_inner(parsed_ast, grammar_dir, &mut load_ctx)
+}
+
+fn extract_import_modules_inner(
+    parsed_ast: &ast::Ast,
+    grammar_dir: &Path,
+    load_ctx: &mut ImportLoadContext<'_>,
+) -> Vec<(String, crate::document::ExternalModuleInfo)> {
     use crate::document::ExternalModuleInfo;
 
-    let mut modules = rustc_hash::FxHashMap::default();
+    let mut modules = Vec::new();
 
     for &item_id in &parsed_ast.root_items {
         let ast::Node::Let { name, value, .. } = parsed_ast.node(item_id) else {
@@ -491,20 +515,62 @@ fn extract_import_modules(
         let full_path = grammar_dir.join(path_str);
         let canonical = dunce::canonicalize(&full_path).ok().unwrap_or(full_path);
 
-        if let Some((defs, refs, rope)) = extract_base_grammar_info(&canonical, ctx) {
-            modules.insert(
-                var_name,
-                ExternalModuleInfo {
-                    path: canonical,
-                    definitions: defs,
-                    references: refs,
-                    rope,
-                },
-            );
+        // Cycle detection: skip if this path is already in the ancestor chain.
+        if load_ctx.ancestor_paths.iter().any(|p| p == &canonical) {
+            continue;
+        }
+
+        // Deduplication: reuse if we've already loaded this path.
+        if let Some(cached) = load_ctx.loaded.get(&canonical) {
+            modules.push((var_name, cached.clone()));
+            continue;
+        }
+
+        if let Some((defs, refs, rope)) = extract_base_grammar_info(&canonical, load_ctx.analysis_ctx) {
+            load_ctx.ancestor_paths.push(canonical.clone());
+            let sub_imports = load_sub_imports(&canonical, load_ctx);
+            load_ctx.ancestor_paths.pop();
+
+            let info = ExternalModuleInfo {
+                path: canonical.clone(),
+                definitions: defs,
+                references: refs,
+                rope,
+                import_modules: sub_imports,
+            };
+            load_ctx.loaded.insert(canonical, info.clone());
+            modules.push((var_name, info));
         }
     }
 
     modules
+}
+
+/// Parse an imported module file and recursively extract its sub-imports.
+fn load_sub_imports(
+    module_path: &Path,
+    load_ctx: &mut ImportLoadContext<'_>,
+) -> Vec<(String, crate::document::ExternalModuleInfo)> {
+    let Some(module_dir) = module_path.parent() else {
+        return Vec::new();
+    };
+    let content = load_ctx
+        .analysis_ctx
+        .and_then(|c| current_base_source(module_path, c.document_map))
+        .map(|(_, c)| c)
+        .or_else(|| std::fs::read_to_string(module_path).ok());
+    let Some(content) = content else {
+        return Vec::new();
+    };
+    let Ok(tokens) = nativedsl::lexer::Lexer::new(&content).tokenize() else {
+        return Vec::new();
+    };
+    let Ok(parsed_ast) =
+        nativedsl::parser::Parser::new(&tokens, content, module_path).parse()
+    else {
+        return Vec::new();
+    };
+    extract_import_modules_inner(&parsed_ast, module_dir, load_ctx)
 }
 
 /// Scan lexer tokens for builtin combinator keywords and add them as references.
