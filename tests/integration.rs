@@ -10,7 +10,8 @@ use tower_lsp::lsp_types::notification::{
 };
 use tower_lsp::lsp_types::request::{
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting,
-    GotoDefinition, HoverRequest, Initialize, References, SemanticTokensFullRequest,
+    GotoDefinition, HoverRequest, Initialize, PrepareRenameRequest, References, Rename,
+    SemanticTokensFullRequest,
 };
 use tower_lsp::lsp_types::*;
 
@@ -3277,4 +3278,172 @@ rule expression {
     let result = goto_def_at(&mut service, uri, pos).await;
     // Should find the definition - exact position from the stale analysis.
     assert!(result.is_some(), "goto-def should work after syntax error");
+}
+
+// ---------------------------------------------------------------------------
+// Rename tests
+// ---------------------------------------------------------------------------
+
+async fn prepare_rename_at(
+    service: &mut LspService<Backend>,
+    uri: Url,
+    pos: Position,
+) -> Option<PrepareRenameResponse> {
+    lsp_request::<PrepareRenameRequest>(
+        service,
+        TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: pos,
+        },
+    )
+    .await
+}
+
+async fn rename_at(
+    service: &mut LspService<Backend>,
+    uri: Url,
+    pos: Position,
+    new_name: &str,
+) -> Option<WorkspaceEdit> {
+    lsp_request::<Rename>(
+        service,
+        RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: pos,
+            },
+            new_name: new_name.into(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        },
+    )
+    .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rename_rule() {
+    let grammar = r#"
+grammar { language: "test" }
+rule program { repeat(expression) }
+rule expression { "x" }
+"#;
+    let uri = test_uri();
+    let mut service = init(&[(uri.clone(), grammar)]).await;
+
+    // Cursor on "expression" at its definition (line 3).
+    let rope = ropey::Rope::from_str(grammar);
+    let def_offset = grammar.rfind("expression").unwrap();
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, def_offset as u32);
+
+    // prepare_rename should succeed and return the range of "expression".
+    let prep = prepare_rename_at(&mut service, uri.clone(), pos).await;
+    assert!(prep.is_some(), "prepare_rename should succeed on rule name");
+
+    // Rename "expression" to "expr".
+    let edit = rename_at(&mut service, uri.clone(), pos, "expr").await;
+    let edit = edit.unwrap();
+    let changes = edit.changes.unwrap();
+    let edits = &changes[&uri];
+
+    // Should have 2 edits: definition site + usage in `repeat(expression)`.
+    assert_eq!(edits.len(), 2);
+    assert!(edits.iter().all(|e| e.new_text == "expr"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rename_function() {
+    let grammar = r#"
+grammar { language: "test" }
+fn helper(x: rule_t) -> rule_t { x }
+rule program { helper("x") }
+"#;
+    let uri = test_uri();
+    let mut service = init(&[(uri.clone(), grammar)]).await;
+
+    let rope = ropey::Rope::from_str(grammar);
+    let offset = grammar.find("helper").unwrap();
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    let edit = rename_at(&mut service, uri.clone(), pos, "wrap").await.unwrap();
+    let edits = &edit.changes.unwrap()[&uri];
+
+    // Definition + usage = 2 edits.
+    assert_eq!(edits.len(), 2);
+    assert!(edits.iter().all(|e| e.new_text == "wrap"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rename_parameter_scoped() {
+    let grammar = r#"
+grammar { language: "test" }
+fn foo(item: rule_t) -> rule_t { item }
+fn bar(item: rule_t) -> rule_t { seq(item, item) }
+rule program { foo("x") }
+"#;
+    let uri = test_uri();
+    let mut service = init(&[(uri.clone(), grammar)]).await;
+
+    // Rename "item" inside foo - should NOT affect bar's "item".
+    let rope = ropey::Rope::from_str(grammar);
+    let foo_item_offset = grammar.find("item").unwrap();
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, foo_item_offset as u32);
+
+    let edit = rename_at(&mut service, uri.clone(), pos, "x").await.unwrap();
+    let edits = &edit.changes.unwrap()[&uri];
+
+    // foo's "item" appears twice: parameter + body usage.
+    assert_eq!(edits.len(), 2);
+    assert!(edits.iter().all(|e| e.new_text == "x"));
+
+    // Verify the edits are in foo's range, not bar's.
+    let foo_end = grammar.find("fn bar").unwrap() as u32;
+    for edit in edits {
+        let edit_byte = ts_grammar_ls::text::position_to_offset(&rope, edit.range.start).unwrap();
+        assert!(
+            edit_byte < foo_end,
+            "edit should be in foo, not bar: byte {edit_byte}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rename_rejects_invalid_name() {
+    let grammar = r#"
+grammar { language: "test" }
+rule program { "x" }
+"#;
+    let uri = test_uri();
+    let mut service = init(&[(uri.clone(), grammar)]).await;
+
+    let rope = ropey::Rope::from_str(grammar);
+    let offset = grammar.find("program").unwrap();
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    // Invalid names should return None.
+    assert_eq!(rename_at(&mut service, uri.clone(), pos, "1bad").await, None);
+    assert_eq!(rename_at(&mut service, uri.clone(), pos, "").await, None);
+    assert_eq!(
+        rename_at(&mut service, uri.clone(), pos, "has space").await,
+        None
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_rename_rejects_builtins() {
+    let grammar = r#"
+grammar { language: "test" }
+rule program { seq("a", "b") }
+"#;
+    let uri = test_uri();
+    let mut service = init(&[(uri.clone(), grammar)]).await;
+
+    // Cursor on "seq" - a builtin, not renameable.
+    let rope = ropey::Rope::from_str(grammar);
+    let offset = grammar.find("seq").unwrap();
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    assert_eq!(
+        prepare_rename_at(&mut service, uri, pos).await,
+        None,
+        "builtins should not be renameable"
+    );
 }

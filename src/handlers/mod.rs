@@ -12,4 +12,5 @@ pub mod goto_definition;
 pub mod hover;
 pub mod initialize;
 pub mod references;
+pub mod rename;
 pub mod semantic_tokens;

@@ -10,8 +10,9 @@ use tower_lsp::{
         DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams,
         DocumentHighlight, DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse,
         GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
-        InitializeResult, Location, ReferenceParams, SemanticTokensParams, SemanticTokensResult,
-        TextEdit, Url,
+        InitializeResult, Location, PrepareRenameResponse, ReferenceParams, RenameParams,
+        SemanticTokensParams, SemanticTokensResult, TextDocumentPositionParams, TextEdit, Url,
+        WorkspaceEdit,
     },
 };
 
@@ -181,5 +182,16 @@ impl LanguageServer for Backend {
         params: CodeActionParams,
     ) -> jsonrpc::Result<Option<CodeActionResponse>> {
         Ok(handlers::code_action::code_action(self, &params))
+    }
+
+    async fn rename(&self, params: RenameParams) -> jsonrpc::Result<Option<WorkspaceEdit>> {
+        Ok(handlers::rename::rename(self, &params))
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> jsonrpc::Result<Option<PrepareRenameResponse>> {
+        Ok(handlers::rename::prepare_rename(self, &params))
     }
 }
