@@ -30,10 +30,9 @@ pub fn hover(backend: &Backend, params: &HoverParams) -> Option<Hover> {
         }
         // On the rule part of `base::rule_name`, show the base grammar's definition.
         CursorContext::BaseRuleAccess => analysis
-            .base_definitions
-            .iter()
-            .flatten()
-            .find(|d| d.name == word)
+            .base_module
+            .as_ref()
+            .and_then(|m| m.definitions.iter().find(|d| d.name == word))
             .map(|def| make_hover(format!("```\n{} {}\n```", def.kind.label(), def.name))),
         // On a member accessed through an imported module (`mod::fn_name`).
         CursorContext::ImportModuleAccess { .. } => {

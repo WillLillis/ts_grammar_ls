@@ -209,14 +209,9 @@ pub struct Analysis {
     pub definitions: Option<Vec<Definition>>,
     /// References extracted from the resolved AST. Available after resolve.
     pub references: Option<Vec<Reference>>,
-    /// Resolved absolute path to the base grammar. Available after stage 4.
-    pub base_grammar_path: Option<std::path::PathBuf>,
-    /// Definitions from the base grammar (for go-to-def on `base::foo`).
-    pub base_definitions: Option<Vec<Definition>>,
-    /// References from the base grammar (for find-references on `base::foo`).
-    pub base_references: Option<Vec<Reference>>,
-    /// Cached rope for the base grammar source (for span-to-range conversion).
-    pub base_rope: Option<Rope>,
+    /// Parsed info from the inherited base grammar (for go-to-def, references,
+    /// and completion on `base::rule_name`). Available after stage 4.
+    pub base_module: Option<ExternalModuleInfo>,
     /// Imported modules, paired with their let-binding name (e.g. `"helpers"` for
     /// `let helpers = import("helpers.tsg")`).
     pub import_modules: Vec<(String, ExternalModuleInfo)>,

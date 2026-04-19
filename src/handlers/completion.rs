@@ -168,9 +168,9 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
         // Fall back to base grammar rules.
         return Some(CompletionResponse::Array(
             analysis
-                .base_definitions
+                .base_module
                 .iter()
-                .flatten()
+                .flat_map(|m| &m.definitions)
                 .filter(|d| matches!(d.kind, DefKind::Rule))
                 .map(|d| CompletionItem {
                     label: d.name.clone(),

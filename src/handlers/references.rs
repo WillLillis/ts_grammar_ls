@@ -47,26 +47,22 @@ fn base_rule_references(
 ) -> Option<Vec<Location>> {
     let mut locations = Vec::new();
 
-    if let (Some(base_path), Some(base_rope)) = (&analysis.base_grammar_path, &analysis.base_rope)
-        && let Ok(base_uri) = Url::from_file_path(base_path)
+    if let Some(base) = &analysis.base_module
+        && let Ok(base_uri) = Url::from_file_path(&base.path)
     {
         if include_declaration
-            && let Some(def) = analysis
-                .base_definitions
-                .iter()
-                .flatten()
-                .find(|d| d.name == word)
+            && let Some(def) = base.definitions.iter().find(|d| d.name == word)
         {
             locations.push(Location {
                 uri: base_uri.clone(),
-                range: text::span_to_range(base_rope, def.name_span),
+                range: text::span_to_range(&base.rope, def.name_span),
             });
         }
-        for reference in analysis.base_references.iter().flatten() {
+        for reference in &base.references {
             if matches!(&reference.kind, RefKind::Rule(name) if name == word) {
                 locations.push(Location {
                     uri: base_uri.clone(),
-                    range: text::span_to_range(base_rope, reference.span),
+                    range: text::span_to_range(&base.rope, reference.span),
                 });
             }
         }

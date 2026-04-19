@@ -55,8 +55,8 @@ pub fn goto_definition(
                 return goto_object_field(uri, &source, object, field);
             }
             RefKind::InheritPath => {
-                let base_path = analysis.base_grammar_path.as_ref()?;
-                let base_uri = Url::from_file_path(base_path).ok()?;
+                let base = analysis.base_module.as_ref()?;
+                let base_uri = Url::from_file_path(&base.path).ok()?;
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: base_uri,
                     range: Range::default(),
@@ -91,15 +91,10 @@ pub fn goto_definition(
 
 /// Jump to a definition in the base grammar file.
 fn goto_base_definition(analysis: &Analysis, name: &str) -> Option<GotoDefinitionResponse> {
-    let base_path = analysis.base_grammar_path.as_ref()?;
-    let base_rope = analysis.base_rope.as_ref()?;
-    let def = analysis
-        .base_definitions
-        .iter()
-        .flatten()
-        .find(|d| d.name == *name)?;
-    let range = text::span_to_range(base_rope, def.name_span);
-    let base_uri = Url::from_file_path(base_path).ok()?;
+    let base = analysis.base_module.as_ref()?;
+    let def = base.definitions.iter().find(|d| d.name == *name)?;
+    let range = text::span_to_range(&base.rope, def.name_span);
+    let base_uri = Url::from_file_path(&base.path).ok()?;
     Some(GotoDefinitionResponse::Scalar(Location {
         uri: base_uri,
         range,

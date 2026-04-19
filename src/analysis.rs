@@ -430,12 +430,16 @@ fn extract_analysis(
     let import_names = collect_import_names(parsed_ast);
     let mut references = extract_references(parsed_ast, &import_names, &scopes);
     extract_builtin_references(tokens, grammar_span, &mut references);
-    let (base_definitions, base_references, base_rope) = base_grammar_path
-        .as_ref()
-        .and_then(|p| extract_base_grammar_info(p, ctx))
-        .map_or((Vec::new(), Vec::new(), None), |(defs, refs, rope)| {
-            (defs, refs, Some(rope))
-        });
+    let base_module = base_grammar_path.and_then(|path| {
+        let (defs, refs, rope) = extract_base_grammar_info(&path, ctx)?;
+        Some(crate::document::ExternalModuleInfo {
+            path,
+            definitions: defs,
+            references: refs,
+            rope,
+            import_modules: Vec::new(),
+        })
+    });
 
     // Load imported modules.
     let import_modules = extract_import_modules(parsed_ast, grammar_dir, ctx);
@@ -445,10 +449,7 @@ fn extract_analysis(
         grammar_span,
         definitions: Some(definitions),
         references: Some(references),
-        base_grammar_path,
-        base_definitions: Some(base_definitions),
-        base_references: Some(base_references),
-        base_rope,
+        base_module,
         import_modules,
     }
 }
