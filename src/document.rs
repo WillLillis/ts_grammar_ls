@@ -181,9 +181,9 @@ pub struct ExternalModuleInfo {
 }
 
 impl ExternalModuleInfo {
-    /// Look up a sub-import by variable name.
+    /// Look up a nested sub-module by variable name.
     #[must_use]
-    pub fn get_import(&self, name: &str) -> Option<&Self> {
+    pub fn get_submodule(&self, name: &str) -> Option<&Self> {
         self.import_modules
             .iter()
             .find(|(n, _)| n == name)

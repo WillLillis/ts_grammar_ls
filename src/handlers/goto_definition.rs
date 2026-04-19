@@ -138,10 +138,7 @@ fn goto_import_file(analysis: &Analysis, offset: u32) -> Option<GotoDefinitionRe
 
 /// Jump to a member definition inside an imported module.
 /// For `a::b::c`, path is `["a", "b"]` and member is `"c"`. Walks the
-/// chain through nested imports to find the target module.
-///
-/// TODO: nested imports (`path.len()` > 1) require recursive module loading
-/// in `ExternalModuleInfo` - currently only single-level imports resolve.
+/// chain through nested sub-modules to find the target.
 fn goto_imported_member(
     analysis: &Analysis,
     path: &[String],
@@ -166,7 +163,7 @@ fn resolve_import_chain<'a>(
     let first = path.first()?;
     let mut module_info = analysis.get_module(first.as_str())?;
     for segment in &path[1..] {
-        module_info = module_info.get_import(segment)?;
+        module_info = module_info.get_submodule(segment)?;
     }
     Some(module_info)
 }
