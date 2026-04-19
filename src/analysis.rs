@@ -90,9 +90,9 @@ fn extract_definitions(parsed_ast: &ast::Ast, scopes: &ScopeIndex) -> Vec<Defini
     }
 
     // Extract for-loop bindings from all nodes.
-    for (i, node) in parsed_ast.nodes.iter().enumerate().skip(1) {
+    for (node_id, node) in parsed_ast.arena.iter() {
         if let ast::Node::For(for_id) = node {
-            let for_span = parsed_ast.context.spans[i];
+            let for_span = parsed_ast.span(node_id);
             let config = parsed_ast.get_for(*for_id);
             let scope = scopes.find(for_span).unwrap_or(for_span);
             for &(binding_span, _) in &config.bindings {
@@ -125,9 +125,9 @@ impl ScopeIndex {
                 scopes.push(parsed_ast.span(item_id));
             }
         }
-        for (i, node) in parsed_ast.nodes.iter().enumerate().skip(1) {
+        for (node_id, node) in parsed_ast.arena.iter() {
             if matches!(node, ast::Node::For(_)) {
-                scopes.push(parsed_ast.context.spans[i]);
+                scopes.push(parsed_ast.span(node_id));
             }
         }
         // Sort by start descending so inner (narrower) scopes come first.
@@ -188,9 +188,8 @@ fn extract_references(
 ) -> Vec<Reference> {
     let mut references = Vec::new();
 
-    for (i, node) in parsed_ast.nodes.iter().enumerate().skip(1) {
-        let id = ast::NodeId(std::num::NonZeroU32::new(i as u32).unwrap());
-        let span = parsed_ast.span(id);
+    for (node_id, node) in parsed_ast.arena.iter() {
+        let span = parsed_ast.span(node_id);
         match node {
             ast::Node::RuleRef => {
                 references.push(Reference {
@@ -350,14 +349,9 @@ fn resolve_base_grammar(
         return (None, Some(canonical));
     };
 
-    let module = nativedsl::load_module(
-        &content,
-        &canonical,
-        nativedsl::ModuleKind::Grammar,
-        &[],
-    )
-    .ok()
-    .map(std::sync::Arc::new);
+    let module = nativedsl::load_module(&content, &canonical, nativedsl::ModuleKind::Grammar, &[])
+        .ok()
+        .map(std::sync::Arc::new);
 
     // Store the module in the grammar cache for reuse.
     if let Some(ctx) = ctx
@@ -573,7 +567,9 @@ fn extract_import_modules_inner(
             continue;
         }
 
-        if let Some((defs, refs, rope)) = extract_base_grammar_info(&canonical, load_ctx.analysis_ctx) {
+        if let Some((defs, refs, rope)) =
+            extract_base_grammar_info(&canonical, load_ctx.analysis_ctx)
+        {
             load_ctx.ancestor_paths.push(canonical.clone());
             let sub_imports = load_sub_imports(&canonical, load_ctx);
             load_ctx.ancestor_paths.pop();
@@ -612,8 +608,7 @@ fn load_sub_imports(
     let Ok(tokens) = nativedsl::lexer::Lexer::new(&content).tokenize() else {
         return Vec::new();
     };
-    let Ok(parsed_ast) =
-        nativedsl::parser::Parser::new(&tokens, content, module_path).parse()
+    let Ok(parsed_ast) = nativedsl::parser::Parser::new(&tokens, content, module_path).parse()
     else {
         return Vec::new();
     };
@@ -930,11 +925,17 @@ mod bench {
         }
         let total_time = start.elapsed() / n;
 
-        eprintln!("=== analyze() breakdown on cpp grammar ({} lines) ===", source.lines().count());
+        eprintln!(
+            "=== analyze() breakdown on cpp grammar ({} lines) ===",
+            source.lines().count()
+        );
         eprintln!("Lex:               {:>8?}", lex_time);
         eprintln!("Parse:             {:>8?}", parse_time);
         eprintln!("Validate:          {:>8?}", validate_time);
-        eprintln!("Load base grammar: {:>8?}  (one-shot, not amortized)", load_base_time);
+        eprintln!(
+            "Load base grammar: {:>8?}  (one-shot, not amortized)",
+            load_base_time
+        );
         eprintln!("Resolve:           {:>8?}", resolve_time);
         eprintln!("ScopeIndex build:  {:>8?}", scope_build_time);
         eprintln!("Extract defs:      {:>8?}", defs_time);

@@ -142,9 +142,9 @@ fn grammar_config_field_hover(
     use tree_sitter_generate::nativedsl::lexer::TokenKind;
 
     // Find the ident token at the cursor.
-    let idx = tokens
-        .iter()
-        .position(|t| t.kind == TokenKind::Ident && offset >= t.span.start && offset < t.span.end)?;
+    let idx = tokens.iter().position(|t| {
+        t.kind == TokenKind::Ident && offset >= t.span.start && offset < t.span.end
+    })?;
 
     // Must be preceded by `.`
     if idx < 2 || tokens[idx - 1].kind != TokenKind::Dot {

@@ -30,9 +30,15 @@ pub fn references(backend: &Backend, params: &ReferenceParams) -> Option<Vec<Loc
         CursorContext::ImportModuleAccess { scope } => {
             import_member_references(&analysis, uri, &rope, &word, scope, include_declaration)
         }
-        CursorContext::Identifier { scope } => {
-            local_references(&analysis, uri, &source, &rope, &word, scope, include_declaration)
-        }
+        CursorContext::Identifier { scope } => local_references(
+            &analysis,
+            uri,
+            &source,
+            &rope,
+            &word,
+            scope,
+            include_declaration,
+        ),
     }
 }
 
@@ -50,9 +56,7 @@ fn base_rule_references(
     if let Some(base) = &analysis.base_module
         && let Ok(base_uri) = Url::from_file_path(&base.path)
     {
-        if include_declaration
-            && let Some(def) = base.definitions.iter().find(|d| d.name == word)
-        {
+        if include_declaration && let Some(def) = base.definitions.iter().find(|d| d.name == word) {
             locations.push(Location {
                 uri: base_uri.clone(),
                 range: text::span_to_range(&base.rope, def.name_span),

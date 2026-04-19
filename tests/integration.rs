@@ -3098,10 +3098,7 @@ async fn hover_grammar_config_builtin() {
         panic!("expected markup");
     };
     // Should show the grammar_config builtin docs
-    assert_eq!(
-        markup.value,
-        ts_grammar_ls::hover_docs::GRAMMAR_CONFIG
-    );
+    assert_eq!(markup.value, ts_grammar_ls::hover_docs::GRAMMAR_CONFIG);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3112,7 +3109,10 @@ async fn hover_grammar_config_field_access() {
     let mut service = init(&[(derived_uri.clone(), &fix.derived_text)]).await;
 
     // Cursor on "extras" in `grammar_config(base).extras`
-    let gc_offset = fix.derived_text.find("grammar_config(base).extras").unwrap();
+    let gc_offset = fix
+        .derived_text
+        .find("grammar_config(base).extras")
+        .unwrap();
     let offset = gc_offset + "grammar_config(base).".len();
     let rope = ropey::Rope::from_str(&fix.derived_text);
     let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);

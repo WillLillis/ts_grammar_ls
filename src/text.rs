@@ -215,7 +215,11 @@ mod tests {
 
         // "extras" at offset 27 is followed by `:` - it's a config field.
         let extras_offset = source.find("extras").unwrap() as u32;
-        assert!(is_grammar_config_field(&tokens, grammar_span, extras_offset));
+        assert!(is_grammar_config_field(
+            &tokens,
+            grammar_span,
+            extras_offset
+        ));
     }
 
     #[test]

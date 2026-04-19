@@ -127,8 +127,7 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             .take_while(|t| t.span.end <= cc_token.span.start)
             .last()
             .filter(|t| t.kind == TokenKind::Ident);
-        let qualifier_name =
-            qualifier.map(|t| &source[t.span.start as usize..t.span.end as usize]);
+        let qualifier_name = qualifier.map(|t| &source[t.span.start as usize..t.span.end as usize]);
 
         // Check if the qualifier is a module variable (import or inherit).
         if let Some(name) = qualifier_name
@@ -140,18 +139,22 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
                     .iter()
                     .filter_map(|d| {
                         let (kind, detail) = match &d.kind {
-                            DefKind::Rule | DefKind::OverrideRule => {
-                                (CompletionItemKind::CLASS, format!("rule {} ({name})", d.name))
-                            }
-                            DefKind::Function { signature } => {
-                                (CompletionItemKind::FUNCTION, format!("{signature} ({name})"))
-                            }
-                            DefKind::Let { .. } => {
-                                (CompletionItemKind::VARIABLE, format!("let {} ({name})", d.name))
-                            }
-                            DefKind::Import | DefKind::Inherit => {
-                                (CompletionItemKind::MODULE, format!("{} {} ({name})", d.kind.label(), d.name))
-                            }
+                            DefKind::Rule | DefKind::OverrideRule => (
+                                CompletionItemKind::CLASS,
+                                format!("rule {} ({name})", d.name),
+                            ),
+                            DefKind::Function { signature } => (
+                                CompletionItemKind::FUNCTION,
+                                format!("{signature} ({name})"),
+                            ),
+                            DefKind::Let { .. } => (
+                                CompletionItemKind::VARIABLE,
+                                format!("let {} ({name})", d.name),
+                            ),
+                            DefKind::Import | DefKind::Inherit => (
+                                CompletionItemKind::MODULE,
+                                format!("{} {} ({name})", d.kind.label(), d.name),
+                            ),
                             DefKind::ObjectKey | DefKind::Parameter { .. } => return None,
                         };
                         Some(CompletionItem {
@@ -193,7 +196,7 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             DefKind::Function { signature } => (CompletionItemKind::FUNCTION, signature.clone()),
             DefKind::Let { .. } => (CompletionItemKind::VARIABLE, format!("let {}", def.name)),
             DefKind::Import | DefKind::Inherit | DefKind::ObjectKey | DefKind::Parameter { .. } => {
-                continue
+                continue;
             }
         };
         items.push(CompletionItem {
@@ -366,7 +369,6 @@ const GRAMMAR_CONFIG_FIELDS: &[(&str, &str)] = &[
     ("word", "rule_t"),
     ("reserved", "{ [context]: list_rule_t }"),
 ];
-
 
 fn grammar_config_field_completions() -> Vec<CompletionItem> {
     GRAMMAR_CONFIG_FIELDS
