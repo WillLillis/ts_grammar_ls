@@ -130,9 +130,9 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
         let qualifier_name =
             qualifier.map(|t| &source[t.span.start as usize..t.span.end as usize]);
 
-        // Check if the qualifier is an import variable.
+        // Check if the qualifier is a module variable (import or inherit).
         if let Some(name) = qualifier_name
-            && let Some(module_info) = analysis.get_import(name)
+            && let Some(module_info) = analysis.get_module(name)
         {
             return Some(CompletionResponse::Array(
                 module_info
@@ -141,16 +141,16 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
                     .filter_map(|d| {
                         let (kind, detail) = match &d.kind {
                             DefKind::Rule | DefKind::OverrideRule => {
-                                (CompletionItemKind::CLASS, format!("rule {}", d.name))
+                                (CompletionItemKind::CLASS, format!("rule {} ({name})", d.name))
                             }
                             DefKind::Function { signature } => {
-                                (CompletionItemKind::FUNCTION, signature.clone())
+                                (CompletionItemKind::FUNCTION, format!("{signature} ({name})"))
                             }
                             DefKind::Let { .. } => {
-                                (CompletionItemKind::VARIABLE, format!("let {}", d.name))
+                                (CompletionItemKind::VARIABLE, format!("let {} ({name})", d.name))
                             }
-                            DefKind::Import => {
-                                (CompletionItemKind::MODULE, format!("import {}", d.name))
+                            DefKind::Import | DefKind::Inherit => {
+                                (CompletionItemKind::MODULE, format!("{} {} ({name})", d.kind.label(), d.name))
                             }
                             DefKind::ObjectKey | DefKind::Parameter { .. } => return None,
                         };
@@ -192,7 +192,9 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             }
             DefKind::Function { signature } => (CompletionItemKind::FUNCTION, signature.clone()),
             DefKind::Let { .. } => (CompletionItemKind::VARIABLE, format!("let {}", def.name)),
-            DefKind::Import | DefKind::ObjectKey | DefKind::Parameter { .. } => continue,
+            DefKind::Import | DefKind::Inherit | DefKind::ObjectKey | DefKind::Parameter { .. } => {
+                continue
+            }
         };
         items.push(CompletionItem {
             label: def.name.clone(),

@@ -132,7 +132,7 @@ fn goto_import_file(analysis: &Analysis, offset: u32) -> Option<GotoDefinitionRe
             && reference.span.start >= d.full_span.start
             && reference.span.end <= d.full_span.end
     })?;
-    let module_info = analysis.get_import(&import_def.name)?;
+    let module_info = analysis.get_module(&import_def.name)?;
     let uri = Url::from_file_path(&module_info.path).ok()?;
     Some(GotoDefinitionResponse::Scalar(Location {
         uri,
@@ -165,8 +165,10 @@ fn resolve_import_chain<'a>(
     analysis: &'a Analysis,
     path: &[String],
 ) -> Option<&'a crate::document::ExternalModuleInfo> {
+    // First segment is a top-level variable (import or inherit binding),
+    // remaining segments walk through nested sub-imports.
     let first = path.first()?;
-    let mut module_info = analysis.get_import(first.as_str())?;
+    let mut module_info = analysis.get_module(first.as_str())?;
     for segment in &path[1..] {
         module_info = module_info.get_import(segment)?;
     }

@@ -1852,11 +1852,16 @@ async fn document_symbols_override_rule() {
         panic!("expected nested symbols");
     };
 
-    let names: Vec<(&str, SymbolKind)> =
+    let names_kinds: Vec<(&str, SymbolKind)> =
         symbols.iter().map(|s| (s.name.as_str(), s.kind)).collect();
-    assert!(names.contains(&("base", SymbolKind::VARIABLE)));
-    assert!(names.contains(&("_statement", SymbolKind::CLASS)));
-    assert!(names.contains(&("new_rule", SymbolKind::CLASS)));
+    assert_eq!(
+        names_kinds,
+        [
+            ("base", SymbolKind::MODULE),
+            ("_statement", SymbolKind::CLASS),
+            ("new_rule", SymbolKind::CLASS),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2703,13 +2708,13 @@ async fn completion_import_members_after_double_colon() {
             CompletionItem {
                 label: "PREC".into(),
                 kind: Some(CompletionItemKind::VARIABLE),
-                detail: Some("let PREC".into()),
+                detail: Some("let PREC (helpers)".into()),
                 ..Default::default()
             },
             CompletionItem {
                 label: "commaSep".into(),
                 kind: Some(CompletionItemKind::FUNCTION),
-                detail: Some("fn commaSep(item: rule_t) -> rule_t".into()),
+                detail: Some("fn commaSep(item: rule_t) -> rule_t (helpers)".into()),
                 ..Default::default()
             },
         ]
@@ -2744,7 +2749,7 @@ async fn document_symbol_import_shows_as_module() {
 // Verify that the inherit fixture's `base` let binding is still classified
 // as a variable (not a module) in document symbols since inherit is not import.
 #[tokio::test(flavor = "current_thread")]
-async fn document_symbol_inherit_binding_is_variable() {
+async fn document_symbol_inherit_binding_is_module() {
     let fix = create_inherit_fixture();
     let derived_uri = Url::from_file_path(&fix.derived_path).unwrap();
 
@@ -2764,9 +2769,9 @@ async fn document_symbol_inherit_binding_is_variable() {
         panic!("expected nested symbols");
     };
 
-    // `let base = inherit(...)` should still be VARIABLE, not MODULE.
+    // `let base = inherit(...)` is a MODULE, same as import bindings.
     let base_sym = symbols.iter().find(|s| s.name == "base").unwrap();
-    assert_eq!(base_sym.kind, SymbolKind::VARIABLE);
+    assert_eq!(base_sym.kind, SymbolKind::MODULE);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2835,13 +2840,13 @@ rule program {{ h::helper_fn("x") }}
             CompletionItem {
                 label: "helper_fn".into(),
                 kind: Some(CompletionItemKind::FUNCTION),
-                detail: Some("fn helper_fn(x: rule_t) -> rule_t".into()),
+                detail: Some("fn helper_fn(x: rule_t) -> rule_t (h)".into()),
                 ..Default::default()
             },
             CompletionItem {
                 label: "utils".into(),
                 kind: Some(CompletionItemKind::MODULE),
-                detail: Some("import utils".into()),
+                detail: Some("import utils (h)".into()),
                 ..Default::default()
             },
         ]

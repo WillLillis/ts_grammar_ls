@@ -62,10 +62,10 @@ fn extract_definitions(parsed_ast: &ast::Ast, scopes: &ScopeIndex) -> Vec<Defini
             ast::Node::Let { name, value, .. } => {
                 let name_span = parsed_ast.span(*name);
                 let full_span = parsed_ast.span(item_id);
-                let kind = if matches!(parsed_ast.node(*value), ast::Node::Import { .. }) {
-                    DefKind::Import
-                } else {
-                    DefKind::Let { scope: None }
+                let kind = match parsed_ast.node(*value) {
+                    ast::Node::Import { .. } => DefKind::Import,
+                    ast::Node::Inherit { .. } => DefKind::Inherit,
+                    _ => DefKind::Let { scope: None },
                 };
                 definitions.push(Definition {
                     name: parsed_ast.text(name_span).to_owned(),

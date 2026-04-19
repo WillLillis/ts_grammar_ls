@@ -48,6 +48,8 @@ pub enum DefKind {
     },
     /// An import binding (e.g. `helpers` in `let helpers = import("helpers.tsg")`).
     Import,
+    /// An inherit binding (e.g. `base` in `let base = inherit("base.tsg")`).
+    Inherit,
     /// A key in an object literal (e.g. `ADD` in `{ ADD: 1 }`).
     ObjectKey,
     /// A function parameter.
@@ -65,6 +67,7 @@ impl DefKind {
             Self::Function { .. } => "fn",
             Self::Let { .. } => "let",
             Self::Import => "import",
+            Self::Inherit => "inherit",
             Self::ObjectKey => "field",
             Self::Parameter { .. } => "parameter",
         }
@@ -79,6 +82,7 @@ impl DefKind {
             | Self::OverrideRule
             | Self::Function { .. }
             | Self::Import
+            | Self::Inherit
             | Self::ObjectKey => None,
         }
     }
@@ -218,13 +222,24 @@ pub struct Analysis {
 }
 
 impl Analysis {
-    /// Look up an imported module by variable name.
+    /// Look up a module by its variable name. Checks both imported modules
+    /// and the inherited base grammar.
     #[must_use]
-    pub fn get_import(&self, name: &str) -> Option<&ExternalModuleInfo> {
-        self.import_modules
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, info)| info)
+    pub fn get_module(&self, name: &str) -> Option<&ExternalModuleInfo> {
+        // Check imports.
+        if let Some((_, info)) = self.import_modules.iter().find(|(n, _)| n == name) {
+            return Some(info);
+        }
+        // Check if this name is the inherit binding.
+        if let Some(base) = &self.base_module
+            && self.definitions.as_ref().is_some_and(|defs| {
+                defs.iter()
+                    .any(|d| d.name == name && d.kind == DefKind::Inherit)
+            })
+        {
+            return Some(base);
+        }
+        None
     }
 
     /// Find the narrowest enclosing scope for a given byte offset.
