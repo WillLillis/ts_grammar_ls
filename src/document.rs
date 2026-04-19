@@ -299,4 +299,7 @@ pub struct Document {
     pub version: i32,
     /// Cached diagnostics, split by phase.
     pub diagnostics: DiagnosticCache,
+    /// Cached analysis result. Invalidated on every `did_change`.
+    /// Lazily recomputed by the first handler that needs it.
+    pub analysis: Option<std::sync::Arc<Analysis>>,
 }

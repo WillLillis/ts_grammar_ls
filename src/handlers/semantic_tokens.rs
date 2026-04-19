@@ -7,7 +7,6 @@ use tower_lsp::lsp_types::{
 
 use tree_sitter_generate::nativedsl::lexer::TokenKind;
 
-use crate::analysis;
 use crate::document::{Analysis, DefKind, RefKind};
 use crate::server::Backend;
 use crate::text;
@@ -39,20 +38,20 @@ pub fn legend() -> SemanticTokensLegend {
 }
 
 #[must_use]
-#[expect(
-    clippy::significant_drop_tightening,
-    reason = "doc borrow is held intentionally while analysis borrows doc.text"
-)]
 pub fn semantic_tokens_full(
     backend: &Backend,
     params: &SemanticTokensParams,
 ) -> Option<SemanticTokensResult> {
     let uri = &params.text_document.uri;
-    let doc = backend.document_map.get(uri)?;
+    // Snapshot document state and drop the guard before get_analysis
+    // to avoid deadlocking on document_map (see hover.rs for details).
+    let (source, rope) = {
+        let doc = backend.document_map.get(uri)?;
+        (doc.text.clone(), doc.rope.clone())
+    };
 
-    let ctx = backend.analysis_context();
-    let analysis = analysis::analyze(&doc.text, uri, Some(&ctx));
-    let tokens = compute_semantic_tokens(&doc.text, &doc.rope, &analysis);
+    let analysis = backend.get_analysis(uri)?;
+    let tokens = compute_semantic_tokens(&source, &rope, &analysis);
 
     Some(SemanticTokensResult::Tokens(SemanticTokens {
         result_id: None,

@@ -1,6 +1,5 @@
 use tower_lsp::lsp_types::{Location, ReferenceParams, Url};
 
-use crate::analysis;
 use crate::document::{CursorContext, RefKind};
 use crate::server::Backend;
 use crate::text;
@@ -11,24 +10,28 @@ pub fn references(backend: &Backend, params: &ReferenceParams) -> Option<Vec<Loc
     let pos = params.text_document_position.position;
     let include_declaration = params.context.include_declaration;
 
-    let doc = backend.document_map.get(uri)?;
-    let offset = text::position_to_offset(&doc.rope, pos)?;
-    let word = text::word_at_offset(&doc.text, offset)?;
+    // Snapshot document state and drop the guard before get_analysis
+    // to avoid deadlocking on document_map (see hover.rs for details).
+    let (source, rope, offset, word) = {
+        let doc = backend.document_map.get(uri)?;
+        let offset = text::position_to_offset(&doc.rope, pos)?;
+        let word = text::word_at_offset(&doc.text, offset)?.to_owned();
+        (doc.text.clone(), doc.rope.clone(), offset, word)
+    };
 
-    let ctx = backend.analysis_context();
-    let analysis = analysis::analyze(&doc.text, uri, Some(&ctx));
+    let analysis = backend.get_analysis(uri)?;
 
-    match analysis.cursor_context(offset, &doc.text) {
+    match analysis.cursor_context(offset, &source) {
         // Grammar config fields aren't referenceable.
         CursorContext::GrammarConfigField => None,
         CursorContext::BaseRuleAccess => {
-            base_rule_references(&analysis, uri, &doc.rope, word, include_declaration)
+            base_rule_references(&analysis, uri, &rope, &word, include_declaration)
         }
         CursorContext::ImportModuleAccess { scope } => {
-            import_member_references(&analysis, uri, &doc, word, scope, include_declaration)
+            import_member_references(&analysis, uri, &rope, &word, scope, include_declaration)
         }
         CursorContext::Identifier { scope } => {
-            local_references(&analysis, uri, &doc, word, scope, include_declaration)
+            local_references(&analysis, uri, &source, &rope, &word, scope, include_declaration)
         }
     }
 }
@@ -85,7 +88,8 @@ fn base_rule_references(
 fn local_references(
     analysis: &crate::document::Analysis,
     uri: &Url,
-    doc: &crate::document::Document,
+    source: &str,
+    rope: &ropey::Rope,
     word: &str,
     cursor_scope: Option<tree_sitter_generate::nativedsl::ast::Span>,
     include_declaration: bool,
@@ -101,7 +105,7 @@ fn local_references(
                 }
                 locations.push(Location {
                     uri: uri.clone(),
-                    range: text::span_to_range(&doc.rope, def.name_span),
+                    range: text::span_to_range(rope, def.name_span),
                 });
             }
         }
@@ -116,10 +120,10 @@ fn local_references(
         ) {
             continue;
         }
-        if reference.matches_word(word, &doc.text, cursor_scope) {
+        if reference.matches_word(word, source, cursor_scope) {
             locations.push(Location {
                 uri: uri.clone(),
-                range: text::span_to_range(&doc.rope, reference.span),
+                range: text::span_to_range(rope, reference.span),
             });
         }
     }
@@ -131,7 +135,7 @@ fn local_references(
 fn import_member_references(
     analysis: &crate::document::Analysis,
     uri: &Url,
-    doc: &crate::document::Document,
+    rope: &ropey::Rope,
     word: &str,
     _cursor_scope: Option<tree_sitter_generate::nativedsl::ast::Span>,
     include_declaration: bool,
@@ -159,7 +163,7 @@ fn import_member_references(
         if matches!(&reference.kind, RefKind::ImportedMember { member, .. } if member == word) {
             locations.push(Location {
                 uri: uri.clone(),
-                range: text::span_to_range(&doc.rope, reference.span),
+                range: text::span_to_range(rope, reference.span),
             });
         }
     }

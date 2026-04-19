@@ -6,10 +6,6 @@ use crate::server::Backend;
 use crate::text;
 
 #[must_use]
-#[expect(
-    clippy::significant_drop_tightening,
-    reason = "doc borrow is held intentionally while analysis borrows doc.text"
-)]
 pub fn goto_definition(
     backend: &Backend,
     params: &GotoDefinitionParams,
@@ -17,11 +13,15 @@ pub fn goto_definition(
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
 
-    let doc = backend.document_map.get(uri)?;
-    let offset = text::position_to_offset(&doc.rope, pos)?;
+    // Snapshot document state and drop the guard before get_analysis
+    // to avoid deadlocking on document_map (see hover.rs for details).
+    let (source, rope, offset) = {
+        let doc = backend.document_map.get(uri)?;
+        let offset = text::position_to_offset(&doc.rope, pos)?;
+        (doc.text.clone(), doc.rope.clone(), offset)
+    };
 
-    let ctx = backend.analysis_context();
-    let analysis = analysis::analyze(&doc.text, uri, Some(&ctx));
+    let analysis = backend.get_analysis(uri)?;
 
     // Check if cursor is on a known reference from the resolved AST.
     if let Some(reference) = analysis
@@ -46,7 +46,7 @@ pub fn goto_definition(
                             (None, Some(_)) => false, // scoped defs not visible from top level
                         }
                 }) {
-                    let range = text::span_to_range(&doc.rope, def.name_span);
+                    let range = text::span_to_range(&rope, def.name_span);
                     return Some(GotoDefinitionResponse::Scalar(Location {
                         uri: uri.clone(),
                         range,
@@ -55,7 +55,7 @@ pub fn goto_definition(
                 return goto_base_definition(&analysis, name);
             }
             RefKind::ObjectField { field, object } => {
-                return goto_object_field(uri, &doc.text, object, field);
+                return goto_object_field(uri, &source, object, field);
             }
             RefKind::InheritPath => {
                 let base_path = analysis.base_grammar_path.as_ref()?;
@@ -78,13 +78,13 @@ pub fn goto_definition(
     }
 
     // Fallback: match by word against local definitions (for names at definition sites).
-    let word = text::word_at_offset(&doc.text, offset)?;
+    let word = text::word_at_offset(&source, offset)?;
     let def = analysis
         .definitions
         .iter()
         .flatten()
         .find(|d| d.name == word)?;
-    let range = text::span_to_range(&doc.rope, def.name_span);
+    let range = text::span_to_range(&rope, def.name_span);
 
     Some(GotoDefinitionResponse::Scalar(Location {
         uri: uri.clone(),

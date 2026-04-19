@@ -298,60 +298,36 @@ pub struct AnalysisContext<'a> {
     pub document_map: &'a dashmap::DashMap<Url, Document>,
 }
 
-/// Resolve the inherit path from the AST and read the base grammar to extract rule names.
-/// Returns (`rule_names`, `canonical_path`).
+/// Resolve the inherit path from the AST and load the base grammar as a
+/// `Module` via the core pipeline. Returns the module (for resolve - it
+/// carries `lowered: Option<InputGrammar>`) and the canonical path (for
+/// LSP goto-def/references on base rules).
 fn resolve_base_grammar(
     parsed_ast: &ast::Ast,
     grammar_dir: &Path,
-) -> (Vec<String>, Option<PathBuf>) {
+) -> (Option<nativedsl::Module>, Option<PathBuf>) {
     let Some(inherit_id) = nativedsl::find_inherit_node(parsed_ast) else {
-        return (Vec::new(), None);
+        return (None, None);
     };
     let ast::Node::Inherit { path, .. } = parsed_ast.node(inherit_id) else {
-        return (Vec::new(), None);
+        return (None, None);
     };
     let path_str = parsed_ast.node_text(*path);
     let full_path = grammar_dir.join(path_str);
     let canonical = dunce::canonicalize(&full_path).ok().unwrap_or(full_path);
 
-    // Read and parse the base grammar to get rule names.
     let Ok(content) = std::fs::read_to_string(&canonical) else {
-        return (Vec::new(), Some(canonical));
+        return (None, Some(canonical));
     };
 
-    let ext = canonical.extension().and_then(|e| e.to_str());
-    let rule_names = match ext {
-        Some("tsg") => {
-            let Ok(tokens) = nativedsl::lexer::Lexer::new(&content).tokenize() else {
-                return (Vec::new(), Some(canonical));
-            };
-            let Ok(base_ast) = nativedsl::parser::Parser::new(&tokens, content, &canonical).parse()
-            else {
-                return (Vec::new(), Some(canonical));
-            };
-            base_ast
-                .root_items
-                .iter()
-                .filter_map(|&id| {
-                    if let ast::Node::Rule { name, .. } = base_ast.node(id) {
-                        Some(base_ast.text(base_ast.span(*name)).to_owned())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        }
-        Some("json") => {
-            // Extract rule names from grammar.json by parsing the "rules" keys.
-            serde_json::from_str::<serde_json::Value>(&content)
-                .ok()
-                .and_then(|v| Some(v.get("rules")?.as_object()?.keys().cloned().collect()))
-                .unwrap_or_default()
-        }
-        _ => Vec::new(),
-    };
-
-    (rule_names, Some(canonical))
+    let module = nativedsl::load_module(
+        &content,
+        &canonical,
+        nativedsl::ModuleKind::Grammar,
+        &[],
+    )
+    .ok();
+    (module, Some(canonical))
 }
 
 /// Parse and resolve a base grammar file to extract definitions, references, and a rope.
@@ -364,7 +340,7 @@ fn parse_base_grammar(
         .parse()
         .ok()?;
     // Resolve so that Ident nodes become RuleRef/VarRef (needed for extract_references).
-    let _ = nativedsl::resolve::resolve(&mut parsed_ast, &[], None, path);
+    let _ = nativedsl::resolve::resolve(&mut parsed_ast, None, path);
     let definitions = extract_definitions(&parsed_ast);
     let import_names = collect_import_names(&parsed_ast);
     let references = extract_references(&parsed_ast, &import_names);
@@ -683,25 +659,22 @@ pub fn analyze(text: &str, uri: &Url, ctx: Option<&AnalysisContext<'_>>) -> Anal
 
     let grammar_dir = grammar_path.parent().unwrap();
 
+    let inherit_node = nativedsl::find_inherit_node(&parsed_ast);
+
     // Stage 3: Validate inheritance
-    if nativedsl::validate_grammar(&parsed_ast).is_err() {
+    if nativedsl::validate_grammar(&parsed_ast, inherit_node).is_err() {
         return extract_analysis(&tokens, &parsed_ast, grammar_dir, None, ctx);
     }
 
-    // Stage 4: Resolve the base grammar path and rule names from inherit()
-    let (base_rule_names, base_path) = resolve_base_grammar(&parsed_ast, grammar_dir);
-
-    let inherit_span = nativedsl::find_inherit_node(&parsed_ast).map(|id| parsed_ast.span(id));
+    // Stage 4: Load the base grammar (for resolve and LSP features)
+    let (base_module, base_path) = resolve_base_grammar(&parsed_ast, grammar_dir);
+    let inherit_span = inherit_node.map(|id| parsed_ast.span(id));
+    let base_for_resolve = base_module
+        .as_ref()
+        .and_then(|m| Some((m.lowered.as_ref()?, inherit_span?)));
 
     // Stage 5: Resolve
-    if nativedsl::resolve::resolve(
-        &mut parsed_ast,
-        &base_rule_names,
-        inherit_span,
-        &grammar_path,
-    )
-    .is_err()
-    {
+    if nativedsl::resolve::resolve(&mut parsed_ast, base_for_resolve, &grammar_path).is_err() {
         return extract_analysis(&tokens, &parsed_ast, grammar_dir, base_path, ctx);
     }
 

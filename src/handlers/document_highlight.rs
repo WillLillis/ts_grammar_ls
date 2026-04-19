@@ -1,7 +1,6 @@
 use tower_lsp::lsp_types::{DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams};
 
-use crate::analysis;
-use crate::document::{Analysis, CursorContext, Document, RefKind};
+use crate::document::{Analysis, CursorContext, RefKind};
 use crate::server::Backend;
 use crate::text;
 
@@ -13,21 +12,27 @@ pub fn document_highlight(
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
 
-    let doc = backend.document_map.get(uri)?;
-    let offset = text::position_to_offset(&doc.rope, pos)?;
-    let word = text::word_at_offset(&doc.text, offset)?;
+    // Snapshot document state and drop the guard before get_analysis
+    // to avoid deadlocking on document_map (see hover.rs for details).
+    let (source, rope, offset, word) = {
+        let doc = backend.document_map.get(uri)?;
+        let offset = text::position_to_offset(&doc.rope, pos)?;
+        let word = text::word_at_offset(&doc.text, offset)?.to_owned();
+        (doc.text.clone(), doc.rope.clone(), offset, word)
+    };
 
-    let ctx = backend.analysis_context();
-    let analysis = analysis::analyze(&doc.text, uri, Some(&ctx));
+    let analysis = backend.get_analysis(uri)?;
 
-    match analysis.cursor_context(offset, &doc.text) {
+    match analysis.cursor_context(offset, &source) {
         // Grammar config fields aren't highlightable.
         CursorContext::GrammarConfigField => None,
-        CursorContext::BaseRuleAccess => base_rule_highlights(&analysis, &doc.rope, word),
+        CursorContext::BaseRuleAccess => base_rule_highlights(&analysis, &rope, &word),
         CursorContext::ImportModuleAccess { .. } => {
-            import_member_highlights(&analysis, &doc.rope, word)
+            import_member_highlights(&analysis, &rope, &word)
         }
-        CursorContext::Identifier { scope } => local_highlights(&analysis, &doc, word, scope),
+        CursorContext::Identifier { scope } => {
+            local_highlights(&analysis, &source, &rope, &word, scope)
+        }
     }
 }
 
@@ -53,7 +58,8 @@ fn base_rule_highlights(
 /// Highlight a regular identifier's definition (WRITE) and references (READ).
 fn local_highlights(
     analysis: &Analysis,
-    doc: &Document,
+    source: &str,
+    rope: &ropey::Rope,
     word: &str,
     cursor_scope: Option<tree_sitter_generate::nativedsl::ast::Span>,
 ) -> Option<Vec<DocumentHighlight>> {
@@ -66,7 +72,7 @@ fn local_highlights(
                 _ => {}
             }
             highlights.push(DocumentHighlight {
-                range: text::span_to_range(&doc.rope, def.name_span),
+                range: text::span_to_range(rope, def.name_span),
                 kind: Some(DocumentHighlightKind::WRITE),
             });
         }
@@ -78,9 +84,9 @@ fn local_highlights(
         if matches!(reference.kind, RefKind::BaseRule(_)) {
             continue;
         }
-        if reference.matches_word(word, &doc.text, cursor_scope) {
+        if reference.matches_word(word, source, cursor_scope) {
             highlights.push(DocumentHighlight {
-                range: text::span_to_range(&doc.rope, reference.span),
+                range: text::span_to_range(rope, reference.span),
                 kind: Some(DocumentHighlightKind::READ),
             });
         }

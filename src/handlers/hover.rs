@@ -11,17 +11,22 @@ pub fn hover(backend: &Backend, params: &HoverParams) -> Option<Hover> {
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
 
-    let doc = backend.document_map.get(uri)?;
-    let offset = text::position_to_offset(&doc.rope, pos)?;
-    let word = text::word_at_offset(&doc.text, offset)?;
+    // Snapshot what we need from the document and drop the DashMap guard
+    // before calling get_analysis, which also accesses document_map
+    // internally (for base grammar lookups). Holding both would deadlock.
+    let (source, offset, word) = {
+        let doc = backend.document_map.get(uri)?;
+        let offset = text::position_to_offset(&doc.rope, pos)?;
+        let word = text::word_at_offset(&doc.text, offset)?.to_owned();
+        (doc.text.clone(), offset, word)
+    };
 
-    let ctx = backend.analysis_context();
-    let analysis = analysis::analyze(&doc.text, uri, Some(&ctx));
+    let analysis = backend.get_analysis(uri)?;
 
-    match analysis.cursor_context(offset, &doc.text) {
+    match analysis.cursor_context(offset, &source) {
         // On `reserved:`, show the config field docs, not the builtin combinator docs.
         CursorContext::GrammarConfigField => {
-            hover_docs::grammar_field_hover(word).map(|info| make_hover(info.to_string()))
+            hover_docs::grammar_field_hover(&word).map(|info| make_hover(info.to_string()))
         }
         // On the rule part of `base::rule_name`, show the base grammar's definition.
         CursorContext::BaseRuleAccess => analysis
@@ -32,10 +37,10 @@ pub fn hover(backend: &Backend, params: &HoverParams) -> Option<Hover> {
             .map(|def| make_hover(format!("```\n{} {}\n```", def.kind.label(), def.name))),
         // On a member accessed through an imported module (`mod::fn_name`).
         CursorContext::ImportModuleAccess { .. } => {
-            imported_member_hover(&analysis, &doc.text, word, offset)
+            imported_member_hover(&analysis, &source, &word, offset)
         }
         CursorContext::Identifier { .. } => {
-            identifier_hover(&analysis, &doc.text, uri, word, offset)
+            identifier_hover(&analysis, &source, uri, &word, offset)
         }
     }
 }

@@ -17,11 +17,12 @@ pub async fn did_change(backend: &Backend, params: DidChangeTextDocumentParams) 
     };
     let text = change.text;
 
-    // Update the document.
+    // Update the document and invalidate cached analysis.
     if let Some(mut doc) = backend.document_map.get_mut(&uri) {
         doc.text.clone_from(&text);
         doc.rope = ropey::Rope::from_str(&text);
         doc.version = version;
+        doc.analysis = None;
     }
 
     // Kill any running generate-check subprocess - the input has changed.

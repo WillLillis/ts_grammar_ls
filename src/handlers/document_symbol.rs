@@ -2,7 +2,6 @@ use tower_lsp::lsp_types::{
     DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, SymbolKind,
 };
 
-use crate::analysis;
 use crate::document::DefKind;
 use crate::server::Backend;
 use crate::text;
@@ -13,10 +12,14 @@ pub fn document_symbol(
     params: &DocumentSymbolParams,
 ) -> Option<DocumentSymbolResponse> {
     let uri = &params.text_document.uri;
-    let doc = backend.document_map.get(uri)?;
+    // Snapshot rope and drop the guard before get_analysis
+    // to avoid deadlocking on document_map (see hover.rs for details).
+    let rope = {
+        let doc = backend.document_map.get(uri)?;
+        doc.rope.clone()
+    };
 
-    let ctx = backend.analysis_context();
-    let analysis = analysis::analyze(&doc.text, uri, Some(&ctx));
+    let analysis = backend.get_analysis(uri)?;
 
     let symbols: Vec<DocumentSymbol> = analysis
         .definitions
@@ -34,8 +37,8 @@ pub fn document_symbol(
                 DefKind::Import => SymbolKind::MODULE,
                 DefKind::ObjectKey | DefKind::Parameter { .. } => return None,
             };
-            let range = text::span_to_range(&doc.rope, def.full_span);
-            let selection_range = text::span_to_range(&doc.rope, def.name_span);
+            let range = text::span_to_range(&rope, def.full_span);
+            let selection_range = text::span_to_range(&rope, def.name_span);
             let detail = if let DefKind::Function { signature } = &def.kind {
                 Some(signature.clone())
             } else {
@@ -57,7 +60,6 @@ pub fn document_symbol(
             })
         })
         .collect();
-    drop(doc);
 
     Some(DocumentSymbolResponse::Nested(symbols))
 }

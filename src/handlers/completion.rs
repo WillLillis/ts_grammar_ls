@@ -3,7 +3,6 @@ use tower_lsp::lsp_types::{
 };
 use tree_sitter_generate::nativedsl::lexer::{Token, TokenKind};
 
-use crate::analysis;
 use crate::document::DefKind;
 use crate::server::Backend;
 use crate::text;
@@ -72,11 +71,15 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
     let uri = &params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
 
-    let doc = backend.document_map.get(uri)?;
-    let offset = text::position_to_offset(&doc.rope, pos)?;
+    // Snapshot document state and drop the guard before get_analysis
+    // to avoid deadlocking on document_map (see hover.rs for details).
+    let (source, offset) = {
+        let doc = backend.document_map.get(uri)?;
+        let offset = text::position_to_offset(&doc.rope, pos)?;
+        (doc.text.clone(), offset)
+    };
 
-    let ctx = backend.analysis_context();
-    let analysis = analysis::analyze(&doc.text, uri, Some(&ctx));
+    let analysis = backend.get_analysis(uri)?;
     let tokens = analysis.tokens.as_deref().unwrap_or_default();
 
     // Find the token just before the cursor position.
@@ -102,7 +105,7 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
 
         // `IDENT.` -> complete object fields.
         if let Some(ident) = before_dot.filter(|t| t.kind == TokenKind::Ident) {
-            let obj_name = &doc.text[ident.span.start as usize..ident.span.end as usize];
+            let obj_name = &source[ident.span.start as usize..ident.span.end as usize];
             if let Some(defs) = &analysis.definitions {
                 return Some(CompletionResponse::Array(object_field_completions(
                     defs, obj_name,
@@ -111,7 +114,7 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             // Definitions unavailable (e.g. parse error). Fall back to
             // scanning tokens for `let OBJ = { KEY: ... }` patterns.
             return Some(CompletionResponse::Array(
-                object_field_completions_from_tokens(tokens, &doc.text, obj_name),
+                object_field_completions_from_tokens(tokens, &source, obj_name),
             ));
         }
     }
@@ -125,7 +128,7 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             .last()
             .filter(|t| t.kind == TokenKind::Ident);
         let qualifier_name =
-            qualifier.map(|t| &doc.text[t.span.start as usize..t.span.end as usize]);
+            qualifier.map(|t| &source[t.span.start as usize..t.span.end as usize]);
 
         // Check if the qualifier is an import variable.
         if let Some(name) = qualifier_name
@@ -198,7 +201,6 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             ..Default::default()
         });
     }
-    drop(doc);
 
     // Builtin combinators.
     for &(name, detail) in BUILTIN_COMBINATORS {

@@ -19,6 +19,7 @@ pub async fn did_open(backend: &Backend, params: DidOpenTextDocumentParams) {
             text: text.clone(),
             version,
             diagnostics: DiagnosticCache::default(),
+            analysis: None,
         },
     );
 

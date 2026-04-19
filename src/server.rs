@@ -46,6 +46,39 @@ impl Backend {
             document_map: &self.document_map,
         }
     }
+
+    /// Get the cached analysis for a document, computing it if needed.
+    /// The result is cached on the `Document` so subsequent handler calls
+    /// within the same document version reuse it.
+    #[must_use]
+    pub fn get_analysis(
+        &self,
+        uri: &tower_lsp::lsp_types::Url,
+    ) -> Option<std::sync::Arc<crate::document::Analysis>> {
+        // Fast path: cached and current.
+        if let Some(doc) = self.document_map.get(uri)
+            && let Some(analysis) = &doc.analysis
+        {
+            return Some(std::sync::Arc::clone(analysis));
+        }
+
+        // Slow path: clone text and drop the guard before calling analyze,
+        // which accesses document_map internally for base grammar lookups.
+        let (text, version) = {
+            let doc = self.document_map.get(uri)?;
+            (doc.text.clone(), doc.version)
+        };
+        let ctx = self.analysis_context();
+        let analysis = std::sync::Arc::new(crate::analysis::analyze(&text, uri, Some(&ctx)));
+
+        // Only store if the document hasn't changed since we started.
+        if let Some(mut doc) = self.document_map.get_mut(uri)
+            && doc.version == version
+        {
+            doc.analysis = Some(std::sync::Arc::clone(&analysis));
+        }
+        Some(analysis)
+    }
 }
 
 #[tower_lsp::async_trait]
