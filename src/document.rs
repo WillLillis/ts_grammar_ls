@@ -205,6 +205,12 @@ impl ExternalModuleInfo {
 /// is <1ms even for large grammars, so the cost is negligible.
 #[derive(Default, Clone)]
 pub struct Analysis {
+    /// The source text this analysis was computed from. Stored here so
+    /// handlers always use text that matches the token/definition spans,
+    /// even when the document has been edited since (stale analysis reuse).
+    pub source: String,
+    /// Rope for the source text, for position/offset conversion.
+    pub rope: Rope,
     /// Lexer tokens. Available after a successful lex.
     pub tokens: Option<Vec<Token>>,
     /// Span of the grammar block (if present). Available after parse.
@@ -326,9 +332,10 @@ pub struct Document {
     pub version: i32,
     /// Cached diagnostics, split by phase.
     pub diagnostics: DiagnosticCache,
-    /// Cached analysis result. Invalidated on every `did_change`.
-    /// Lazily recomputed by the first handler that needs it.
-    pub analysis: Option<std::sync::Arc<Analysis>>,
+    /// Cached analysis result, paired with the document version it was
+    /// computed from. Recomputed lazily by handlers; kept when parse fails
+    /// so features work mid-keystroke.
+    pub analysis: Option<(i32, std::sync::Arc<Analysis>)>,
 }
 
 #[cfg(test)]

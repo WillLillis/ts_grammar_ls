@@ -12,13 +12,6 @@ pub fn document_symbol(
     params: &DocumentSymbolParams,
 ) -> Option<DocumentSymbolResponse> {
     let uri = &params.text_document.uri;
-    // Snapshot rope and drop the guard before get_analysis
-    // to avoid deadlocking on document_map (see hover.rs for details).
-    let rope = {
-        let doc = backend.document_map.get(uri)?;
-        doc.rope.clone()
-    };
-
     let analysis = backend.get_analysis(uri)?;
 
     let symbols: Vec<DocumentSymbol> = analysis
@@ -37,8 +30,8 @@ pub fn document_symbol(
                 DefKind::Import | DefKind::Inherit => SymbolKind::MODULE,
                 DefKind::ObjectKey | DefKind::Parameter { .. } => return None,
             };
-            let range = text::span_to_range(&rope, def.full_span);
-            let selection_range = text::span_to_range(&rope, def.name_span);
+            let range = text::span_to_range(&analysis.rope, def.full_span);
+            let selection_range = text::span_to_range(&analysis.rope, def.name_span);
             let detail = if let DefKind::Function { signature } = &def.kind {
                 Some(signature.clone())
             } else {

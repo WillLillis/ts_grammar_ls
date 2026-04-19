@@ -43,15 +43,8 @@ pub fn semantic_tokens_full(
     params: &SemanticTokensParams,
 ) -> Option<SemanticTokensResult> {
     let uri = &params.text_document.uri;
-    // Snapshot document state and drop the guard before get_analysis
-    // to avoid deadlocking on document_map (see hover.rs for details).
-    let (source, rope) = {
-        let doc = backend.document_map.get(uri)?;
-        (doc.text.clone(), doc.rope.clone())
-    };
-
     let analysis = backend.get_analysis(uri)?;
-    let tokens = compute_semantic_tokens(&source, &rope, &analysis);
+    let tokens = compute_semantic_tokens(&analysis.source, &analysis.rope, &analysis);
 
     Some(SemanticTokensResult::Tokens(SemanticTokens {
         result_id: None,

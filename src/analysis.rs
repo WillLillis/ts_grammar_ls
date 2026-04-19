@@ -498,6 +498,8 @@ fn extract_analysis(
     let import_modules = extract_import_modules(parsed_ast, grammar_dir, ctx);
 
     Analysis {
+        source: parsed_ast.source().to_owned(),
+        rope: Rope::from_str(parsed_ast.source()),
         tokens: Some(tokens.to_vec()),
         grammar_span,
         definitions: Some(definitions),
@@ -708,16 +710,27 @@ pub fn uri_to_grammar_path(uri: &Url) -> PathBuf {
 pub fn analyze(text: &str, uri: &Url, ctx: Option<&AnalysisContext<'_>>) -> Analysis {
     let grammar_path = uri_to_grammar_path(uri);
 
+    let source = text.to_owned();
+    let rope = Rope::from_str(text);
+
     // Stage 1: Lex
     let Ok(tokens) = nativedsl::lexer::Lexer::new(text).tokenize() else {
-        return Analysis::default();
+        tracing::warn!("analyze: lex failed for {uri}");
+        return Analysis {
+            source,
+            rope,
+            ..Analysis::default()
+        };
     };
 
     // Stage 2: Parse
     let Ok(mut parsed_ast) =
         nativedsl::parser::Parser::new(&tokens, text.to_owned(), &grammar_path).parse()
     else {
+        tracing::warn!("analyze: parse failed for {uri}");
         return Analysis {
+            source,
+            rope,
             tokens: Some(tokens),
             ..Analysis::default()
         };

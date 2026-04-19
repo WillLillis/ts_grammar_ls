@@ -55,27 +55,38 @@ impl Backend {
         &self,
         uri: &tower_lsp::lsp_types::Url,
     ) -> Option<std::sync::Arc<crate::document::Analysis>> {
-        // Fast path: cached and current.
-        if let Some(doc) = self.document_map.get(uri)
-            && let Some(analysis) = &doc.analysis
-        {
-            return Some(std::sync::Arc::clone(analysis));
+        // Fast path: cached analysis matches the current document version.
+        let (text, version, cached) = {
+            let doc = self.document_map.get(uri)?;
+            if let Some((v, analysis)) = &doc.analysis
+                && *v == doc.version
+            {
+                return Some(std::sync::Arc::clone(analysis));
+            }
+            (
+                doc.text.clone(),
+                doc.version,
+                doc.analysis.as_ref().map(|(_, a)| std::sync::Arc::clone(a)),
+            )
+        };
+
+        // Slow path: recompute. Guard is dropped before calling analyze,
+        // which accesses document_map internally for base grammar lookups.
+        let ctx = self.analysis_context();
+        let new = crate::analysis::analyze(&text, uri, Some(&ctx));
+
+        // If parse failed (definitions is None), keep the previous good
+        // analysis so features like completion still work mid-keystroke.
+        if new.definitions.is_none() && let Some(old) = cached {
+            return Some(old);
         }
 
-        // Slow path: clone text and drop the guard before calling analyze,
-        // which accesses document_map internally for base grammar lookups.
-        let (text, version) = {
-            let doc = self.document_map.get(uri)?;
-            (doc.text.clone(), doc.version)
-        };
-        let ctx = self.analysis_context();
-        let analysis = std::sync::Arc::new(crate::analysis::analyze(&text, uri, Some(&ctx)));
-
+        let analysis = std::sync::Arc::new(new);
         // Only store if the document hasn't changed since we started.
         if let Some(mut doc) = self.document_map.get_mut(uri)
             && doc.version == version
         {
-            doc.analysis = Some(std::sync::Arc::clone(&analysis));
+            doc.analysis = Some((version, std::sync::Arc::clone(&analysis)));
         }
         Some(analysis)
     }

@@ -10,31 +10,30 @@ pub fn references(backend: &Backend, params: &ReferenceParams) -> Option<Vec<Loc
     let pos = params.text_document_position.position;
     let include_declaration = params.context.include_declaration;
 
-    // Snapshot document state and drop the guard before get_analysis
-    // to avoid deadlocking on document_map (see hover.rs for details).
-    let (source, rope, offset, word) = {
+    // Use the current document's rope for position-to-offset (the client
+    // sends positions in the current buffer), but the analysis's source
+    // for text operations (spans match the analyzed text).
+    let offset = {
         let doc = backend.document_map.get(uri)?;
-        let offset = text::position_to_offset(&doc.rope, pos)?;
-        let word = text::word_at_offset(&doc.text, offset)?.to_owned();
-        (doc.text.clone(), doc.rope.clone(), offset, word)
+        text::position_to_offset(&doc.rope, pos)?
     };
-
     let analysis = backend.get_analysis(uri)?;
+    let word = text::word_at_offset(&analysis.source, offset)?.to_owned();
 
-    match analysis.cursor_context(offset, &source) {
+    match analysis.cursor_context(offset, &analysis.source) {
         // Grammar config fields aren't referenceable.
         CursorContext::GrammarConfigField => None,
         CursorContext::BaseRuleAccess => {
-            base_rule_references(&analysis, uri, &rope, &word, include_declaration)
+            base_rule_references(&analysis, uri, &analysis.rope, &word, include_declaration)
         }
         CursorContext::ImportModuleAccess { scope } => {
-            import_member_references(&analysis, uri, &rope, &word, scope, include_declaration)
+            import_member_references(&analysis, uri, &analysis.rope, &word, scope, include_declaration)
         }
         CursorContext::Identifier { scope } => local_references(
             &analysis,
             uri,
-            &source,
-            &rope,
+            &analysis.source,
+            &analysis.rope,
             &word,
             scope,
             include_declaration,

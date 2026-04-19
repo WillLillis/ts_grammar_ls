@@ -71,16 +71,20 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
     let uri = &params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
 
-    // Snapshot document state and drop the guard before get_analysis
-    // to avoid deadlocking on document_map (see hover.rs for details).
-    let (source, offset) = {
+    // Use the current buffer text for token scanning (to detect what the
+    // user just typed: `::`, `.`, etc.) but the cached analysis for
+    // definitions/modules (which may be from a prior successful parse).
+    let (current_source, offset) = {
         let doc = backend.document_map.get(uri)?;
         let offset = text::position_to_offset(&doc.rope, pos)?;
         (doc.text.clone(), offset)
     };
-
     let analysis = backend.get_analysis(uri)?;
-    let tokens = analysis.tokens.as_deref().unwrap_or_default();
+    let current_tokens = tree_sitter_generate::nativedsl::lexer::Lexer::new(&current_source)
+        .tokenize()
+        .ok();
+    let tokens = current_tokens.as_deref().unwrap_or_default();
+    let source = &current_source;
 
     // Find the token just before the cursor position.
     let prev_token = tokens.iter().take_while(|t| t.span.end <= offset).last();
@@ -114,7 +118,7 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             // Definitions unavailable (e.g. parse error). Fall back to
             // scanning tokens for `let OBJ = { KEY: ... }` patterns.
             return Some(CompletionResponse::Array(
-                object_field_completions_from_tokens(tokens, &source, obj_name),
+                object_field_completions_from_tokens(tokens, source, obj_name),
             ));
         }
     }

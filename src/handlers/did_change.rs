@@ -17,12 +17,13 @@ pub async fn did_change(backend: &Backend, params: DidChangeTextDocumentParams) 
     };
     let text = change.text;
 
-    // Update the document and invalidate cached analysis.
+    // Update the document text. Don't clear the cached analysis here -
+    // get_analysis will recompute it and keep the last good result if
+    // the new text doesn't parse (e.g. mid-keystroke syntax errors).
     if let Some(mut doc) = backend.document_map.get_mut(&uri) {
         doc.text.clone_from(&text);
         doc.rope = ropey::Rope::from_str(&text);
         doc.version = version;
-        doc.analysis = None;
     }
 
     // Kill any running generate-check subprocess - the input has changed.

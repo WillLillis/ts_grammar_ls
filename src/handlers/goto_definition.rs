@@ -13,14 +13,10 @@ pub fn goto_definition(
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
 
-    // Snapshot document state and drop the guard before get_analysis
-    // to avoid deadlocking on document_map (see hover.rs for details).
-    let (source, rope, offset) = {
+    let offset = {
         let doc = backend.document_map.get(uri)?;
-        let offset = text::position_to_offset(&doc.rope, pos)?;
-        (doc.text.clone(), doc.rope.clone(), offset)
+        text::position_to_offset(&doc.rope, pos)?
     };
-
     let analysis = backend.get_analysis(uri)?;
 
     // Check if cursor is on a known reference from the resolved AST.
@@ -43,7 +39,7 @@ pub fn goto_definition(
                     .flatten()
                     .find(|d| d.name == *name && d.kind.visible_from(ref_scope))
                 {
-                    let range = text::span_to_range(&rope, def.name_span);
+                    let range = text::span_to_range(&analysis.rope, def.name_span);
                     return Some(GotoDefinitionResponse::Scalar(Location {
                         uri: uri.clone(),
                         range,
@@ -52,7 +48,7 @@ pub fn goto_definition(
                 return goto_base_definition(&analysis, name);
             }
             RefKind::ObjectField { field, object } => {
-                return goto_object_field(uri, &source, object, field);
+                return goto_object_field(uri, &analysis.source, object, field);
             }
             RefKind::InheritPath => {
                 let base = analysis.base_module.as_ref()?;
@@ -75,13 +71,13 @@ pub fn goto_definition(
     }
 
     // Fallback: match by word against local definitions (for names at definition sites).
-    let word = text::word_at_offset(&source, offset)?;
+    let word = text::word_at_offset(&analysis.source, offset)?;
     let def = analysis
         .definitions
         .iter()
         .flatten()
         .find(|d| d.name == word)?;
-    let range = text::span_to_range(&rope, def.name_span);
+    let range = text::span_to_range(&analysis.rope, def.name_span);
 
     Some(GotoDefinitionResponse::Scalar(Location {
         uri: uri.clone(),

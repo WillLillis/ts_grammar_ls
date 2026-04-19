@@ -12,26 +12,22 @@ pub fn document_highlight(
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
 
-    // Snapshot document state and drop the guard before get_analysis
-    // to avoid deadlocking on document_map (see hover.rs for details).
-    let (source, rope, offset, word) = {
+    let offset = {
         let doc = backend.document_map.get(uri)?;
-        let offset = text::position_to_offset(&doc.rope, pos)?;
-        let word = text::word_at_offset(&doc.text, offset)?.to_owned();
-        (doc.text.clone(), doc.rope.clone(), offset, word)
+        text::position_to_offset(&doc.rope, pos)?
     };
-
     let analysis = backend.get_analysis(uri)?;
+    let word = text::word_at_offset(&analysis.source, offset)?.to_owned();
 
-    match analysis.cursor_context(offset, &source) {
+    match analysis.cursor_context(offset, &analysis.source) {
         // Grammar config fields aren't highlightable.
         CursorContext::GrammarConfigField => None,
-        CursorContext::BaseRuleAccess => base_rule_highlights(&analysis, &rope, &word),
+        CursorContext::BaseRuleAccess => base_rule_highlights(&analysis, &analysis.rope, &word),
         CursorContext::ImportModuleAccess { .. } => {
-            import_member_highlights(&analysis, &rope, &word)
+            import_member_highlights(&analysis, &analysis.rope, &word)
         }
         CursorContext::Identifier { scope } => {
-            local_highlights(&analysis, &source, &rope, &word, scope)
+            local_highlights(&analysis, &analysis.source, &analysis.rope, &word, scope)
         }
     }
 }
