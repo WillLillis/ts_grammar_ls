@@ -195,4 +195,84 @@ mod tests {
         // Cursor past EOF - returns None.
         assert_eq!(word_at_offset(text, 11), None);
     }
+
+    fn lex(source: &str) -> Vec<tree_sitter_generate::nativedsl::lexer::Token> {
+        tree_sitter_generate::nativedsl::lexer::Lexer::new(source)
+            .tokenize()
+            .unwrap()
+    }
+
+    #[test]
+    fn is_grammar_config_field_inside_block() {
+        let source = r#"grammar { language: "test", extras: [" "] }"#;
+        let tokens = lex(source);
+        // "grammar" spans the whole block.
+        let grammar_span = Span::new(0, source.len() as u32);
+
+        // "language" at offset 10 is followed by `:` - it's a config field.
+        let lang_offset = source.find("language").unwrap() as u32;
+        assert!(is_grammar_config_field(&tokens, grammar_span, lang_offset));
+
+        // "extras" at offset 27 is followed by `:` - it's a config field.
+        let extras_offset = source.find("extras").unwrap() as u32;
+        assert!(is_grammar_config_field(&tokens, grammar_span, extras_offset));
+    }
+
+    #[test]
+    fn is_grammar_config_field_outside_block() {
+        let source = r#"grammar { language: "test" } rule foo { "x" }"#;
+        let tokens = lex(source);
+        let grammar_span = Span::new(0, 28);
+
+        // "foo" is outside the grammar block.
+        let foo_offset = source.find("foo").unwrap() as u32;
+        assert!(!is_grammar_config_field(&tokens, grammar_span, foo_offset));
+    }
+
+    #[test]
+    fn is_base_rule_access_after_double_colon() {
+        let source = r#"grammar { language: "t" } rule foo { base::bar }"#;
+        let tokens = lex(source);
+
+        // "bar" is preceded by `::`
+        let bar_offset = source.find("bar").unwrap() as u32;
+        assert!(is_base_rule_access(&tokens, bar_offset));
+
+        // "base" is NOT preceded by `::`
+        let base_offset = source.find("base").unwrap() as u32;
+        assert!(!is_base_rule_access(&tokens, base_offset));
+
+        // "foo" is NOT preceded by `::`
+        let foo_offset = source.find("foo").unwrap() as u32;
+        assert!(!is_base_rule_access(&tokens, foo_offset));
+    }
+
+    #[test]
+    fn qualified_access_module_returns_qualifier() {
+        let source = r#"grammar { language: "t" } rule foo { helpers::func("x") }"#;
+        let tokens = lex(source);
+
+        // Cursor on "func" - should return "helpers"
+        let func_offset = source.find("func").unwrap() as u32;
+        assert_eq!(
+            qualified_access_module(&tokens, source, func_offset),
+            Some("helpers")
+        );
+
+        // Cursor on "helpers" - not preceded by `::`
+        let helpers_offset = source.find("helpers").unwrap() as u32;
+        assert_eq!(
+            qualified_access_module(&tokens, source, helpers_offset),
+            None
+        );
+    }
+
+    #[test]
+    fn qualified_access_module_no_qualifier() {
+        let source = r#"grammar { language: "t" } rule foo { "x" }"#;
+        let tokens = lex(source);
+
+        let foo_offset = source.find("foo").unwrap() as u32;
+        assert_eq!(qualified_access_module(&tokens, source, foo_offset), None);
+    }
 }

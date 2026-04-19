@@ -315,3 +315,57 @@ pub struct Document {
     /// Lazily recomputed by the first handler that needs it.
     pub analysis: Option<std::sync::Arc<Analysis>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_from_top_level_always_visible() {
+        let rule = DefKind::Rule;
+        assert!(rule.visible_from(None));
+        assert!(rule.visible_from(Some(Span::new(10, 50))));
+    }
+
+    #[test]
+    fn visible_from_scoped_not_visible_at_top_level() {
+        let param = DefKind::Parameter {
+            scope: Span::new(10, 50),
+        };
+        assert!(!param.visible_from(None));
+    }
+
+    #[test]
+    fn visible_from_same_scope() {
+        let param = DefKind::Parameter {
+            scope: Span::new(10, 50),
+        };
+        assert!(param.visible_from(Some(Span::new(10, 50))));
+    }
+
+    #[test]
+    fn visible_from_inner_scope() {
+        // Param defined in outer scope [10, 100], cursor in inner scope [20, 50].
+        let param = DefKind::Parameter {
+            scope: Span::new(10, 100),
+        };
+        assert!(param.visible_from(Some(Span::new(20, 50))));
+    }
+
+    #[test]
+    fn visible_from_outer_scope_not_visible() {
+        // Param defined in inner scope [20, 50], cursor in outer scope [10, 100].
+        let param = DefKind::Parameter {
+            scope: Span::new(20, 50),
+        };
+        assert!(!param.visible_from(Some(Span::new(10, 100))));
+    }
+
+    #[test]
+    fn visible_from_disjoint_scope() {
+        let param = DefKind::Parameter {
+            scope: Span::new(10, 50),
+        };
+        assert!(!param.visible_from(Some(Span::new(60, 100))));
+    }
+}
