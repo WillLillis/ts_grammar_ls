@@ -34,7 +34,7 @@ async fn init(documents: &[(Url, &str)]) -> LspService<Backend> {
         debounce_version: Arc::new(dashmap::DashMap::new()),
         generate_child: Arc::default(),
         config: Arc::new(config.into()),
-        base_grammar_cache: Arc::new(dashmap::DashMap::new()),
+        grammar_cache: Arc::new(dashmap::DashMap::new()),
     })
     .finish();
 

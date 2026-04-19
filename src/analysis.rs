@@ -291,32 +291,38 @@ pub enum SourceVersion {
     Disk(std::time::SystemTime),
 }
 
-#[derive(Clone)]
-pub struct CachedBaseGrammar {
+pub struct CachedGrammar {
     pub version: SourceVersion,
     pub definitions: Vec<Definition>,
     pub references: Vec<Reference>,
     pub rope: Rope,
+    /// The full loaded module, for use by `resolve` (needs `InputGrammar`).
+    /// `None` for grammars that were only parsed for definitions (e.g. imports
+    /// loaded via `parse_base_grammar`).
+    pub module: Option<std::sync::Arc<nativedsl::Module>>,
 }
 
-/// Cache of parsed base grammars, keyed by absolute path.
-pub type BaseGrammarCache = dashmap::DashMap<PathBuf, CachedBaseGrammar>;
+/// Cache of parsed grammars, keyed by absolute path. Stores both the
+/// extracted LSP data (definitions/references/rope) and optionally the
+/// full `Module` from core's `load_module`.
+pub type GrammarCache = dashmap::DashMap<PathBuf, CachedGrammar>;
 
 /// Context passed to `analyze()` to enable base grammar caching and
 /// lookup of in-memory text for open documents.
 pub struct AnalysisContext<'a> {
-    pub base_cache: &'a BaseGrammarCache,
+    pub grammar_cache: &'a GrammarCache,
     pub document_map: &'a dashmap::DashMap<Url, Document>,
 }
 
-/// Resolve the inherit path from the AST and load the base grammar as a
-/// `Module` via the core pipeline. Returns the module (for resolve - it
-/// carries `lowered: Option<InputGrammar>`) and the canonical path (for
-/// LSP goto-def/references on base rules).
+/// Resolve the inherit path from the AST and load the base grammar.
+///
+/// Uses the core's `load_module` pipeline. Caches the result by path +
+/// mtime so subsequent calls skip the expensive pipeline.
 fn resolve_base_grammar(
     parsed_ast: &ast::Ast,
     grammar_dir: &Path,
-) -> (Option<nativedsl::Module>, Option<PathBuf>) {
+    ctx: Option<&AnalysisContext<'_>>,
+) -> (Option<std::sync::Arc<nativedsl::Module>>, Option<PathBuf>) {
     let Some(inherit_id) = nativedsl::find_inherit_node(parsed_ast) else {
         return (None, None);
     };
@@ -326,6 +332,19 @@ fn resolve_base_grammar(
     let path_str = parsed_ast.node_text(*path);
     let full_path = grammar_dir.join(path_str);
     let canonical = dunce::canonicalize(&full_path).ok().unwrap_or(full_path);
+
+    // Check the cache for a previously loaded module with matching mtime.
+    let mtime = std::fs::metadata(&canonical)
+        .and_then(|m| m.modified())
+        .ok();
+    if let Some(ctx) = ctx
+        && let Some(mtime) = mtime
+        && let Some(entry) = ctx.grammar_cache.get(&canonical)
+        && entry.version == SourceVersion::Disk(mtime)
+        && let Some(module) = &entry.module
+    {
+        return (Some(std::sync::Arc::clone(module)), Some(canonical));
+    }
 
     let Ok(content) = std::fs::read_to_string(&canonical) else {
         return (None, Some(canonical));
@@ -337,7 +356,37 @@ fn resolve_base_grammar(
         nativedsl::ModuleKind::Grammar,
         &[],
     )
-    .ok();
+    .ok()
+    .map(std::sync::Arc::new);
+
+    // Store the module in the grammar cache for reuse.
+    if let Some(ctx) = ctx
+        && let Some(mtime) = mtime
+        && let Some(module) = &module
+    {
+        // Also extract definitions/references so the cache entry serves
+        // both resolve_base_grammar (needs Module) and extract_base_grammar_info
+        // (needs definitions/references/rope).
+        let scopes = ScopeIndex::build(&module.ast);
+        let definitions = extract_definitions(&module.ast, &scopes);
+        let import_names = collect_import_names(&module.ast);
+        let references = extract_references(&module.ast, &import_names, &scopes);
+
+        if ctx.grammar_cache.len() >= MAX_GRAMMAR_CACHE_ENTRIES {
+            ctx.grammar_cache.clear();
+        }
+        ctx.grammar_cache.insert(
+            canonical.clone(),
+            CachedGrammar {
+                version: SourceVersion::Disk(mtime),
+                definitions,
+                references,
+                rope: Rope::from_str(module.ast.source()),
+                module: Some(std::sync::Arc::clone(module)),
+            },
+        );
+    }
+
     (module, Some(canonical))
 }
 
@@ -390,7 +439,7 @@ fn extract_base_grammar_info(
     let (version, content) = current_base_source(path, ctx.document_map)?;
 
     // Cache hit: version matches.
-    if let Some(entry) = ctx.base_cache.get(path)
+    if let Some(entry) = ctx.grammar_cache.get(path)
         && entry.version == version
     {
         return Some((
@@ -405,17 +454,18 @@ fn extract_base_grammar_info(
 
     // Evict the entire cache if it grows too large. In practice a session
     // works with a handful of base grammars, so this rarely triggers.
-    if ctx.base_cache.len() >= MAX_GRAMMAR_CACHE_ENTRIES {
-        ctx.base_cache.clear();
+    if ctx.grammar_cache.len() >= MAX_GRAMMAR_CACHE_ENTRIES {
+        ctx.grammar_cache.clear();
     }
 
-    ctx.base_cache.insert(
+    ctx.grammar_cache.insert(
         path.clone(),
-        CachedBaseGrammar {
+        CachedGrammar {
             version,
             definitions: definitions.clone(),
             references: references.clone(),
             rope: rope.clone(),
+            module: None,
         },
     );
     Some((definitions, references, rope))
@@ -688,7 +738,7 @@ pub fn analyze(text: &str, uri: &Url, ctx: Option<&AnalysisContext<'_>>) -> Anal
     }
 
     // Stage 4: Load the base grammar (for resolve and LSP features)
-    let (base_module, base_path) = resolve_base_grammar(&parsed_ast, grammar_dir);
+    let (base_module, base_path) = resolve_base_grammar(&parsed_ast, grammar_dir, ctx);
     let inherit_span = inherit_node.map(|id| parsed_ast.span(id));
     let base_for_resolve = base_module
         .as_ref()
@@ -754,4 +804,144 @@ pub fn with_type_env<T>(
     let module_envs = nativedsl::typecheck_modules(&module.sub_modules).ok()?;
     let env = nativedsl::typecheck::check(&module.ast, module_envs).ok()?;
     Some(f(&module.ast, &env))
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_analyze_stages() {
+        let path =
+            std::path::PathBuf::from("/home/lillis/projects/grammars/tree-sitter-cpp/grammar.tsg");
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping: cpp grammar not found");
+            return;
+        };
+        let uri = Url::from_file_path(&path).unwrap();
+        let grammar_path = uri_to_grammar_path(&uri);
+        let grammar_dir = grammar_path.parent().unwrap();
+
+        let n = 200u32;
+
+        // Stage 1: Lex
+        let start = std::time::Instant::now();
+        let mut tokens_store = None;
+        for _ in 0..n {
+            let t = nativedsl::lexer::Lexer::new(&source).tokenize().unwrap();
+            tokens_store = Some(t);
+        }
+        let lex_time = start.elapsed() / n;
+        let tokens = tokens_store.unwrap();
+
+        // Stage 2: Parse
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(
+                nativedsl::parser::Parser::new(&tokens, source.clone(), &grammar_path)
+                    .parse()
+                    .unwrap(),
+            );
+        }
+        let parse_time = start.elapsed() / n;
+
+        let mut parsed_ast = nativedsl::parser::Parser::new(&tokens, source.clone(), &grammar_path)
+            .parse()
+            .unwrap();
+
+        // Stage 3: Validate
+        let inherit_node = nativedsl::find_inherit_node(&parsed_ast);
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(nativedsl::validate_grammar(&parsed_ast, inherit_node).unwrap());
+        }
+        let validate_time = start.elapsed() / n;
+
+        // Stage 4: Load base grammar
+        let start = std::time::Instant::now();
+        let (base_module, base_path) = resolve_base_grammar(&parsed_ast, grammar_dir, None);
+        let load_base_time = start.elapsed();
+
+        let inherit_span = inherit_node.map(|id| parsed_ast.span(id));
+        let base_for_resolve = base_module
+            .as_ref()
+            .and_then(|m| Some((m.lowered.as_ref()?, inherit_span?)));
+
+        // Stage 5: Resolve
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            let mut ast_clone =
+                nativedsl::parser::Parser::new(&tokens, source.clone(), &grammar_path)
+                    .parse()
+                    .unwrap();
+            nativedsl::resolve::resolve(&mut ast_clone, base_for_resolve, &grammar_path).unwrap();
+        }
+        let resolve_time = start.elapsed() / n - parse_time; // subtract parse from resolve
+
+        nativedsl::resolve::resolve(&mut parsed_ast, base_for_resolve, &grammar_path).unwrap();
+
+        // Stage 6: extract_analysis components
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(ScopeIndex::build(&parsed_ast));
+        }
+        let scope_build_time = start.elapsed() / n;
+
+        let scopes = ScopeIndex::build(&parsed_ast);
+
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(extract_definitions(&parsed_ast, &scopes));
+        }
+        let defs_time = start.elapsed() / n;
+
+        let import_names = collect_import_names(&parsed_ast);
+
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(extract_references(&parsed_ast, &import_names, &scopes));
+        }
+        let refs_time = start.elapsed() / n;
+
+        let grammar_span = parsed_ast
+            .root_items
+            .iter()
+            .find(|&&id| matches!(parsed_ast.node(id), ast::Node::Grammar))
+            .map(|&id| parsed_ast.span(id));
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            let mut refs = Vec::new();
+            extract_builtin_references(&tokens, grammar_span, &mut refs);
+            std::hint::black_box(refs);
+        }
+        let builtin_refs_time = start.elapsed() / n;
+
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(extract_import_modules(&parsed_ast, grammar_dir, None));
+        }
+        let imports_time = start.elapsed() / n;
+
+        // Stage 7: Full analyze
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(analyze(&source, &uri, None));
+        }
+        let total_time = start.elapsed() / n;
+
+        eprintln!("=== analyze() breakdown on cpp grammar ({} lines) ===", source.lines().count());
+        eprintln!("Lex:               {:>8?}", lex_time);
+        eprintln!("Parse:             {:>8?}", parse_time);
+        eprintln!("Validate:          {:>8?}", validate_time);
+        eprintln!("Load base grammar: {:>8?}  (one-shot, not amortized)", load_base_time);
+        eprintln!("Resolve:           {:>8?}", resolve_time);
+        eprintln!("ScopeIndex build:  {:>8?}", scope_build_time);
+        eprintln!("Extract defs:      {:>8?}", defs_time);
+        eprintln!("Extract refs:      {:>8?}", refs_time);
+        eprintln!("Builtin refs:      {:>8?}", builtin_refs_time);
+        eprintln!("Import modules:    {:>8?}", imports_time);
+        eprintln!("---");
+        eprintln!("Total analyze():   {:>8?}", total_time);
+    }
 }

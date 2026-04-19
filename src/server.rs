@@ -15,7 +15,7 @@ use tower_lsp::{
     },
 };
 
-use crate::analysis::{AnalysisContext, BaseGrammarCache};
+use crate::analysis::{AnalysisContext, GrammarCache};
 use crate::config::Config;
 use crate::diagnostics::GenerateChildSlot;
 use crate::document::Document;
@@ -34,7 +34,7 @@ pub struct Backend {
     pub config: Arc<RwLock<Config>>,
     /// Cache of parsed base grammars, keyed by path. Invalidated when the
     /// source version (document version or disk mtime) changes.
-    pub base_grammar_cache: Arc<BaseGrammarCache>,
+    pub grammar_cache: Arc<GrammarCache>,
 }
 
 impl Backend {
@@ -42,7 +42,7 @@ impl Backend {
     #[must_use]
     pub fn analysis_context(&self) -> AnalysisContext<'_> {
         AnalysisContext {
-            base_cache: &self.base_grammar_cache,
+            grammar_cache: &self.grammar_cache,
             document_map: &self.document_map,
         }
     }
