@@ -2781,9 +2781,9 @@ async fn goto_def_nested_import() {
     let dir = tempfile::tempdir().unwrap();
 
     // utils.tsg: defines utils_fn
-    let utils_text = r#"
+    let utils_text = "
 fn utils_fn(x: rule_t) -> rule_t { x }
-"#;
+";
     let utils_path = dir.path().join("utils.tsg");
     std::fs::write(&utils_path, utils_text).unwrap();
 

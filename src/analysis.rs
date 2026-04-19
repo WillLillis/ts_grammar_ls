@@ -820,6 +820,7 @@ mod bench {
 
     #[test]
     #[ignore = "benchmark"]
+    #[allow(clippy::too_many_lines)]
     fn bench_analyze_stages() {
         let path =
             std::path::PathBuf::from("/home/lillis/projects/grammars/tree-sitter-cpp/grammar.tsg");
@@ -862,13 +863,14 @@ mod bench {
         let inherit_node = nativedsl::find_inherit_node(&parsed_ast);
         let start = std::time::Instant::now();
         for _ in 0..n {
+            #[expect(clippy::unit_arg, reason = "benchmark")]
             std::hint::black_box(nativedsl::validate_grammar(&parsed_ast, inherit_node).unwrap());
         }
         let validate_time = start.elapsed() / n;
 
         // Stage 4: Load base grammar
         let start = std::time::Instant::now();
-        let (base_module, base_path) = resolve_base_grammar(&parsed_ast, grammar_dir, None);
+        let (base_module, _base_path) = resolve_base_grammar(&parsed_ast, grammar_dir, None);
         let load_base_time = start.elapsed();
 
         let inherit_span = inherit_node.map(|id| parsed_ast.span(id));
@@ -885,7 +887,7 @@ mod bench {
                     .unwrap();
             nativedsl::resolve::resolve(&mut ast_clone, base_for_resolve, &grammar_path).unwrap();
         }
-        let resolve_time = start.elapsed() / n - parse_time; // subtract parse from resolve
+        let resolve_time = (start.elapsed() / n).checked_sub(parse_time).unwrap();
 
         nativedsl::resolve::resolve(&mut parsed_ast, base_for_resolve, &grammar_path).unwrap();
 
@@ -942,20 +944,17 @@ mod bench {
             "=== analyze() breakdown on cpp grammar ({} lines) ===",
             source.lines().count()
         );
-        eprintln!("Lex:               {:>8?}", lex_time);
-        eprintln!("Parse:             {:>8?}", parse_time);
-        eprintln!("Validate:          {:>8?}", validate_time);
-        eprintln!(
-            "Load base grammar: {:>8?}  (one-shot, not amortized)",
-            load_base_time
-        );
-        eprintln!("Resolve:           {:>8?}", resolve_time);
-        eprintln!("ScopeIndex build:  {:>8?}", scope_build_time);
-        eprintln!("Extract defs:      {:>8?}", defs_time);
-        eprintln!("Extract refs:      {:>8?}", refs_time);
-        eprintln!("Builtin refs:      {:>8?}", builtin_refs_time);
-        eprintln!("Import modules:    {:>8?}", imports_time);
+        eprintln!("Lex:               {lex_time:>8?}");
+        eprintln!("Parse:             {parse_time:>8?}");
+        eprintln!("Validate:          {validate_time:>8?}");
+        eprintln!("Load base grammar: {load_base_time:>8?}  (one-shot, not amortized)");
+        eprintln!("Resolve:           {resolve_time:>8?}");
+        eprintln!("ScopeIndex build:  {scope_build_time:>8?}");
+        eprintln!("Extract defs:      {defs_time:>8?}");
+        eprintln!("Extract refs:      {refs_time:>8?}");
+        eprintln!("Builtin refs:      {builtin_refs_time:>8?}");
+        eprintln!("Import modules:    {imports_time:>8?}");
         eprintln!("---");
-        eprintln!("Total analyze():   {:>8?}", total_time);
+        eprintln!("Total analyze():   {total_time:>8?}");
     }
 }
