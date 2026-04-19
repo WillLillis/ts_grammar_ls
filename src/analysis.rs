@@ -7,6 +7,8 @@ use tree_sitter_generate::nativedsl::{self, ast};
 
 use crate::document::{Analysis, DefKind, Definition, Document, RefKind, Reference};
 
+const MAX_GRAMMAR_CACHE_ENTRIES: usize = 32;
+
 // ---------------------------------------------------------------------------
 // Analysis extraction - walk the AST to collect definitions and references
 // ---------------------------------------------------------------------------
@@ -400,6 +402,13 @@ fn extract_base_grammar_info(
 
     // Miss or stale: reparse and update cache.
     let (definitions, references, rope) = parse_base_grammar(path, &content)?;
+
+    // Evict the entire cache if it grows too large. In practice a session
+    // works with a handful of base grammars, so this rarely triggers.
+    if ctx.base_cache.len() >= MAX_GRAMMAR_CACHE_ENTRIES {
+        ctx.base_cache.clear();
+    }
+
     ctx.base_cache.insert(
         path.clone(),
         CachedBaseGrammar {

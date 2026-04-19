@@ -365,14 +365,6 @@ const GRAMMAR_CONFIG_FIELDS: &[(&str, &str)] = &[
     ("reserved", "{ [context]: list_rule_t }"),
 ];
 
-/// Look up the type of a grammar config field by name.
-#[must_use]
-pub fn grammar_config_field_type(name: &str) -> Option<&'static str> {
-    GRAMMAR_CONFIG_FIELDS
-        .iter()
-        .find(|&&(n, _)| n == name)
-        .map(|&(_, ty)| ty)
-}
 
 fn grammar_config_field_completions() -> Vec<CompletionItem> {
     GRAMMAR_CONFIG_FIELDS

@@ -53,7 +53,7 @@ fn identifier_hover(
 ) -> Option<Hover> {
     // grammar_config(x).field - show the field type from the known config schema.
     if let Some(tokens) = analysis.tokens.as_deref()
-        && let Some(content) = grammar_config_field_hover(tokens, text, word, offset)
+        && let Some(content) = grammar_config_field_hover(tokens, word, offset)
     {
         return Some(make_hover(content));
     }
@@ -136,7 +136,6 @@ fn imported_member_hover(
 /// If so, return a hover string with the field's type.
 fn grammar_config_field_hover(
     tokens: &[tree_sitter_generate::nativedsl::lexer::Token],
-    _text: &str,
     word: &str,
     offset: u32,
 ) -> Option<String> {
