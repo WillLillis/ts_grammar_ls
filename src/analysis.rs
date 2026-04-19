@@ -12,7 +12,7 @@ use crate::document::{Analysis, DefKind, Definition, Document, RefKind, Referenc
 // ---------------------------------------------------------------------------
 
 /// Extract definitions from an AST's root items.
-fn extract_definitions(parsed_ast: &ast::Ast) -> Vec<Definition> {
+fn extract_definitions(parsed_ast: &ast::Ast, scopes: &ScopeIndex) -> Vec<Definition> {
     let mut definitions = Vec::new();
     for &item_id in &parsed_ast.root_items {
         match parsed_ast.node(item_id) {
@@ -92,7 +92,7 @@ fn extract_definitions(parsed_ast: &ast::Ast) -> Vec<Definition> {
         if let ast::Node::For(for_id) = node {
             let for_span = parsed_ast.context.spans[i];
             let config = parsed_ast.get_for(*for_id);
-            let scope = find_scope(for_span, parsed_ast).unwrap_or(for_span);
+            let scope = scopes.find(for_span).unwrap_or(for_span);
             for &(binding_span, _) in &config.bindings {
                 definitions.push(Definition {
                     name: parsed_ast.text(binding_span).to_owned(),
@@ -107,32 +107,40 @@ fn extract_definitions(parsed_ast: &ast::Ast) -> Vec<Definition> {
     definitions
 }
 
-/// Determine the narrowest enclosing scope (function or for-loop) for a span.
-fn find_scope(span: ast::Span, parsed_ast: &ast::Ast) -> Option<ast::Span> {
-    let mut best: Option<ast::Span> = None;
-    // Check functions.
-    for &item_id in &parsed_ast.root_items {
-        if let ast::Node::Fn(_) = parsed_ast.node(item_id) {
-            let fn_span = parsed_ast.span(item_id);
-            if span.start >= fn_span.start && span.end <= fn_span.end {
-                best = Some(fn_span);
+/// Pre-collected scope spans (functions and for-loops), sorted by start
+/// position for efficient lookup.
+struct ScopeIndex {
+    /// All scope spans, sorted by start position descending so the
+    /// narrowest enclosing scope is found first.
+    scopes: Vec<ast::Span>,
+}
+
+impl ScopeIndex {
+    fn build(parsed_ast: &ast::Ast) -> Self {
+        let mut scopes = Vec::new();
+        for &item_id in &parsed_ast.root_items {
+            if matches!(parsed_ast.node(item_id), ast::Node::Fn(_)) {
+                scopes.push(parsed_ast.span(item_id));
             }
         }
-    }
-    // Check for-loops (may narrow the scope further).
-    for (i, node) in parsed_ast.nodes.iter().enumerate().skip(1) {
-        if let ast::Node::For(_) = node {
-            let for_span = parsed_ast.context.spans[i];
-            if span.start >= for_span.start && span.end <= for_span.end {
-                match best {
-                    Some(b) if for_span.start > b.start => best = Some(for_span),
-                    None => best = Some(for_span),
-                    _ => {}
-                }
+        for (i, node) in parsed_ast.nodes.iter().enumerate().skip(1) {
+            if matches!(node, ast::Node::For(_)) {
+                scopes.push(parsed_ast.context.spans[i]);
             }
         }
+        // Sort by start descending so inner (narrower) scopes come first.
+        scopes.sort_unstable_by(|a, b| b.start.cmp(&a.start));
+        Self { scopes }
     }
-    best
+
+    /// Find the narrowest enclosing scope for a span.
+    fn find(&self, span: ast::Span) -> Option<ast::Span> {
+        self.scopes
+            .iter()
+            .copied()
+            .filter(|s| s.start <= span.start && span.end <= s.end)
+            .min_by_key(|s| s.end - s.start)
+    }
 }
 
 /// Collect the names of import variables from the AST (`let x = import(...)`).
@@ -174,6 +182,7 @@ fn collect_qualified_path(parsed_ast: &ast::Ast, obj_id: ast::NodeId) -> Vec<Str
 fn extract_references(
     parsed_ast: &ast::Ast,
     import_names: &rustc_hash::FxHashSet<String>,
+    scopes: &ScopeIndex,
 ) -> Vec<Reference> {
     let mut references = Vec::new();
 
@@ -185,14 +194,14 @@ fn extract_references(
                 references.push(Reference {
                     span,
                     kind: RefKind::Rule(parsed_ast.text(span).to_owned()),
-                    scope: find_scope(span, parsed_ast),
+                    scope: scopes.find(span),
                 });
             }
             ast::Node::VarRef => {
                 references.push(Reference {
                     span,
                     kind: RefKind::Variable(parsed_ast.text(span).to_owned()),
-                    scope: find_scope(span, parsed_ast),
+                    scope: scopes.find(span),
                 });
             }
             // `expr::member` qualified access - could be base rule or import access.
@@ -213,7 +222,7 @@ fn extract_references(
                 references.push(Reference {
                     span: member_span,
                     kind,
-                    scope: find_scope(member_span, parsed_ast),
+                    scope: scopes.find(member_span),
                 });
             }
             // `expr::fn_name(args)` qualified call - import function call.
@@ -230,7 +239,7 @@ fn extract_references(
                             path,
                             member: member_name,
                         },
-                        scope: find_scope(name_span, parsed_ast),
+                        scope: scopes.find(name_span),
                     });
                 }
             }
@@ -244,7 +253,7 @@ fn extract_references(
                         field: parsed_ast.text(field_span).to_owned(),
                         object: parsed_ast.text(obj_span).to_owned(),
                     },
-                    scope: find_scope(field_span, parsed_ast),
+                    scope: scopes.find(field_span),
                 });
             }
             // inherit("path") - the path string literal.
@@ -341,9 +350,10 @@ fn parse_base_grammar(
         .ok()?;
     // Resolve so that Ident nodes become RuleRef/VarRef (needed for extract_references).
     let _ = nativedsl::resolve::resolve(&mut parsed_ast, None, path);
-    let definitions = extract_definitions(&parsed_ast);
+    let scopes = ScopeIndex::build(&parsed_ast);
+    let definitions = extract_definitions(&parsed_ast, &scopes);
     let import_names = collect_import_names(&parsed_ast);
-    let references = extract_references(&parsed_ast, &import_names);
+    let references = extract_references(&parsed_ast, &import_names, &scopes);
     Some((definitions, references, Rope::from_str(content)))
 }
 
@@ -415,9 +425,10 @@ fn extract_analysis(
         .find(|&&id| matches!(parsed_ast.node(id), ast::Node::Grammar))
         .map(|&id| parsed_ast.span(id));
 
-    let definitions = extract_definitions(parsed_ast);
+    let scopes = ScopeIndex::build(parsed_ast);
+    let definitions = extract_definitions(parsed_ast, &scopes);
     let import_names = collect_import_names(parsed_ast);
-    let mut references = extract_references(parsed_ast, &import_names);
+    let mut references = extract_references(parsed_ast, &import_names, &scopes);
     extract_builtin_references(tokens, grammar_span, &mut references);
     let (base_definitions, base_references, base_rope) = base_grammar_path
         .as_ref()

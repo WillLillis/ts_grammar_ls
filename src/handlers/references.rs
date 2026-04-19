@@ -98,11 +98,7 @@ fn local_references(
 
     if include_declaration {
         for def in analysis.definitions.iter().flatten() {
-            if def.name == word {
-                match (cursor_scope, def.kind.scope()) {
-                    (Some(cs), Some(ds)) if cs != ds => continue,
-                    _ => {}
-                }
+            if def.name == word && def.kind.visible_from(cursor_scope) {
                 locations.push(Location {
                     uri: uri.clone(),
                     range: text::span_to_range(rope, def.name_span),

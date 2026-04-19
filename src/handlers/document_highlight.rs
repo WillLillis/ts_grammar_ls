@@ -66,11 +66,7 @@ fn local_highlights(
     let mut highlights = Vec::new();
 
     for def in analysis.definitions.iter().flatten() {
-        if def.name == word {
-            match (cursor_scope, def.kind.scope()) {
-                (Some(cs), Some(ds)) if cs != ds => continue,
-                _ => {}
-            }
+        if def.name == word && def.kind.visible_from(cursor_scope) {
             highlights.push(DocumentHighlight {
                 range: text::span_to_range(rope, def.name_span),
                 kind: Some(DocumentHighlightKind::WRITE),

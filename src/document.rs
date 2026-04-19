@@ -82,6 +82,23 @@ impl DefKind {
             | Self::ObjectKey => None,
         }
     }
+
+    /// Check if this definition is visible from the given cursor scope.
+    /// Top-level definitions (scope = None) are visible everywhere.
+    /// Scoped definitions (parameters, locals) are visible if the
+    /// definition's scope contains the cursor scope (handles nesting).
+    #[must_use]
+    pub const fn visible_from(&self, cursor_scope: Option<Span>) -> bool {
+        match (cursor_scope, self.scope()) {
+            // Cursor is inside a scope, def is scoped - visible if
+            // the def's scope encloses the cursor's scope.
+            (Some(cs), Some(ds)) => ds.start <= cs.start && cs.end <= ds.end,
+            // Top-level defs are visible from any scope.
+            (_, None) => true,
+            // Scoped defs are not visible from top level.
+            (None, Some(_)) => false,
+        }
+    }
 }
 
 /// An identifier reference extracted from the resolved AST.

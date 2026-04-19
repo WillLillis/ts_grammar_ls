@@ -181,7 +181,10 @@ fn spawn_generate_check(
         }
 
         // Spawn the subprocess.
-        let exe = std::env::current_exe().unwrap();
+        let Ok(exe) = std::env::current_exe() else {
+            tracing::error!("failed to determine current executable path");
+            return;
+        };
         let mut child = match tokio::process::Command::new(exe)
             .arg("generate-check")
             .stdin(std::process::Stdio::piped())

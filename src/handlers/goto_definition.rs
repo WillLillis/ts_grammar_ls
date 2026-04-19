@@ -37,15 +37,12 @@ pub fn goto_definition(
             RefKind::Rule(name) | RefKind::Variable(name) => {
                 let ref_scope = reference.scope;
                 // Try scoped definitions first (parameters), then top-level, then base.
-                if let Some(def) = analysis.definitions.iter().flatten().find(|d| {
-                    d.name == *name
-                        && match (ref_scope, d.kind.scope()) {
-                            (Some(rs), Some(ds)) => rs.start == ds.start && rs.end == ds.end,
-                            // top-level defs visible from any scope
-                            (_, None) => true,
-                            (None, Some(_)) => false, // scoped defs not visible from top level
-                        }
-                }) {
+                if let Some(def) = analysis
+                    .definitions
+                    .iter()
+                    .flatten()
+                    .find(|d| d.name == *name && d.kind.visible_from(ref_scope))
+                {
                     let range = text::span_to_range(&rope, def.name_span);
                     return Some(GotoDefinitionResponse::Scalar(Location {
                         uri: uri.clone(),
