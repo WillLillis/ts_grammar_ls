@@ -5,7 +5,8 @@ use tower::{Service, ServiceExt};
 use tower_lsp::LspService;
 use tower_lsp::jsonrpc::Request;
 use tower_lsp::lsp_types::notification::{
-    DidChangeConfiguration, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
+    DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
+    DidSaveTextDocument,
 };
 use tower_lsp::lsp_types::request::{
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting,
@@ -3128,4 +3129,152 @@ async fn hover_grammar_config_field_access() {
             range: None,
         })
     );
+}
+
+// ---------------------------------------------------------------------------
+// Stale analysis reuse tests
+// ---------------------------------------------------------------------------
+
+/// Helper: send a didChange notification to simulate editing a document.
+async fn did_change(service: &mut LspService<Backend>, uri: Url, version: i32, text: &str) {
+    lsp_notify::<DidChangeTextDocument>(
+        service,
+        DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier { uri, version },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: text.to_string(),
+            }],
+        },
+    )
+    .await;
+    // Small sleep to let the document update propagate.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn completion_works_after_syntax_error() {
+    let good_grammar = r#"
+grammar { language: "test" }
+rule program { repeat(expression) }
+rule expression { "x" }
+"#;
+    let uri = test_uri();
+    let mut service = init(&[(uri.clone(), good_grammar)]).await;
+
+    // Verify completion works on the good grammar.
+    let rope = ropey::Rope::from_str(good_grammar);
+    let pos = ts_grammar_ls::text::offset_to_position(
+        &rope,
+        good_grammar.find("expression").unwrap() as u32,
+    );
+    let items = completions_at(&mut service, uri.clone(), pos).await;
+    assert!(
+        items.iter().any(|i| i.label == "program"),
+        "should have completions before edit: {items:?}"
+    );
+
+    // Edit to introduce a syntax error (truncate mid-rule).
+    let broken = r#"
+grammar { language: "test" }
+rule program { repeat(expression) }
+rule expression {
+"#;
+    did_change(&mut service, uri.clone(), 1, broken).await;
+
+    // Completion should still work using the last good analysis.
+    let broken_rope = ropey::Rope::from_str(broken);
+    let pos = ts_grammar_ls::text::offset_to_position(
+        &broken_rope,
+        broken.find("expression").unwrap() as u32,
+    );
+    let items = completions_at(&mut service, uri, pos).await;
+    assert!(
+        items.iter().any(|i| i.label == "program"),
+        "should still have completions after syntax error: {items:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hover_works_after_syntax_error() {
+    let good_grammar = r#"
+grammar { language: "test" }
+fn helper(x: rule_t) -> rule_t { x }
+rule program { helper("x") }
+"#;
+    let uri = test_uri();
+    let mut service = init(&[(uri.clone(), good_grammar)]).await;
+
+    // Seed the analysis cache by triggering a handler on the good grammar.
+    let rope = ropey::Rope::from_str(good_grammar);
+    let pos = ts_grammar_ls::text::offset_to_position(
+        &rope,
+        good_grammar.find("program").unwrap() as u32,
+    );
+    assert!(hover_at(&mut service, uri.clone(), pos).await.is_some());
+
+    // Edit to introduce a syntax error.
+    let broken = r#"
+grammar { language: "test" }
+fn helper(x: rule_t) -> rule_t { x }
+rule program { helper(
+"#;
+    did_change(&mut service, uri.clone(), 1, broken).await;
+
+    // Hover on "helper" should still show the function signature
+    // from the last good analysis.
+    let broken_rope = ropey::Rope::from_str(broken);
+    let pos = ts_grammar_ls::text::offset_to_position(
+        &broken_rope,
+        broken.rfind("helper").unwrap() as u32,
+    );
+    assert_eq!(
+        hover_at(&mut service, uri, pos).await,
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "```\nfn helper(x: rule_t) -> rule_t\n```".into(),
+            }),
+            range: None,
+        })
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn goto_def_works_after_syntax_error() {
+    let good_grammar = r#"
+grammar { language: "test" }
+rule program { repeat(expression) }
+rule expression { "x" }
+"#;
+    let uri = test_uri();
+    let mut service = init(&[(uri.clone(), good_grammar)]).await;
+
+    // Seed the analysis cache by triggering a handler on the good grammar.
+    let rope = ropey::Rope::from_str(good_grammar);
+    let pos = ts_grammar_ls::text::offset_to_position(
+        &rope,
+        good_grammar.find("program").unwrap() as u32,
+    );
+    assert!(hover_at(&mut service, uri.clone(), pos).await.is_some());
+
+    // Edit to introduce a syntax error.
+    let broken = r#"
+grammar { language: "test" }
+rule program { repeat(expression) }
+rule expression {
+"#;
+    did_change(&mut service, uri.clone(), 1, broken).await;
+
+    // Goto-def on "expression" in `repeat(expression)` should still
+    // jump to the rule definition from the last good analysis.
+    let broken_rope = ropey::Rope::from_str(broken);
+    let pos = ts_grammar_ls::text::offset_to_position(
+        &broken_rope,
+        broken.find("expression").unwrap() as u32,
+    );
+    let result = goto_def_at(&mut service, uri, pos).await;
+    // Should find the definition - exact position from the stale analysis.
+    assert!(result.is_some(), "goto-def should work after syntax error");
 }
