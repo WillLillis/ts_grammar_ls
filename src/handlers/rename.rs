@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
 use tower_lsp::lsp_types::{
-    PrepareRenameResponse, RenameParams, TextDocumentPositionParams, TextEdit, WorkspaceEdit,
+    PrepareRenameResponse, RenameParams, TextDocumentPositionParams, TextEdit, Url, WorkspaceEdit,
 };
 
-use crate::document::{CursorContext, DefKind, RefKind};
+use ropey::Rope;
+
+use crate::document::{CursorContext, DefKind, DiagnosticCache, Document, ExternalModuleInfo, RefKind};
 use crate::server::Backend;
 use crate::text;
 
@@ -25,12 +27,27 @@ pub fn prepare_rename(
     let word = text::word_at_offset(&analysis.source, offset)?;
 
     match analysis.cursor_context(offset, &analysis.source) {
-        // Only regular identifiers are renameable within the current file.
-        // Config fields, base rule accesses, and import member accesses
-        // would require cross-file edits.
-        CursorContext::GrammarConfigField
-        | CursorContext::BaseRuleAccess
-        | CursorContext::ImportModuleAccess { .. } => return None,
+        CursorContext::GrammarConfigField => return None,
+        CursorContext::BaseRuleAccess => {
+            // Cursor is on the member part of `base::rule_name`.
+            // Find the definition in the base module.
+            let base = analysis.base_module.as_ref()?;
+            let def = base.definitions.iter().find(|d| d.name == word)?;
+            let range = text::span_to_range(&base.rope, def.name_span);
+            return Some(PrepareRenameResponse::Range(range));
+        }
+        CursorContext::ImportModuleAccess { .. } => {
+            // Cursor is on the member part of `mod::member`.
+            let qualifier = text::qualified_access_module(
+                analysis.tokens.as_deref()?,
+                &analysis.source,
+                offset,
+            )?;
+            let module = analysis.get_module(qualifier)?;
+            let def = module.definitions.iter().find(|d| d.name == word)?;
+            let range = text::span_to_range(&module.rope, def.name_span);
+            return Some(PrepareRenameResponse::Range(range));
+        }
         CursorContext::Identifier { .. } => {}
     }
 
@@ -55,7 +72,7 @@ pub fn prepare_rename(
     Some(PrepareRenameResponse::Range(range))
 }
 
-/// Rename a symbol and all its references within the current file.
+/// Rename a symbol and all its references, potentially across files.
 #[must_use]
 pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit> {
     let uri = &params.text_document_position.text_document.uri;
@@ -74,12 +91,151 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
     let analysis = backend.get_analysis(uri)?;
     let word = text::word_at_offset(&analysis.source, offset)?;
 
-    // Only rename regular identifiers (not base/import accesses).
-    let CursorContext::Identifier { scope } = analysis.cursor_context(offset, &analysis.source)
-    else {
-        return None;
-    };
+    match analysis.cursor_context(offset, &analysis.source) {
+        CursorContext::BaseRuleAccess => {
+            let base = analysis.base_module.as_ref()?;
+            let (edit, new_source) = rename_cross_file(
+                uri,
+                &analysis,
+                base,
+                word,
+                new_name,
+                |r| matches!(&r.kind, RefKind::BaseRule(name) if name == word),
+            )?;
+            seed_external_document(backend, &base.path, new_source);
+            Some(edit)
+        }
+        CursorContext::ImportModuleAccess { .. } => {
+            let qualifier = text::qualified_access_module(
+                analysis.tokens.as_deref()?,
+                &analysis.source,
+                offset,
+            )?;
+            let module = analysis.get_module(qualifier)?;
+            let (edit, new_source) = rename_cross_file(
+                uri,
+                &analysis,
+                module,
+                word,
+                new_name,
+                |r| matches!(&r.kind, RefKind::ImportedMember { member, .. } if member == word),
+            )?;
+            seed_external_document(backend, &module.path, new_source);
+            Some(edit)
+        }
+        CursorContext::Identifier { scope } => rename_local(uri, &analysis, word, new_name, scope),
+        CursorContext::GrammarConfigField => None,
+    }
+}
 
+/// Insert the post-rename content of an external file into the document_map
+/// and invalidate its grammar cache entry. The analysis pipeline prefers
+/// document_map content over disk, so subsequent `get_analysis` calls will
+/// pick up the renamed symbols immediately.
+fn seed_external_document(backend: &Backend, path: &std::path::Path, content: String) {
+    if let Ok(uri) = Url::from_file_path(path) {
+        backend.grammar_cache.remove(path);
+        backend.document_map.insert(
+            uri,
+            Document {
+                rope: Rope::from_str(&content),
+                text: content,
+                version: 0,
+                diagnostics: DiagnosticCache::default(),
+                analysis: None,
+            },
+        );
+    }
+}
+
+/// Rename a symbol defined in an external module (base or imported).
+/// Edits the definition + references in the external file, and all matching
+/// cross-module references in the current file.
+/// Returns (WorkspaceEdit, new external source text).
+fn rename_cross_file(
+    current_uri: &Url,
+    analysis: &crate::document::Analysis,
+    module: &ExternalModuleInfo,
+    word: &str,
+    new_name: &str,
+    current_file_ref_filter: impl Fn(&crate::document::Reference) -> bool,
+) -> Option<(WorkspaceEdit, String)> {
+    let external_uri = Url::from_file_path(&module.path).ok()?;
+
+    // Collect edits in the external file: definition + all references.
+    // Track both LSP TextEdits (for the WorkspaceEdit) and byte offsets
+    // (to compute the new source text for the document_map).
+    let mut external_edits = Vec::new();
+    let mut byte_edits: Vec<(usize, usize)> = Vec::new();
+    for def in &module.definitions {
+        if def.name == word {
+            external_edits.push(TextEdit {
+                range: text::span_to_range(&module.rope, def.name_span),
+                new_text: new_name.into(),
+            });
+            byte_edits.push((def.name_span.start as usize, def.name_span.end as usize));
+        }
+    }
+    for reference in &module.references {
+        let name_matches = match &reference.kind {
+            RefKind::Rule(name) | RefKind::Variable(name) => name == word,
+            _ => false,
+        };
+        if name_matches {
+            external_edits.push(TextEdit {
+                range: text::span_to_range(&module.rope, reference.span),
+                new_text: new_name.into(),
+            });
+            byte_edits.push((reference.span.start as usize, reference.span.end as usize));
+        }
+    }
+
+    // Collect edits in the current file: cross-module references.
+    let mut current_edits = Vec::new();
+    for reference in analysis.references.iter().flatten() {
+        if current_file_ref_filter(reference) {
+            current_edits.push(TextEdit {
+                range: text::span_to_range(&analysis.rope, reference.span),
+                new_text: new_name.into(),
+            });
+        }
+    }
+
+    if external_edits.is_empty() && current_edits.is_empty() {
+        return None;
+    }
+
+    // Compute the new external source by applying byte edits back-to-front.
+    let mut new_source = module.rope.to_string();
+    byte_edits.sort_by(|a, b| b.0.cmp(&a.0));
+    for (start, end) in &byte_edits {
+        new_source.replace_range(*start..*end, new_name);
+    }
+
+    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+    if !external_edits.is_empty() {
+        changes.insert(external_uri, external_edits);
+    }
+    if !current_edits.is_empty() {
+        changes.insert(current_uri.clone(), current_edits);
+    }
+    Some((
+        WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        },
+        new_source,
+    ))
+}
+
+/// Rename a locally-defined symbol within the current file.
+fn rename_local(
+    uri: &Url,
+    analysis: &crate::document::Analysis,
+    word: &str,
+    new_name: &str,
+    scope: Option<tree_sitter_generate::nativedsl::ast::Span>,
+) -> Option<WorkspaceEdit> {
     let mut edits = Vec::new();
 
     // Rename the definition site(s).
@@ -87,7 +243,7 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
         if def.name == word && def.kind.visible_from(scope) {
             edits.push(TextEdit {
                 range: text::span_to_range(&analysis.rope, def.name_span),
-                new_text: new_name.clone(),
+                new_text: new_name.into(),
             });
         }
     }
@@ -104,7 +260,7 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
         if reference.matches_word(word, &analysis.source, scope) {
             edits.push(TextEdit {
                 range: text::span_to_range(&analysis.rope, reference.span),
-                new_text: new_name.clone(),
+                new_text: new_name.into(),
             });
         }
     }
@@ -125,9 +281,7 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
 /// not starting with a digit).
 fn is_valid_identifier(name: &str) -> bool {
     !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         && !name.as_bytes()[0].is_ascii_digit()
 }
 

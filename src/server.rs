@@ -78,7 +78,9 @@ impl Backend {
 
         // If parse failed (definitions is None), keep the previous good
         // analysis so features like completion still work mid-keystroke.
-        if new.definitions.is_none() && let Some(old) = cached {
+        if new.definitions.is_none()
+            && let Some(old) = cached
+        {
             return Some(old);
         }
 

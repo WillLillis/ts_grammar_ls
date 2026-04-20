@@ -1567,6 +1567,142 @@ async fn document_highlight_base_rule_excludes_override() {
     assert_eq!(highlights[0].kind, Some(DocumentHighlightKind::READ));
 }
 
+/// Create a fixture where the base grammar has a function, and the derived
+/// grammar calls it via `base::wrap(...)`.
+struct InheritFnFixture {
+    _dir: tempfile::TempDir,
+    base_path: std::path::PathBuf,
+    derived_path: std::path::PathBuf,
+    derived_text: String,
+}
+
+fn create_inherit_fn_fixture() -> InheritFnFixture {
+    let dir = tempfile::tempdir().unwrap();
+
+    let base_text = r#"
+grammar { language: "base_lang" }
+fn wrap(x: rule_t) -> rule_t { seq("(", x, ")") }
+rule program { wrap("x") }
+"#;
+    let base_path = dir.path().join("base.tsg");
+    std::fs::write(&base_path, base_text).unwrap();
+
+    let derived_text = format!(
+        r#"
+let base = inherit("{}")
+grammar {{
+    language: "derived_lang",
+    inherits: base,
+}}
+rule program {{ base::wrap("y") }}
+"#,
+        base_path.display()
+    );
+    let derived_path = dir.path().join("derived.tsg");
+    std::fs::write(&derived_path, &derived_text).unwrap();
+
+    InheritFnFixture {
+        _dir: dir,
+        base_path,
+        derived_path,
+        derived_text,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn goto_def_base_qualified_call() {
+    let fix = create_inherit_fn_fixture();
+    let derived_uri = Url::from_file_path(&fix.derived_path).unwrap();
+    let base_uri = Url::from_file_path(&fix.base_path).unwrap();
+
+    let mut service = init(&[(derived_uri.clone(), &fix.derived_text)]).await;
+
+    // Cursor on "wrap" in `base::wrap("y")`.
+    let wrap_offset = fix.derived_text.find("base::wrap").unwrap() + "base::".len();
+    let rope = ropey::Rope::from_str(&fix.derived_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, wrap_offset as u32);
+
+    let result = goto_def_at(&mut service, derived_uri, pos).await;
+
+    let resp = result.unwrap();
+    let GotoDefinitionResponse::Scalar(loc) = resp else {
+        panic!("expected scalar location");
+    };
+    assert_eq!(loc.uri, base_uri, "base::wrap() should jump to base grammar");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn references_base_qualified_call() {
+    let fix = create_inherit_fn_fixture();
+    let derived_uri = Url::from_file_path(&fix.derived_path).unwrap();
+    let base_uri = Url::from_file_path(&fix.base_path).unwrap();
+
+    let mut service = init(&[(derived_uri.clone(), &fix.derived_text)]).await;
+
+    // Cursor on "wrap" in `base::wrap("y")`.
+    let wrap_offset = fix.derived_text.find("base::wrap").unwrap() + "base::".len();
+    let rope = ropey::Rope::from_str(&fix.derived_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, wrap_offset as u32);
+
+    let result = references_at(&mut service, derived_uri.clone(), pos, true).await;
+    let locations = result.expect("should find references");
+
+    // Should include: base definition, base usage in `rule program`, derived `base::wrap` ref.
+    let base_locations: Vec<_> = locations.iter().filter(|l| l.uri == base_uri).collect();
+    let derived_locations: Vec<_> = locations.iter().filter(|l| l.uri == derived_uri).collect();
+
+    assert_eq!(base_locations.len(), 2, "base: definition + usage in program");
+    assert_eq!(derived_locations.len(), 1, "derived: base::wrap reference");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn highlight_base_qualified_call() {
+    let fix = create_inherit_fn_fixture();
+    let derived_uri = Url::from_file_path(&fix.derived_path).unwrap();
+
+    let mut service = init(&[(derived_uri.clone(), &fix.derived_text)]).await;
+
+    // Cursor on "wrap" in `base::wrap("y")`.
+    let wrap_offset = fix.derived_text.find("base::wrap").unwrap() + "base::".len();
+    let rope = ropey::Rope::from_str(&fix.derived_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, wrap_offset as u32);
+
+    let result = highlights_at(&mut service, derived_uri, pos).await;
+    let highlights = result.expect("should find highlights");
+
+    assert_eq!(highlights.len(), 1, "should highlight the base::wrap call");
+    assert_eq!(highlights[0].kind, Some(DocumentHighlightKind::READ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rename_base_qualified_call() {
+    let fix = create_inherit_fn_fixture();
+    let derived_uri = Url::from_file_path(&fix.derived_path).unwrap();
+    let base_uri = Url::from_file_path(&fix.base_path).unwrap();
+
+    let mut service = init(&[(derived_uri.clone(), &fix.derived_text)]).await;
+
+    // Cursor on "wrap" in `base::wrap("y")`.
+    let wrap_offset = fix.derived_text.find("base::wrap").unwrap() + "base::".len();
+    let rope = ropey::Rope::from_str(&fix.derived_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, wrap_offset as u32);
+
+    let edit = rename_at(&mut service, derived_uri.clone(), pos, "enclose")
+        .await
+        .unwrap();
+    let changes = edit.changes.unwrap();
+
+    // Base file: definition of `wrap` + usage in `rule program { wrap("x") }`.
+    let base_edits = &changes[&base_uri];
+    assert_eq!(base_edits.len(), 2);
+    assert!(base_edits.iter().all(|e| e.new_text == "enclose"));
+
+    // Derived file: the `base::wrap` reference.
+    let derived_edits = &changes[&derived_uri];
+    assert_eq!(derived_edits.len(), 1);
+    assert_eq!(derived_edits[0].new_text, "enclose");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn base_grammar_uses_in_memory_text_when_open() {
     // When the base grammar is also open as a document, analyze() should use
@@ -3363,7 +3499,9 @@ rule program { helper("x") }
     let offset = grammar.find("helper").unwrap();
     let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
 
-    let edit = rename_at(&mut service, uri.clone(), pos, "wrap").await.unwrap();
+    let edit = rename_at(&mut service, uri.clone(), pos, "wrap")
+        .await
+        .unwrap();
     let edits = &edit.changes.unwrap()[&uri];
 
     // Definition + usage = 2 edits.
@@ -3387,7 +3525,9 @@ rule program { foo("x") }
     let foo_item_offset = grammar.find("item").unwrap();
     let pos = ts_grammar_ls::text::offset_to_position(&rope, foo_item_offset as u32);
 
-    let edit = rename_at(&mut service, uri.clone(), pos, "x").await.unwrap();
+    let edit = rename_at(&mut service, uri.clone(), pos, "x")
+        .await
+        .unwrap();
     let edits = &edit.changes.unwrap()[&uri];
 
     // foo's "item" appears twice: parameter + body usage.
@@ -3419,7 +3559,10 @@ rule program { "x" }
     let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
 
     // Invalid names should return None.
-    assert_eq!(rename_at(&mut service, uri.clone(), pos, "1bad").await, None);
+    assert_eq!(
+        rename_at(&mut service, uri.clone(), pos, "1bad").await,
+        None
+    );
     assert_eq!(rename_at(&mut service, uri.clone(), pos, "").await, None);
     assert_eq!(
         rename_at(&mut service, uri.clone(), pos, "has space").await,
@@ -3446,4 +3589,82 @@ rule program { seq("a", "b") }
         None,
         "builtins should not be renameable"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-file rename tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn rename_base_rule_from_derived_file() {
+    let fix = create_inherit_fixture();
+    let derived_uri = Url::from_file_path(&fix.derived_path).unwrap();
+    let base_uri = Url::from_file_path(&fix.base_path).unwrap();
+
+    let mut service = init(&[(derived_uri.clone(), &fix.derived_text)]).await;
+
+    // Cursor on "_statement" in `base::_statement`.
+    let base_stmt_offset = fix.derived_text.find("base::_statement").unwrap() + "base::".len();
+    let rope = ropey::Rope::from_str(&fix.derived_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, base_stmt_offset as u32);
+
+    // prepare_rename should succeed for cross-file rename.
+    let prep = prepare_rename_at(&mut service, derived_uri.clone(), pos).await;
+    assert!(
+        prep.is_some(),
+        "prepare_rename should accept base rule access"
+    );
+
+    // Rename "_statement" to "stmt".
+    let edit = rename_at(&mut service, derived_uri.clone(), pos, "stmt")
+        .await
+        .unwrap();
+    let changes = edit.changes.unwrap();
+
+    // Base file: definition of `_statement` + reference in `repeat(_statement)`.
+    let base_edits = &changes[&base_uri];
+    assert_eq!(base_edits.len(), 2);
+    assert!(base_edits.iter().all(|e| e.new_text == "stmt"));
+
+    // Derived file: the `base::_statement` reference.
+    let derived_edits = &changes[&derived_uri];
+    assert_eq!(derived_edits.len(), 1);
+    assert_eq!(derived_edits[0].new_text, "stmt");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rename_imported_function_from_importing_file() {
+    let fix = create_import_fixture();
+    let grammar_uri = Url::from_file_path(&fix.grammar_path).unwrap();
+    let helper_uri = Url::from_file_path(&fix.helper_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &fix.grammar_text)]).await;
+
+    // Cursor on "commaSep" in `helpers::commaSep("x")`.
+    let comma_sep_offset = fix.grammar_text.find("helpers::commaSep").unwrap() + "helpers::".len();
+    let rope = ropey::Rope::from_str(&fix.grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, comma_sep_offset as u32);
+
+    // prepare_rename should succeed for cross-file rename.
+    let prep = prepare_rename_at(&mut service, grammar_uri.clone(), pos).await;
+    assert!(
+        prep.is_some(),
+        "prepare_rename should accept import member access"
+    );
+
+    // Rename "commaSep" to "separated".
+    let edit = rename_at(&mut service, grammar_uri.clone(), pos, "separated")
+        .await
+        .unwrap();
+    let changes = edit.changes.unwrap();
+
+    // Helper file: definition of `commaSep`.
+    let helper_edits = &changes[&helper_uri];
+    assert_eq!(helper_edits.len(), 1);
+    assert_eq!(helper_edits[0].new_text, "separated");
+
+    // Grammar file: the `helpers::commaSep` reference.
+    let grammar_edits = &changes[&grammar_uri];
+    assert_eq!(grammar_edits.len(), 1);
+    assert_eq!(grammar_edits[0].new_text, "separated");
 }

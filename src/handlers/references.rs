@@ -26,9 +26,14 @@ pub fn references(backend: &Backend, params: &ReferenceParams) -> Option<Vec<Loc
         CursorContext::BaseRuleAccess => {
             base_rule_references(&analysis, uri, &analysis.rope, &word, include_declaration)
         }
-        CursorContext::ImportModuleAccess { scope } => {
-            import_member_references(&analysis, uri, &analysis.rope, &word, scope, include_declaration)
-        }
+        CursorContext::ImportModuleAccess { scope } => import_member_references(
+            &analysis,
+            uri,
+            &analysis.rope,
+            &word,
+            scope,
+            include_declaration,
+        ),
         CursorContext::Identifier { scope } => local_references(
             &analysis,
             uri,

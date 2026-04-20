@@ -226,23 +226,26 @@ fn extract_references(
                     scope: scopes.find(member_span),
                 });
             }
-            // `expr::fn_name(args)` qualified call - import function call.
+            // `expr::fn_name(args)` qualified call - could be base or import.
             ast::Node::QualifiedCall(range) => {
                 let (obj, name, _args) = parsed_ast.get_qualified_call(*range);
                 let name_span = parsed_ast.span(name);
                 let member_name = parsed_ast.text(name_span).to_owned();
                 let path = collect_qualified_path(parsed_ast, obj);
                 let is_import = path.first().is_some_and(|root| import_names.contains(root));
-                if is_import {
-                    references.push(Reference {
-                        span: name_span,
-                        kind: RefKind::ImportedMember {
-                            path,
-                            member: member_name,
-                        },
-                        scope: scopes.find(name_span),
-                    });
-                }
+                let kind = if is_import {
+                    RefKind::ImportedMember {
+                        path,
+                        member: member_name,
+                    }
+                } else {
+                    RefKind::BaseRule(member_name)
+                };
+                references.push(Reference {
+                    span: name_span,
+                    kind,
+                    scope: scopes.find(name_span),
+                });
             }
             // Field access: `obj.field` - extract the field as an ObjectField ref.
             ast::Node::FieldAccess { obj, field } => {
