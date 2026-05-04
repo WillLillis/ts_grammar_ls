@@ -133,6 +133,33 @@ pub fn qualified_access_module<'src>(
     Some(&source[qual.span.start as usize..qual.span.end as usize])
 }
 
+/// Check if `start_idx` (a token index, exclusive) sits inside the
+/// field-name argument slot of a `grammar_config(module, |...)` call.
+/// Walks back through idents/commas/comments to find the opening `(`,
+/// requiring at least one comma along the way.
+#[must_use]
+pub fn at_grammar_config_field_arg(
+    tokens: &[tree_sitter_generate::nativedsl::lexer::Token],
+    start_idx: usize,
+) -> bool {
+    use tree_sitter_generate::nativedsl::lexer::TokenKind;
+
+    let mut i = start_idx;
+    let mut saw_comma = false;
+    while i > 0 {
+        i -= 1;
+        match tokens[i].kind {
+            TokenKind::Ident | TokenKind::Comment => {}
+            TokenKind::Comma => saw_comma = true,
+            TokenKind::LParen => {
+                return saw_comma && i > 0 && tokens[i - 1].kind == TokenKind::KwGrammarConfig;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 #[must_use]
 pub fn span_to_range(rope: &Rope, span: Span) -> Range {
     Range::new(

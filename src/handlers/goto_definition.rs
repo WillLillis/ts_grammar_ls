@@ -20,12 +20,7 @@ pub fn goto_definition(
     let analysis = backend.get_analysis(uri)?;
 
     // Check if cursor is on a known reference from the resolved AST.
-    if let Some(reference) = analysis
-        .references
-        .iter()
-        .flatten()
-        .find(|r| offset >= r.span.start && offset < r.span.end)
-    {
+    if let Some(reference) = analysis.reference_at(offset) {
         match &reference.kind {
             RefKind::BaseRule(name) => {
                 return goto_base_definition(&analysis, name);
@@ -104,8 +99,8 @@ fn goto_object_field(
     object_name: &str,
     field_name: &str,
 ) -> Option<GotoDefinitionResponse> {
-    analysis::with_ast(text, uri, |parsed_ast| {
-        let (key_span, _) = analysis::find_object_field(parsed_ast, object_name, field_name)?;
+    analysis::with_ast(text, uri, |shared, ctx| {
+        let (key_span, _) = analysis::find_object_field(shared, ctx, object_name, field_name)?;
         let rope = ropey::Rope::from_str(text);
         Some(GotoDefinitionResponse::Scalar(Location {
             uri: uri.clone(),

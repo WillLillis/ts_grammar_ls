@@ -289,15 +289,24 @@ let extras: list_rule_t = [regexp(r\"\\s\"), comment]
 
 pub const KW_FN: &str = "\
 ```
-fn <name>(<params>) -> <return_type> { <body> }
+macro <name>(<params>) <return_type> { <body> }
 ```
-Define a function. Parameters require type annotations. The return type \
-is required. Functions can be called from rule bodies and other functions.
+Define a parameterized expression template. Macros are expanded inline at \
+grammar generation time - calls are substituted with the macro body, with \
+arguments filled in for each parameter. Use them to factor out repeated \
+patterns (comma-separated lists, parenthesized groups, optional prefixes, \
+shared values) so you write the shape once and reuse it.
+
+Parameters and return values are typed (`rule_t`, `str_t`, `int_t`, list \
+variants). Macros have no runtime cost: they're not calls, they're \
+templates that produce grammar structure.
 ```
-fn commaSep1(item: rule_t) -> rule_t {
+macro commaSep1(item: rule_t) rule_t {
     seq(item, repeat(seq(\",\", item)))
 }
-fn commaSep(item: rule_t) -> rule_t { optional(commaSep1(item)) }
+macro commaSep(item: rule_t) rule_t { optional(commaSep1(item)) }
+
+rule arguments { commaSep(_expression) }
 ```";
 
 pub const KW_FOR: &str = "\
@@ -526,7 +535,7 @@ pub fn builtin_hover(name: &str) -> Option<&'static str> {
         "rule" => KW_RULE,
         "override" => KW_OVERRIDE,
         "let" => KW_LET,
-        "fn" | "in" => KW_FN,
+        "macro" | "in" => KW_FN,
         "for" => KW_FOR,
         "print" => KW_PRINT,
         "rule_t" => TYPE_RULE_T,

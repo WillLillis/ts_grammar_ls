@@ -67,7 +67,12 @@ fn base_rule_references(
             });
         }
         for reference in &base.references {
-            if matches!(&reference.kind, RefKind::Rule(name) if name == word) {
+            // Match both rule references and macro/variable references by
+            // name - inherited names can be either rules or macros.
+            if matches!(
+                &reference.kind,
+                RefKind::Rule(name) | RefKind::Variable(name) if name == word,
+            ) {
                 locations.push(Location {
                     uri: base_uri.clone(),
                     range: text::span_to_range(&base.rope, reference.span),

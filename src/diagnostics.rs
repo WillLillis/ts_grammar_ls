@@ -28,7 +28,10 @@ use tree_sitter_generate::parse_grammar::normalize_grammar;
 // ---------------------------------------------------------------------------
 
 fn dsl_error_to_diagnostics(error: &DslError, rope: &Rope) -> Vec<Diagnostic> {
-    let range = text::span_to_range(rope, error.span());
+    let range = error
+        .span()
+        .map(|s| text::span_to_range(rope, s))
+        .unwrap_or_default();
     let source = Some("ts_grammar_ls".into());
 
     let mut diagnostics = vec![Diagnostic {
@@ -306,7 +309,15 @@ fn prepare_grammar_json(text: &str, grammar_path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+
+    /// Write grammar text to a temp file and return the path.
+    /// `parse_native_dsl` requires a canonicalizable path.
+    fn temp_grammar(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.tsg");
+        std::fs::write(&path, text).unwrap();
+        (dir, path)
+    }
 
     #[test]
     fn prepare_grammar_json_valid() {
@@ -314,7 +325,7 @@ mod tests {
             grammar { language: "test" }
             rule program { repeat("x") }
         "#;
-        let path = PathBuf::from("test.tsg");
+        let (_dir, path) = temp_grammar(text);
         let json = prepare_grammar_json(text, &path);
         assert!(json.is_some());
         let json = json.unwrap();
@@ -324,18 +335,17 @@ mod tests {
     #[test]
     fn prepare_grammar_json_invalid() {
         let text = r#"grammar { language: "test" } rule program {"#;
-        let path = PathBuf::from("test.tsg");
+        let (_dir, path) = temp_grammar(text);
         assert_eq!(prepare_grammar_json(text, &path), None);
     }
 
     #[test]
     fn generate_check_valid_grammar() {
-        // Verify that a valid grammar JSON passes generate_parser_for_grammar.
         let text = r#"
             grammar { language: "test" }
             rule program { repeat("x") }
         "#;
-        let path = PathBuf::from("test.tsg");
+        let (_dir, path) = temp_grammar(text);
         let json = prepare_grammar_json(text, &path).unwrap();
         let result = tree_sitter_generate::generate_parser_for_grammar(&json, None);
         assert!(
@@ -347,15 +357,13 @@ mod tests {
 
     #[test]
     fn generate_check_catches_errors() {
-        // A grammar with an unresolved conflict should fail during generate.
-        // This is a generate-phase error that the DSL pipeline wouldn't catch.
         let text = r#"
             grammar { language: "test" }
             rule program { choice(a, b) }
             rule a { seq("x", "y") }
             rule b { seq("x", "z") }
         "#;
-        let path = PathBuf::from("test.tsg");
+        let (_dir, path) = temp_grammar(text);
         let json = prepare_grammar_json(text, &path);
         // This grammar is valid at the DSL level.
         assert!(json.is_some());

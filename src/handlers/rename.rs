@@ -128,13 +128,11 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
     }
 }
 
-/// Insert the post-rename content of an external file into the document_map
-/// and invalidate its grammar cache entry. The analysis pipeline prefers
-/// document_map content over disk, so subsequent `get_analysis` calls will
-/// pick up the renamed symbols immediately.
+/// Insert the post-rename content of an external file into the document_map.
+/// The analysis pipeline prefers document_map content over disk, so subsequent
+/// `get_analysis` calls will pick up the renamed symbols immediately.
 fn seed_external_document(backend: &Backend, path: &std::path::Path, content: String) {
     if let Ok(uri) = Url::from_file_path(path) {
-        backend.grammar_cache.remove(path);
         backend.document_map.insert(
             uri,
             Document {

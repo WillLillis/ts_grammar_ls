@@ -36,7 +36,7 @@ const KEYWORDS: &[(&str, &str)] = &[
     ("rule", "Define a grammar rule"),
     ("override", "Override an inherited rule"),
     ("let", "Bind a value"),
-    ("fn", "Define a function"),
+    ("macro", "Define a macro"),
     ("for", "Iterate over a list"),
     ("in", "For-loop iterable"),
     (
@@ -89,6 +89,15 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
     // Find the token just before the cursor position.
     let prev_token = tokens.iter().take_while(|t| t.span.end <= offset).last();
 
+    // Inside `grammar_config(module, |` - complete field names.
+    let cursor_token_idx = tokens
+        .iter()
+        .rposition(|t| t.span.end <= offset)
+        .map_or(0, |i| i + 1);
+    if text::at_grammar_config_field_arg(tokens, cursor_token_idx) {
+        return Some(CompletionResponse::Array(grammar_config_field_completions()));
+    }
+
     // `IDENT.` -> complete object fields
     if let Some(Token {
         kind: TokenKind::Dot,
@@ -99,13 +108,6 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             .iter()
             .take_while(|t| t.span.end <= dot_span.start)
             .last();
-
-        // `grammar_config(x).` -> complete grammar config fields.
-        if before_dot.is_some_and(|t| t.kind == TokenKind::RParen)
-            && is_grammar_config_call(tokens, dot_span.start)
-        {
-            return Some(CompletionResponse::Array(grammar_config_field_completions()));
-        }
 
         // `IDENT.` -> complete object fields.
         if let Some(ident) = before_dot.filter(|t| t.kind == TokenKind::Ident) {

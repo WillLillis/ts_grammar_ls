@@ -54,12 +54,8 @@ fn identifier_hover(
     }
 
     // Object field access (e.g. `CALL` in `PREC.CALL`) - show the field's value.
-    if let Some(RefKind::ObjectField { field, object }) = analysis
-        .references
-        .iter()
-        .flatten()
-        .find(|r| offset >= r.span.start && offset < r.span.end)
-        .map(|r| r.kind.clone())
+    if let Some(RefKind::ObjectField { field, object }) =
+        analysis.reference_at(offset).map(|r| r.kind.clone())
         && let Some(content) = field_value_hover(text, uri, &object, &field)
     {
         return Some(make_hover(content));
@@ -76,8 +72,20 @@ fn identifier_hover(
             DefKind::Function { signature } => format!("```\n{signature}\n```"),
             DefKind::Let { .. } => {
                 // Run the pipeline to get the type from the type environment.
-                let ty =
-                    analysis::with_type_env(text, uri, |_ast, env| env.vars.get(word)).flatten();
+                let ty = analysis::with_type_env(text, uri, |shared, ctx, env| {
+                    ctx.root_items.iter().find_map(|&item_id| {
+                        if let tree_sitter_generate::nativedsl::ast::Node::Let {
+                            name, ..
+                        } = shared.arena.get(item_id)
+                            && ctx.text(*name) == word
+                        {
+                            env.vars.get(&item_id).copied()
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .flatten();
                 ty.map_or_else(
                     || format!("```\nlet {}\n```", def.name),
                     |ty| format!("```\nlet {}: {ty}\n```", def.name),
@@ -99,9 +107,9 @@ fn field_value_hover(
     object_name: &str,
     field_name: &str,
 ) -> Option<String> {
-    analysis::with_ast(text, uri, |parsed_ast| {
-        let (_, value_id) = analysis::find_object_field(parsed_ast, object_name, field_name)?;
-        let value_text = parsed_ast.text(parsed_ast.span(value_id));
+    analysis::with_ast(text, uri, |shared, ctx| {
+        let (_, value_id) = analysis::find_object_field(shared, ctx, object_name, field_name)?;
+        let value_text = ctx.text(shared.arena.span(value_id));
         Some(format!(
             "```\n{object_name}.{field_name} = {value_text}\n```"
         ))
@@ -127,8 +135,9 @@ fn imported_member_hover(
     Some(make_hover(content))
 }
 
-/// Check if the identifier at `offset` is a field access on `grammar_config(...)`.
-/// If so, return a hover string with the field's type.
+/// Check if the identifier at `offset` is the field-name argument of a
+/// `grammar_config(module, field)` call. If so, return a hover string with
+/// the field's type.
 fn grammar_config_field_hover(
     tokens: &[tree_sitter_generate::nativedsl::lexer::Token],
     word: &str,
@@ -136,30 +145,12 @@ fn grammar_config_field_hover(
 ) -> Option<String> {
     use tree_sitter_generate::nativedsl::lexer::TokenKind;
 
-    // Find the ident token at the cursor.
     let idx = tokens.iter().position(|t| {
         t.kind == TokenKind::Ident && offset >= t.span.start && offset < t.span.end
     })?;
-
-    // Must be preceded by `.`
-    if idx < 2 || tokens[idx - 1].kind != TokenKind::Dot {
-        return None;
-    }
-
-    // The token before `.` must be `)` closing a `grammar_config(...)` call.
-    let before_dot = &tokens[idx - 2];
-    if before_dot.kind != TokenKind::RParen {
-        return None;
-    }
-
-    // Walk back through parens to find `grammar_config`.
-    let dot_start = tokens[idx - 1].span.start;
-    if !crate::handlers::completion::is_grammar_config_call(tokens, dot_start) {
-        return None;
-    }
-
-    // Show the same docs as hovering over the field inside the grammar block.
-    Some(hover_docs::grammar_field_hover(word)?.to_owned())
+    text::at_grammar_config_field_arg(tokens, idx)
+        .then(|| hover_docs::grammar_field_hover(word).map(str::to_owned))
+        .flatten()
 }
 
 const fn make_hover(value: String) -> Hover {

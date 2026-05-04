@@ -64,7 +64,7 @@ impl DefKind {
         match self {
             Self::Rule => "rule",
             Self::OverrideRule => "override rule",
-            Self::Function { .. } => "fn",
+            Self::Function { .. } => "macro",
             Self::Let { .. } => "let",
             Self::Import => "import",
             Self::Inherit => "inherit",
@@ -228,6 +228,30 @@ pub struct Analysis {
 }
 
 impl Analysis {
+    /// Find the reference at `offset`, preferring more specific kinds when
+    /// multiple references share a span (e.g. `helpers::commaSep` produces
+    /// both an inner `Variable("commaSep")` and an outer `ImportedMember`).
+    /// `BaseRule`/`ImportedMember`/`ImportedPath`/`InheritPath`/`ObjectField`
+    /// win over plain `Rule`/`Variable`.
+    #[must_use]
+    pub fn reference_at(&self, offset: u32) -> Option<&Reference> {
+        fn priority(kind: &RefKind) -> u8 {
+            match kind {
+                RefKind::BaseRule(_)
+                | RefKind::ImportedMember { .. }
+                | RefKind::ImportPath
+                | RefKind::InheritPath
+                | RefKind::ObjectField { .. } => 0,
+                _ => 1,
+            }
+        }
+        self.references
+            .iter()
+            .flatten()
+            .filter(|r| offset >= r.span.start && offset < r.span.end)
+            .min_by_key(|r| priority(&r.kind))
+    }
+
     /// Look up a module by its variable name. Checks both imported modules
     /// and the inherited base grammar.
     #[must_use]
