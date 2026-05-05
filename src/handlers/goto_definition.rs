@@ -13,11 +13,8 @@ pub fn goto_definition(
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
 
-    let offset = {
-        let doc = backend.document_map.get(uri)?;
-        text::position_to_offset(&doc.rope, pos)?
-    };
     let analysis = backend.get_analysis(uri)?;
+    let offset = text::position_to_offset(&analysis.rope, pos)?;
 
     // Check if cursor is on a known reference from the resolved AST.
     if let Some(reference) = analysis.reference_at(offset) {
@@ -65,13 +62,12 @@ pub fn goto_definition(
         }
     }
 
-    // Fallback: match by word against local definitions (for names at definition sites).
+    // Fallback: match by word at the cursor scope (for names at definition
+    // sites, where reference_at returns None). `binding_for` resolves
+    // shadowing by picking the innermost visible binding.
     let word = text::word_at_offset(&analysis.source, offset)?;
-    let def = analysis
-        .definitions
-        .iter()
-        .flatten()
-        .find(|d| d.name == word)?;
+    let scope = analysis.scope_at(offset);
+    let def = analysis.binding_for(word, scope)?;
     let range = text::span_to_range(&analysis.rope, def.name_span);
 
     Some(GotoDefinitionResponse::Scalar(Location {
@@ -139,26 +135,9 @@ fn goto_imported_member(
     path: &[String],
     member: &str,
 ) -> Option<GotoDefinitionResponse> {
-    let module_info = resolve_import_chain(analysis, path)?;
+    let module_info = analysis.resolve_import_chain(path)?;
     let def = module_info.definitions.iter().find(|d| d.name == member)?;
     let uri = Url::from_file_path(&module_info.path).ok()?;
     let range = text::span_to_range(&module_info.rope, def.name_span);
     Some(GotoDefinitionResponse::Scalar(Location { uri, range }))
-}
-
-/// Walk an import path chain to find the target module info.
-/// For `a::b::c`, path is `["a", "b"]` - looks up `a` in the analysis,
-/// then `b` in `a`'s sub-imports.
-fn resolve_import_chain<'a>(
-    analysis: &'a Analysis,
-    path: &[String],
-) -> Option<&'a crate::document::ExternalModuleInfo> {
-    // First segment is a top-level variable (import or inherit binding),
-    // remaining segments walk through nested sub-imports.
-    let first = path.first()?;
-    let mut module_info = analysis.get_module(first.as_str())?;
-    for segment in &path[1..] {
-        module_info = module_info.get_submodule(segment)?;
-    }
-    Some(module_info)
 }

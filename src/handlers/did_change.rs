@@ -3,10 +3,9 @@ use std::sync::Arc;
 use tower_lsp::lsp_types::DidChangeTextDocumentParams;
 
 use crate::diagnostics;
-use crate::server::Backend;
+use crate::server::{Backend, cancel_pending_diagnostics};
 
-const DEBOUNCE_MS: u64 = 200;
-
+#[allow(clippy::unused_async, reason = "required by LanguageServer trait")]
 pub async fn did_change(backend: &Backend, params: DidChangeTextDocumentParams) {
     let uri = params.text_document.uri;
     let version = params.text_document.version;
@@ -17,47 +16,41 @@ pub async fn did_change(backend: &Backend, params: DidChangeTextDocumentParams) 
     };
     let text = change.text;
 
-    // Update the document text. Don't clear the cached analysis here -
-    // get_analysis will recompute it and keep the last good result if
-    // the new text doesn't parse (e.g. mid-keystroke syntax errors).
     if let Some(mut doc) = backend.document_map.get_mut(&uri) {
         doc.text.clone_from(&text);
         doc.rope = ropey::Rope::from_str(&text);
         doc.version = version;
     }
 
-    // Kill any running generate-check subprocess - the input has changed.
-    diagnostics::kill_generate_child(&backend.generate_child, None).await;
+    // Kill any in-flight generate-check from a prior save/open of THIS file -
+    // it's running on stale text now. Other files' generate-checks are left alone.
+    diagnostics::kill_generate_child(&backend.generate_child, &uri);
 
-    // Record this version for debounce staleness checks.
-    backend.debounce_version.insert(uri.clone(), version);
+    // Cancel any in-flight publish task; this one supersedes it.
+    cancel_pending_diagnostics(&backend.publish_handle, &uri);
 
-    // Spawn a debounced diagnostic task.
     let client = backend.client.clone();
     let document_map = Arc::clone(&backend.document_map);
-    let debounce_version = Arc::clone(&backend.debounce_version);
     let generate_child = Arc::clone(&backend.generate_child);
-    let generate_enabled = backend.config.read().await.diagnostics.generate_diagnostics;
     let uri_clone = uri.clone();
 
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(DEBOUNCE_MS)).await;
-
-        // Check if a newer version has been dispatched since we started waiting.
-        let current = debounce_version.get(&uri_clone).map_or(0, |v| *v);
-        if current != version {
-            return; // Stale, a newer change is pending.
-        }
-
+    // Typing path: DSL diagnostics only, off the LSP request task so a slow
+    // publish doesn't head-of-line-block subsequent requests. Generate-check
+    // is reserved for save/open since it can take many seconds. The handle
+    // is tracked so a later did_change/did_save/did_open can cancel any
+    // still-in-flight publish and supersede it.
+    let handle = tokio::spawn(async move {
         diagnostics::run_and_publish(
             &client,
             &document_map,
             &generate_child,
-            generate_enabled,
+            false,
             uri_clone,
             text,
             version,
         )
         .await;
     });
+
+    backend.publish_handle.insert(uri, handle);
 }

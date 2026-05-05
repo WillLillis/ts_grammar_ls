@@ -10,14 +10,8 @@ pub fn references(backend: &Backend, params: &ReferenceParams) -> Option<Vec<Loc
     let pos = params.text_document_position.position;
     let include_declaration = params.context.include_declaration;
 
-    // Use the current document's rope for position-to-offset (the client
-    // sends positions in the current buffer), but the analysis's source
-    // for text operations (spans match the analyzed text).
-    let offset = {
-        let doc = backend.document_map.get(uri)?;
-        text::position_to_offset(&doc.rope, pos)?
-    };
     let analysis = backend.get_analysis(uri)?;
+    let offset = text::position_to_offset(&analysis.rope, pos)?;
     let word = text::word_at_offset(&analysis.source, offset)?.to_owned();
 
     match analysis.cursor_context(offset, &analysis.source) {
@@ -26,14 +20,22 @@ pub fn references(backend: &Backend, params: &ReferenceParams) -> Option<Vec<Loc
         CursorContext::BaseRuleAccess => {
             base_rule_references(&analysis, uri, &analysis.rope, &word, include_declaration)
         }
-        CursorContext::ImportModuleAccess { scope } => import_member_references(
-            &analysis,
-            uri,
-            &analysis.rope,
-            &word,
-            scope,
-            include_declaration,
-        ),
+        CursorContext::ImportModuleAccess { .. } => {
+            // Recover the cursor's qualified path so we can disambiguate
+            // between e.g. `a::foo` and `b::foo`.
+            let cursor_ref = analysis.reference_at(offset)?;
+            let RefKind::ImportedMember { path, member } = &cursor_ref.kind else {
+                return None;
+            };
+            import_member_references(
+                &analysis,
+                uri,
+                &analysis.rope,
+                path,
+                member,
+                include_declaration,
+            )
+        }
         CursorContext::Identifier { scope } => local_references(
             &analysis,
             uri,
@@ -136,36 +138,39 @@ fn local_references(
     (!locations.is_empty()).then_some(locations)
 }
 
-/// References for a member accessed through an imported module (`mod::fn_name`).
+/// References for a member accessed through an imported module chain
+/// (`a::b::member`). Filters by full qualified path so `a::foo` and `b::foo`
+/// don't collide.
 fn import_member_references(
     analysis: &crate::document::Analysis,
     uri: &Url,
     rope: &ropey::Rope,
-    word: &str,
-    _cursor_scope: Option<tree_sitter_generate::nativedsl::ast::Span>,
+    path: &[String],
+    member: &str,
     include_declaration: bool,
 ) -> Option<Vec<Location>> {
     let mut locations = Vec::new();
 
-    if include_declaration {
-        // Find the import module that contains this member and include the
-        // declaration from the imported file.
-        for (_, module_info) in &analysis.import_modules {
-            if let Some(def) = module_info.definitions.iter().find(|d| d.name == word)
-                && let Ok(module_uri) = Url::from_file_path(&module_info.path)
-            {
-                locations.push(Location {
-                    uri: module_uri,
-                    range: text::span_to_range(&module_info.rope, def.name_span),
-                });
-                break;
-            }
-        }
+    if include_declaration
+        && let Some(module_info) = analysis.resolve_import_chain(path)
+        && let Some(def) = module_info.definitions.iter().find(|d| d.name == member)
+        && let Ok(module_uri) = Url::from_file_path(&module_info.path)
+    {
+        locations.push(Location {
+            uri: module_uri,
+            range: text::span_to_range(&module_info.rope, def.name_span),
+        });
     }
 
-    // Find all ImportedMember references with the same member name in this file.
+    // Match call/access sites by exact qualified path AND member name.
     for reference in analysis.references.iter().flatten() {
-        if matches!(&reference.kind, RefKind::ImportedMember { member, .. } if member == word) {
+        if let RefKind::ImportedMember {
+            path: ref_path,
+            member: ref_member,
+        } = &reference.kind
+            && ref_path.as_slice() == path
+            && ref_member == member
+        {
             locations.push(Location {
                 uri: uri.clone(),
                 range: text::span_to_range(rope, reference.span),

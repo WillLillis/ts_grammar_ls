@@ -76,12 +76,12 @@ fn compute_semantic_tokens(text: &str, rope: &Rope, analysis: &Analysis) -> Vec<
         let value = match def.kind {
             DefKind::Rule | DefKind::OverrideRule => (TYPE_CLASS, MOD_DECLARATION),
             DefKind::Function { .. } => (TYPE_FUNCTION, MOD_DECLARATION),
-            DefKind::Let { .. } | DefKind::Import | DefKind::Inherit => {
-                (TYPE_VARIABLE, MOD_DECLARATION)
-            }
-            DefKind::ObjectKey | DefKind::Parameter { .. } => continue,
+            DefKind::Let { .. }
+            | DefKind::Import
+            | DefKind::Inherit
+            | DefKind::Parameter { .. } => (TYPE_VARIABLE, MOD_DECLARATION),
+            DefKind::ObjectKey => continue,
         };
-        // Defs override refs (e.g. parameter declaration site).
         index.insert(def.name_span.start, value);
     }
 

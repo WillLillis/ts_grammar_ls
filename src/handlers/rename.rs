@@ -4,9 +4,7 @@ use tower_lsp::lsp_types::{
     PrepareRenameResponse, RenameParams, TextDocumentPositionParams, TextEdit, Url, WorkspaceEdit,
 };
 
-use ropey::Rope;
-
-use crate::document::{CursorContext, DefKind, DiagnosticCache, Document, ExternalModuleInfo, RefKind};
+use crate::document::{CursorContext, DefKind, ExternalModuleInfo, RefKind};
 use crate::server::Backend;
 use crate::text;
 
@@ -19,22 +17,19 @@ pub fn prepare_rename(
     let uri = &params.text_document.uri;
     let pos = params.position;
 
-    let offset = {
-        let doc = backend.document_map.get(uri)?;
-        text::position_to_offset(&doc.rope, pos)?
-    };
     let analysis = backend.get_analysis(uri)?;
+    let offset = text::position_to_offset(&analysis.rope, pos)?;
     let word = text::word_at_offset(&analysis.source, offset)?;
 
     match analysis.cursor_context(offset, &analysis.source) {
-        CursorContext::GrammarConfigField => return None,
+        CursorContext::GrammarConfigField => None,
         CursorContext::BaseRuleAccess => {
             // Cursor is on the member part of `base::rule_name`.
             // Find the definition in the base module.
             let base = analysis.base_module.as_ref()?;
             let def = base.definitions.iter().find(|d| d.name == word)?;
             let range = text::span_to_range(&base.rope, def.name_span);
-            return Some(PrepareRenameResponse::Range(range));
+            Some(PrepareRenameResponse::Range(range))
         }
         CursorContext::ImportModuleAccess { .. } => {
             // Cursor is on the member part of `mod::member`.
@@ -46,30 +41,25 @@ pub fn prepare_rename(
             let module = analysis.get_module(qualifier)?;
             let def = module.definitions.iter().find(|d| d.name == word)?;
             let range = text::span_to_range(&module.rope, def.name_span);
-            return Some(PrepareRenameResponse::Range(range));
+            Some(PrepareRenameResponse::Range(range))
         }
-        CursorContext::Identifier { .. } => {}
+        CursorContext::Identifier { scope } => {
+            // Resolve the cursor word to its binding using lexical scoping
+            // (innermost match wins under shadowing).
+            let def = analysis.binding_for(word, scope)?;
+            // Only rename user-defined names, not builtins or object keys.
+            match def.kind {
+                DefKind::Rule
+                | DefKind::OverrideRule
+                | DefKind::Function { .. }
+                | DefKind::Let { .. }
+                | DefKind::Parameter { .. } => {}
+                DefKind::Import | DefKind::Inherit | DefKind::ObjectKey => return None,
+            }
+            let range = text::span_to_range(&analysis.rope, def.name_span);
+            Some(PrepareRenameResponse::Range(range))
+        }
     }
-
-    // Check if the word matches a definition we can rename.
-    let def = analysis
-        .definitions
-        .as_ref()?
-        .iter()
-        .find(|d| d.name == word)?;
-
-    // Only rename user-defined names, not builtins or object keys.
-    match def.kind {
-        DefKind::Rule
-        | DefKind::OverrideRule
-        | DefKind::Function { .. }
-        | DefKind::Let { .. }
-        | DefKind::Parameter { .. } => {}
-        DefKind::Import | DefKind::Inherit | DefKind::ObjectKey => return None,
-    }
-
-    let range = text::span_to_range(&analysis.rope, def.name_span);
-    Some(PrepareRenameResponse::Range(range))
 }
 
 /// Rename a symbol and all its references, potentially across files.
@@ -84,26 +74,21 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
         return None;
     }
 
-    let offset = {
-        let doc = backend.document_map.get(uri)?;
-        text::position_to_offset(&doc.rope, pos)?
-    };
     let analysis = backend.get_analysis(uri)?;
+    let offset = text::position_to_offset(&analysis.rope, pos)?;
     let word = text::word_at_offset(&analysis.source, offset)?;
 
     match analysis.cursor_context(offset, &analysis.source) {
         CursorContext::BaseRuleAccess => {
             let base = analysis.base_module.as_ref()?;
-            let (edit, new_source) = rename_cross_file(
+            rename_cross_file(
                 uri,
                 &analysis,
                 base,
                 word,
                 new_name,
                 |r| matches!(&r.kind, RefKind::BaseRule(name) if name == word),
-            )?;
-            seed_external_document(backend, &base.path, new_source);
-            Some(edit)
+            )
         }
         CursorContext::ImportModuleAccess { .. } => {
             let qualifier = text::qualified_access_module(
@@ -112,44 +97,25 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
                 offset,
             )?;
             let module = analysis.get_module(qualifier)?;
-            let (edit, new_source) = rename_cross_file(
+            rename_cross_file(
                 uri,
                 &analysis,
                 module,
                 word,
                 new_name,
                 |r| matches!(&r.kind, RefKind::ImportedMember { member, .. } if member == word),
-            )?;
-            seed_external_document(backend, &module.path, new_source);
-            Some(edit)
+            )
         }
         CursorContext::Identifier { scope } => rename_local(uri, &analysis, word, new_name, scope),
         CursorContext::GrammarConfigField => None,
     }
 }
 
-/// Insert the post-rename content of an external file into the document_map.
-/// The analysis pipeline prefers document_map content over disk, so subsequent
-/// `get_analysis` calls will pick up the renamed symbols immediately.
-fn seed_external_document(backend: &Backend, path: &std::path::Path, content: String) {
-    if let Ok(uri) = Url::from_file_path(path) {
-        backend.document_map.insert(
-            uri,
-            Document {
-                rope: Rope::from_str(&content),
-                text: content,
-                version: 0,
-                diagnostics: DiagnosticCache::default(),
-                analysis: None,
-            },
-        );
-    }
-}
-
 /// Rename a symbol defined in an external module (base or imported).
-/// Edits the definition + references in the external file, and all matching
-/// cross-module references in the current file.
-/// Returns (WorkspaceEdit, new external source text).
+/// Produces edits for the definition + all references in the external file,
+/// plus all matching cross-module references in the current file. The client
+/// applies these via `WorkspaceEdit`; subsequent `get_analysis` calls re-read
+/// the (now-updated) external file from disk or document_map.
 fn rename_cross_file(
     current_uri: &Url,
     analysis: &crate::document::Analysis,
@@ -157,21 +123,16 @@ fn rename_cross_file(
     word: &str,
     new_name: &str,
     current_file_ref_filter: impl Fn(&crate::document::Reference) -> bool,
-) -> Option<(WorkspaceEdit, String)> {
+) -> Option<WorkspaceEdit> {
     let external_uri = Url::from_file_path(&module.path).ok()?;
 
-    // Collect edits in the external file: definition + all references.
-    // Track both LSP TextEdits (for the WorkspaceEdit) and byte offsets
-    // (to compute the new source text for the document_map).
     let mut external_edits = Vec::new();
-    let mut byte_edits: Vec<(usize, usize)> = Vec::new();
     for def in &module.definitions {
         if def.name == word {
             external_edits.push(TextEdit {
                 range: text::span_to_range(&module.rope, def.name_span),
                 new_text: new_name.into(),
             });
-            byte_edits.push((def.name_span.start as usize, def.name_span.end as usize));
         }
     }
     for reference in &module.references {
@@ -184,11 +145,9 @@ fn rename_cross_file(
                 range: text::span_to_range(&module.rope, reference.span),
                 new_text: new_name.into(),
             });
-            byte_edits.push((reference.span.start as usize, reference.span.end as usize));
         }
     }
 
-    // Collect edits in the current file: cross-module references.
     let mut current_edits = Vec::new();
     for reference in analysis.references.iter().flatten() {
         if current_file_ref_filter(reference) {
@@ -203,13 +162,6 @@ fn rename_cross_file(
         return None;
     }
 
-    // Compute the new external source by applying byte edits back-to-front.
-    let mut new_source = module.rope.to_string();
-    byte_edits.sort_by(|a, b| b.0.cmp(&a.0));
-    for (start, end) in &byte_edits {
-        new_source.replace_range(*start..*end, new_name);
-    }
-
     let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
     if !external_edits.is_empty() {
         changes.insert(external_uri, external_edits);
@@ -217,28 +169,36 @@ fn rename_cross_file(
     if !current_edits.is_empty() {
         changes.insert(current_uri.clone(), current_edits);
     }
-    Some((
-        WorkspaceEdit {
-            changes: Some(changes),
-            ..Default::default()
-        },
-        new_source,
-    ))
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+        ..Default::default()
+    })
 }
 
 /// Rename a locally-defined symbol within the current file.
+///
+/// Resolves the cursor name to its binding using lexical scoping, then for
+/// each occurrence (definition or reference) verifies it binds to the same
+/// target before including it. This correctly handles shadowing: only the
+/// occurrences that resolve to the clicked binding are renamed.
 fn rename_local(
     uri: &Url,
     analysis: &crate::document::Analysis,
     word: &str,
     new_name: &str,
-    scope: Option<tree_sitter_generate::nativedsl::ast::Span>,
+    cursor_scope: Option<tree_sitter_generate::nativedsl::ast::Span>,
 ) -> Option<WorkspaceEdit> {
+    let target = analysis.binding_for(word, cursor_scope)?;
+    let target_id = target.name_span;
+
     let mut edits = Vec::new();
 
-    // Rename the definition site(s).
+    // Definition sites: a same-named def is the same binding iff it shares
+    // the target's scope. (Two top-level defs with the same name would be a
+    // resolver error; two scoped defs with the same scope span are the same
+    // binding.)
     for def in analysis.definitions.iter().flatten() {
-        if def.name == word && def.kind.visible_from(scope) {
+        if def.name == word && def.kind.scope() == target.kind.scope() {
             edits.push(TextEdit {
                 range: text::span_to_range(&analysis.rope, def.name_span),
                 new_text: new_name.into(),
@@ -246,16 +206,31 @@ fn rename_local(
         }
     }
 
-    // Rename all reference sites.
+    // Reference sites: re-resolve each candidate at its own enclosing scope
+    // and include only if it binds to the target.
     for reference in analysis.references.iter().flatten() {
-        // Skip cross-module references.
         if matches!(
             reference.kind,
             RefKind::BaseRule(_) | RefKind::ImportedMember { .. }
         ) {
             continue;
         }
-        if reference.matches_word(word, &analysis.source, scope) {
+        let ref_name = match &reference.kind {
+            RefKind::Rule(n) | RefKind::Variable(n) => n.as_str(),
+            RefKind::ObjectField { field, .. } => field.as_str(),
+            RefKind::Builtin => {
+                &analysis.source[reference.span.start as usize..reference.span.end as usize]
+            }
+            RefKind::InheritPath | RefKind::ImportPath => continue,
+            RefKind::BaseRule(_) | RefKind::ImportedMember { .. } => unreachable!(),
+        };
+        if ref_name != word {
+            continue;
+        }
+        if analysis
+            .binding_for(word, reference.scope)
+            .is_some_and(|d| d.name_span == target_id)
+        {
             edits.push(TextEdit {
                 range: text::span_to_range(&analysis.rope, reference.span),
                 new_text: new_name.into(),
@@ -275,12 +250,18 @@ fn rename_local(
     })
 }
 
-/// Check if a string is a valid DSL identifier (alphanumeric + underscores,
-/// not starting with a digit).
+/// Check that `name` is a valid DSL identifier: it must lex as exactly one
+/// `Ident` token (with EOF following), which rules out empty strings, leading
+/// digits, whitespace, punctuation, and DSL keywords like `rule`/`let`/`macro`.
 fn is_valid_identifier(name: &str) -> bool {
-    !name.is_empty()
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        && !name.as_bytes()[0].is_ascii_digit()
+    use tree_sitter_generate::nativedsl::lexer::{Lexer, TokenKind};
+    let Ok(tokens) = Lexer::new(name).tokenize() else {
+        return false;
+    };
+    matches!(
+        tokens.as_slice(),
+        [t, eof] if t.kind == TokenKind::Ident && eof.kind == TokenKind::Eof
+    )
 }
 
 #[cfg(test)]

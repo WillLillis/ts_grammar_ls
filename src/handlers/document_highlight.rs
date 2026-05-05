@@ -12,11 +12,8 @@ pub fn document_highlight(
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
 
-    let offset = {
-        let doc = backend.document_map.get(uri)?;
-        text::position_to_offset(&doc.rope, pos)?
-    };
     let analysis = backend.get_analysis(uri)?;
+    let offset = text::position_to_offset(&analysis.rope, pos)?;
     let word = text::word_at_offset(&analysis.source, offset)?.to_owned();
 
     match analysis.cursor_context(offset, &analysis.source) {

@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use ropey::Rope;
-use tokio::sync::Mutex;
 
 use tower_lsp::{
     Client,
@@ -76,11 +75,18 @@ fn run_dsl_pipeline(text: &str, rope: &Rope, grammar_path: &Path) -> Vec<Diagnos
 // Publishing
 // ---------------------------------------------------------------------------
 
+/// Run the cheap native-DSL diagnostic pipeline and publish results.
+///
+/// Optionally fires off the (potentially long-running) generate-check
+/// subprocess after publishing, gated on `include_generate_check`. Typing
+/// (`did_change`) passes `false` to avoid burning CPU on a generate run that
+/// will be killed by the next keystroke; save/open pass the user-configured
+/// flag so a real check happens at points where the file is "settled".
 pub async fn run_and_publish(
     client: &Client,
     document_map: &Arc<DashMap<Url, Document>>,
     generate_child: &Arc<GenerateChildSlot>,
-    generate_enabled: bool,
+    include_generate_check: bool,
     uri: Url,
     text: String,
     version: i32,
@@ -103,7 +109,7 @@ pub async fn run_and_publish(
         .publish_diagnostics(uri.clone(), all, Some(version))
         .await;
 
-    if dsl_ok && generate_enabled {
+    if dsl_ok && include_generate_check {
         spawn_generate_check(
             client.clone(),
             Arc::clone(document_map),
@@ -120,21 +126,13 @@ pub async fn run_and_publish(
 // Generate-check subprocess
 // ---------------------------------------------------------------------------
 
-/// Handle to the currently in-flight generate-check subprocess.
-pub type GenerateChildSlot = Mutex<Option<(Url, tokio_util::sync::CancellationToken)>>;
+/// In-flight generate-check subprocesses, keyed by document URI so concurrent
+/// saves of different files don't cancel each other.
+pub type GenerateChildSlot = DashMap<Url, tokio_util::sync::CancellationToken>;
 
-/// Cancel the running generate-check subprocess.
-///
-/// If `only_for_uri` is `Some`, only cancels if the current subprocess was
-/// spawned for that URI.
-pub async fn kill_generate_child(generate_child: &GenerateChildSlot, only_for_uri: Option<&Url>) {
-    let mut guard = generate_child.lock().await;
-    let should_cancel = match (only_for_uri, guard.as_ref()) {
-        (Some(uri), Some((u, _))) => u == uri,
-        (None, Some(_)) => true,
-        _ => false,
-    };
-    if should_cancel && let Some((_, token)) = guard.take() {
+/// Cancel the running generate-check subprocess for `uri` if any.
+pub fn kill_generate_child(generate_child: &GenerateChildSlot, uri: &Url) {
+    if let Some((_, token)) = generate_child.remove(uri) {
         token.cancel();
     }
 }
@@ -155,8 +153,9 @@ fn spawn_generate_check(
             return;
         };
 
-        // Kill any previous generate-check subprocess.
-        kill_generate_child(&generate_child, None).await;
+        // Kill any previous generate-check for this URI; concurrent saves of
+        // other files run in parallel.
+        kill_generate_child(&generate_child, &uri);
 
         // Create a progress token.
         let token = NumberOrString::String("generate-check".into());
@@ -225,7 +224,7 @@ fn spawn_generate_check(
 
         // Register a cancellation token so external code can signal us to stop.
         let cancel = tokio_util::sync::CancellationToken::new();
-        *generate_child.lock().await = Some((uri.clone(), cancel.clone()));
+        generate_child.insert(uri.clone(), cancel.clone());
 
         // Wait for the child to finish or for cancellation, whichever comes first.
         // If cancelled, `child` is dropped - `kill_on_drop(true)` above ensures
@@ -293,8 +292,13 @@ fn spawn_generate_check(
             doc.diagnostics.all()
         });
         if let Some(all) = all {
-            client.publish_diagnostics(uri, all, Some(version)).await;
+            client
+                .publish_diagnostics(uri.clone(), all, Some(version))
+                .await;
         }
+        // Subprocess finished naturally; drop our slot entry so the map
+        // doesn't accumulate stale URIs across many saves.
+        generate_child.remove(&uri);
     });
 }
 

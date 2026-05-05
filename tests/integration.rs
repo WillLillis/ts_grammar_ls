@@ -33,7 +33,7 @@ async fn init(documents: &[(Url, &str)]) -> LspService<Backend> {
     let (mut service, socket) = LspService::build(|client| Backend {
         client,
         document_map: Arc::new(dashmap::DashMap::new()),
-        debounce_version: Arc::new(dashmap::DashMap::new()),
+        publish_handle: Arc::new(dashmap::DashMap::new()),
         generate_child: Arc::default(),
         config: Arc::new(config.into()),
     })
@@ -570,6 +570,57 @@ async fn diagnostics_type_error() {
 // ---------------------------------------------------------------------------
 // Semantic token tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn semantic_tokens_includes_parameter_declaration() {
+    // Parameter declaration sites must be emitted as VARIABLE+DECLARATION,
+    // matching how parameter uses inside the body are emitted (just as
+    // VARIABLE without DECLARATION). Asserts the full decoded token list.
+    let grammar = "grammar { language: \"test\" }\nmacro foo(x: rule_t) rule_t { x }\n";
+    let mut service = init(&[(test_uri(), grammar)]).await;
+
+    let result: Option<SemanticTokensResult> = lsp_request::<SemanticTokensFullRequest>(
+        &mut service,
+        SemanticTokensParams {
+            text_document: TextDocumentIdentifier { uri: test_uri() },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        },
+    )
+    .await;
+
+    let SemanticTokensResult::Tokens(tokens) = result.unwrap() else {
+        panic!("expected full tokens");
+    };
+
+    // Decode delta-encoded tokens to (line, col, length, type, mod).
+    let mut line = 0u32;
+    let mut col = 0u32;
+    let decoded: Vec<(u32, u32, u32, u32, u32)> = tokens
+        .data
+        .iter()
+        .map(|t| {
+            line += t.delta_line;
+            if t.delta_line > 0 {
+                col = 0;
+            }
+            col += t.delta_start;
+            (line, col, t.length, t.token_type, t.token_modifiers_bitset)
+        })
+        .collect();
+
+    // Legend: 0=FUNCTION, 1=VARIABLE, 2=TYPE, 3=CLASS. Modifier bit 0 = DECLARATION.
+    assert_eq!(
+        decoded,
+        vec![
+            (1, 6, 3, 0, 1),  // `foo` (function decl)
+            (1, 10, 1, 1, 1), // `x` parameter decl
+            (1, 13, 6, 2, 0), // `rule_t` param type
+            (1, 21, 6, 2, 0), // `rule_t` return type
+            (1, 30, 1, 1, 0), // `x` parameter use
+        ],
+    );
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn semantic_tokens_classifies_identifiers() {
@@ -1632,7 +1683,10 @@ async fn goto_def_base_qualified_call() {
     let GotoDefinitionResponse::Scalar(loc) = resp else {
         panic!("expected scalar location");
     };
-    assert_eq!(loc.uri, base_uri, "base::wrap() should jump to base grammar");
+    assert_eq!(
+        loc.uri, base_uri,
+        "base::wrap() should jump to base grammar"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1655,7 +1709,11 @@ async fn references_base_qualified_call() {
     let base_locations: Vec<_> = locations.iter().filter(|l| l.uri == base_uri).collect();
     let derived_locations: Vec<_> = locations.iter().filter(|l| l.uri == derived_uri).collect();
 
-    assert_eq!(base_locations.len(), 2, "base: definition + usage in program");
+    assert_eq!(
+        base_locations.len(),
+        2,
+        "base: definition + usage in program"
+    );
     assert_eq!(derived_locations.len(), 1, "derived: base::wrap reference");
 }
 
@@ -2933,6 +2991,49 @@ rule program {{ h::helper_fn("x") }}
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn goto_def_through_nested_sub_import() {
+    // grammar -> imports h (helpers) -> imports utils.
+    // Cursor on `utils_fn` in `h::utils::utils_fn(...)` must walk the chain
+    // through `h`'s sub-import `utils` and land on utils.tsg.
+    let dir = tempfile::tempdir().unwrap();
+
+    let utils_text = "macro utils_fn(x: rule_t) rule_t { x }\n";
+    let utils_path = dir.path().join("utils.tsg");
+    std::fs::write(&utils_path, utils_text).unwrap();
+
+    let helpers_text = format!(
+        "let utils = import(\"{}\")\nmacro helper_fn(x: rule_t) rule_t {{ x }}\n",
+        utils_path.display()
+    );
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, &helpers_text).unwrap();
+
+    let grammar_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"test\" }}\nrule program {{ h::utils::utils_fn(\"x\") }}\n",
+        helpers_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &grammar_text).unwrap();
+
+    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
+    let utils_uri = Url::from_file_path(&utils_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &grammar_text)]).await;
+
+    let offset = grammar_text.find("h::utils::utils_fn").unwrap() + "h::utils::".len();
+    let rope = ropey::Rope::from_str(&grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    assert_eq!(
+        goto_def_at(&mut service, grammar_uri, pos).await,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: utils_uri,
+            range: Range::new(Position::new(0, 6), Position::new(0, 14)),
+        }))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn import_cycle_does_not_hang() {
     // Two files that import each other. The LSP should not hang or crash.
     let dir = tempfile::tempdir().unwrap();
@@ -3019,6 +3120,70 @@ async fn references_imported_member() {
             Location {
                 uri: helper_uri,
                 range: Range::new(Position::new(1, 6), Position::new(1, 14)),
+            },
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn references_imported_member_disambiguates_by_qualifier() {
+    // Two imports both define `foo`. References on `a::foo` must include only
+    // a's foo definition + a-qualified call sites - never b's.
+    let dir = tempfile::tempdir().unwrap();
+
+    let a_text = "macro foo(x: rule_t) rule_t { x }\n";
+    let a_path = dir.path().join("a.tsg");
+    std::fs::write(&a_path, a_text).unwrap();
+
+    let b_text = "macro foo(x: rule_t) rule_t { x }\n";
+    let b_path = dir.path().join("b.tsg");
+    std::fs::write(&b_path, b_text).unwrap();
+
+    let grammar_text = format!(
+        "let a = import(\"{}\")\nlet b = import(\"{}\")\ngrammar {{ language: \"test\" }}\nrule program {{ seq(a::foo(\"x\"), b::foo(\"y\")) }}\n",
+        a_path.display(),
+        b_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &grammar_text).unwrap();
+
+    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
+    let a_uri = Url::from_file_path(&a_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &grammar_text)]).await;
+
+    // Cursor on `foo` in `a::foo("x")`.
+    let offset = grammar_text.find("a::foo").unwrap() + "a::".len();
+    let rope = ropey::Rope::from_str(&grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    let mut result = references_at(&mut service, grammar_uri.clone(), pos, true)
+        .await
+        .expect("references should succeed");
+    result.sort_by(|x, y| {
+        x.uri
+            .as_str()
+            .cmp(y.uri.as_str())
+            .then(x.range.start.line.cmp(&y.range.start.line))
+            .then(x.range.start.character.cmp(&y.range.start.character))
+    });
+
+    // a's def site + the a::foo call site only (b::foo and b's def excluded).
+    let a_call_offset = grammar_text.find("a::foo").unwrap() + "a::".len();
+    let a_call_start = ts_grammar_ls::text::offset_to_position(&rope, a_call_offset as u32);
+    let a_call_end =
+        ts_grammar_ls::text::offset_to_position(&rope, (a_call_offset + "foo".len()) as u32);
+
+    assert_eq!(
+        result,
+        vec![
+            Location {
+                uri: a_uri,
+                range: Range::new(Position::new(0, 6), Position::new(0, 9)),
+            },
+            Location {
+                uri: grammar_uri,
+                range: Range::new(a_call_start, a_call_end),
             },
         ]
     );
@@ -3159,7 +3324,10 @@ async fn hover_grammar_config_builtin() {
     let mut service = init(&[(derived_uri.clone(), &fix.derived_text)]).await;
 
     // Cursor on "grammar_config" keyword
-    let offset = fix.derived_text.find("grammar_config(base, extras)").unwrap();
+    let offset = fix
+        .derived_text
+        .find("grammar_config(base, extras)")
+        .unwrap();
     let rope = ropey::Rope::from_str(&fix.derived_text);
     let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
 
@@ -3479,6 +3647,111 @@ rule program { foo("x") }
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn prepare_rename_under_shadowing_returns_innermost_range() {
+    // A top-level `let item` is shadowed by a macro parameter `item`.
+    // Clicking on the parameter must return the parameter's range, not the let's.
+    let grammar = r#"
+grammar { language: "test" }
+let item = "x"
+macro foo(item: rule_t) rule_t { item }
+rule program { foo("x") }
+"#;
+    let uri = test_uri();
+    let mut service = init(&[(uri.clone(), grammar)]).await;
+
+    let rope = ropey::Rope::from_str(grammar);
+    let param_offset = (grammar.find("macro foo(").unwrap() + "macro foo(".len()) as u32;
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, param_offset);
+
+    let prep = prepare_rename_at(&mut service, uri.clone(), pos)
+        .await
+        .expect("prepare_rename should succeed on parameter");
+    let range = match prep {
+        PrepareRenameResponse::Range(r) => r,
+        other => panic!("expected Range response, got {other:?}"),
+    };
+
+    let returned_start = ts_grammar_ls::text::position_to_offset(&rope, range.start).unwrap();
+    let returned_end = ts_grammar_ls::text::position_to_offset(&rope, range.end).unwrap();
+    assert_eq!(
+        (returned_start, returned_end),
+        (param_offset, param_offset + "item".len() as u32),
+        "prepare_rename should return the parameter's range, not the let's range"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn goto_def_at_parameter_decl_under_shadowing() {
+    // Top-level `let item` shadowed by macro parameter `item`. Clicking on the
+    // parameter declaration must jump to the parameter, not the let.
+    let grammar = r#"
+grammar { language: "test" }
+let item = "x"
+macro foo(item: rule_t) rule_t { item }
+"#;
+    let uri = test_uri();
+    let mut service = init(&[(uri.clone(), grammar)]).await;
+
+    let rope = ropey::Rope::from_str(grammar);
+    let param_offset = (grammar.find("macro foo(").unwrap() + "macro foo(".len()) as u32;
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, param_offset);
+
+    let resp = goto_def_at(&mut service, uri.clone(), pos)
+        .await
+        .expect("goto_def should succeed on parameter decl");
+    let GotoDefinitionResponse::Scalar(loc) = resp else {
+        panic!("expected scalar location, got {resp:?}");
+    };
+
+    let expected_start = ts_grammar_ls::text::offset_to_position(&rope, param_offset);
+    let expected_end =
+        ts_grammar_ls::text::offset_to_position(&rope, param_offset + "item".len() as u32);
+    assert_eq!(loc.uri, uri);
+    assert_eq!(
+        loc.range,
+        Range::new(expected_start, expected_end),
+        "goto_def should land on the parameter, not the let"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rename_under_shadowing_only_edits_innermost_binding() {
+    // Top-level `let item` shadowed by macro parameter `item`.
+    // Renaming the parameter must not touch the let or any references to it.
+    let grammar = r#"
+grammar { language: "test" }
+let item = "x"
+macro foo(item: rule_t) rule_t { item }
+rule program { foo(item) }
+"#;
+    let uri = test_uri();
+    let mut service = init(&[(uri.clone(), grammar)]).await;
+
+    let rope = ropey::Rope::from_str(grammar);
+    let param_offset = (grammar.find("macro foo(").unwrap() + "macro foo(".len()) as u32;
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, param_offset);
+
+    let edit = rename_at(&mut service, uri.clone(), pos, "x")
+        .await
+        .expect("rename should succeed on parameter");
+    let edits = &edit.changes.unwrap()[&uri];
+
+    // Exactly two edits: parameter declaration + parameter use inside macro body.
+    // The top-level `let item` and its use in `rule program` must be untouched.
+    assert_eq!(edits.len(), 2, "expected 2 edits, got: {edits:#?}");
+
+    let macro_start = grammar.find("macro foo").unwrap() as u32;
+    let macro_end = grammar.find("rule program").unwrap() as u32;
+    for e in edits {
+        let byte = ts_grammar_ls::text::position_to_offset(&rope, e.range.start).unwrap();
+        assert!(
+            byte >= macro_start && byte < macro_end,
+            "edit at byte {byte} is outside the macro span [{macro_start}, {macro_end})"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn rename_rejects_invalid_name() {
     let grammar = r#"
 grammar { language: "test" }
@@ -3501,6 +3774,45 @@ rule program { "x" }
         rename_at(&mut service, uri.clone(), pos, "has space").await,
         None
     );
+
+    // DSL keywords would produce a syntactically broken file when substituted in.
+    // Includes block keywords, builtin combinators, and `grammar_config`.
+    for kw in [
+        "grammar",
+        "rule",
+        "let",
+        "macro",
+        "for",
+        "in",
+        "inherit",
+        "import",
+        "override",
+        "append",
+        "grammar_config",
+        "reserved",
+        "seq",
+        "choice",
+        "repeat",
+        "repeat1",
+        "optional",
+        "blank",
+        "field",
+        "alias",
+        "token",
+        "token_immediate",
+        "concat",
+        "regexp",
+        "prec",
+        "prec_left",
+        "prec_right",
+        "prec_dynamic",
+    ] {
+        assert_eq!(
+            rename_at(&mut service, uri.clone(), pos, kw).await,
+            None,
+            "rename to keyword `{kw}` should be rejected"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3600,4 +3912,94 @@ async fn rename_imported_function_from_importing_file() {
     let grammar_edits = &changes[&grammar_uri];
     assert_eq!(grammar_edits.len(), 1);
     assert_eq!(grammar_edits[0].new_text, "separated");
+}
+
+// ---------------------------------------------------------------------------
+// Benchmarks (run with `cargo test --release -- --ignored --nocapture bench_`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "benchmark"]
+async fn bench_hover_cpp_end_to_end() {
+    let path = "/home/lillis/projects/grammars/tree-sitter-cpp/grammar.tsg";
+    let Ok(text) = std::fs::read_to_string(path) else {
+        eprintln!("skipping: cpp grammar not found at {path}");
+        return;
+    };
+    let uri = Url::from_file_path(path).unwrap();
+    let mut service = init(&[(uri.clone(), &text)]).await;
+
+    // Cursor on the first occurrence of an identifier.
+    let rope = ropey::Rope::from_str(&text);
+    let some_offset = text.find("rule").unwrap() as u32;
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, some_offset);
+
+    // Warm up.
+    for _ in 0..20 {
+        let _ = hover_at(&mut service, uri.clone(), pos).await;
+    }
+
+    let n = 200u32;
+
+    // Cache hit: same version, repeated hovers.
+    let start = std::time::Instant::now();
+    for _ in 0..n {
+        std::hint::black_box(hover_at(&mut service, uri.clone(), pos).await);
+    }
+    let hit_time = start.elapsed() / n;
+
+    // did_change only: measures keystroke-handling overhead alone.
+    let start = std::time::Instant::now();
+    for i in 0..n {
+        lsp_notify::<DidChangeTextDocument>(
+            &mut service,
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 1000 + i as i32,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.clone(),
+                }],
+            },
+        )
+        .await;
+    }
+    let change_only_time = start.elapsed() / n;
+
+    // did_change + hover: each hover forces a fresh analyze (cache miss).
+    let start = std::time::Instant::now();
+    for i in 0..n {
+        lsp_notify::<DidChangeTextDocument>(
+            &mut service,
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2000 + i as i32,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.clone(),
+                }],
+            },
+        )
+        .await;
+        std::hint::black_box(hover_at(&mut service, uri.clone(), pos).await);
+    }
+    let miss_time = start.elapsed() / n;
+
+    eprintln!(
+        "=== End-to-end LSP hover on cpp grammar ({} lines) ===",
+        text.lines().count()
+    );
+    eprintln!("Cache hit (no change):                {hit_time:>10?}");
+    eprintln!("did_change only (no hover):           {change_only_time:>10?}");
+    eprintln!("did_change + hover (full re-analyze): {miss_time:>10?}");
+    eprintln!(
+        "Implied analyze + hover handler cost: {:>10?}",
+        miss_time.saturating_sub(change_only_time)
+    );
 }

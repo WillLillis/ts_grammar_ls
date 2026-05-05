@@ -252,6 +252,37 @@ impl Analysis {
             .min_by_key(|r| priority(&r.kind))
     }
 
+    /// Resolve `name` to the definition it refers to from a given enclosing
+    /// scope, using lexical scoping. Among definitions whose name matches and
+    /// are visible from `scope`, the one with the smallest (innermost) scope
+    /// wins. Top-level definitions are visible everywhere but lose to any
+    /// in-scope binding of the same name.
+    #[must_use]
+    pub fn binding_for(&self, name: &str, scope: Option<Span>) -> Option<&Definition> {
+        self.definitions
+            .as_ref()?
+            .iter()
+            .filter(|d| d.name == name && d.kind.visible_from(scope))
+            .min_by_key(|d| match d.kind.scope() {
+                Some(s) => (0u8, s.end - s.start),
+                None => (1, 0),
+            })
+    }
+
+    /// Walk a qualified-access chain to the leaf module. For `a::b::c`, given
+    /// `path = ["a", "b"]`, returns the `ExternalModuleInfo` for `b` (a's
+    /// sub-import). The first segment must be a top-level binding (import or
+    /// inherit); subsequent segments walk through nested sub-imports.
+    #[must_use]
+    pub fn resolve_import_chain(&self, path: &[String]) -> Option<&ExternalModuleInfo> {
+        let first = path.first()?;
+        let mut module_info = self.get_module(first.as_str())?;
+        for segment in &path[1..] {
+            module_info = module_info.get_submodule(segment)?;
+        }
+        Some(module_info)
+    }
+
     /// Look up a module by its variable name. Checks both imported modules
     /// and the inherited base grammar.
     #[must_use]
@@ -356,10 +387,12 @@ pub struct Document {
     pub version: i32,
     /// Cached diagnostics, split by phase.
     pub diagnostics: DiagnosticCache,
-    /// Cached analysis result, paired with the document version it was
-    /// computed from. Recomputed lazily by handlers; kept when parse fails
-    /// so features work mid-keystroke.
-    pub analysis: Option<(i32, std::sync::Arc<Analysis>)>,
+    /// Last analysis where parse succeeded. Used as a fallback when the
+    /// current text fails to parse, so handlers (hover, completion, ...) keep
+    /// working mid-keystroke. Never consulted on the success path: every
+    /// `get_analysis` re-runs analyze and serves the fresh result if it
+    /// parsed.
+    pub last_good_analysis: Option<std::sync::Arc<Analysis>>,
 }
 
 #[cfg(test)]

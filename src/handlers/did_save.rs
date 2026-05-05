@@ -2,21 +2,19 @@ use tower_lsp::lsp_types::DidSaveTextDocumentParams;
 use tracing::info;
 
 use crate::diagnostics;
-use crate::server::Backend;
+use crate::server::{Backend, cancel_pending_diagnostics};
 
 pub async fn did_save(backend: &Backend, params: DidSaveTextDocumentParams) {
     let uri = params.text_document.uri;
     info!("did_save: {uri}");
 
-    let (text, version) = match backend.document_map.get_mut(&uri) {
-        Some(mut doc) => {
-            // Invalidate the cached analysis so the next get_analysis
-            // recomputes with fresh data from disk for external modules.
-            doc.analysis = None;
-            (doc.text.clone(), doc.version)
-        }
+    let (text, version) = match backend.document_map.get(&uri) {
+        Some(doc) => (doc.text.clone(), doc.version),
         None => return,
     };
+
+    // Supersede any pending publish task; we're publishing fresh diagnostics now.
+    cancel_pending_diagnostics(&backend.publish_handle, &uri);
 
     let generate_enabled = backend.config.read().await.diagnostics.generate_diagnostics;
     diagnostics::run_and_publish(

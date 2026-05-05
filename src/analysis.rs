@@ -6,7 +6,7 @@ use tower_lsp::lsp_types::Url;
 
 use tree_sitter_generate::nativedsl::{self, ast};
 
-use crate::document::{Analysis, DefKind, Definition, Document, RefKind, Reference};
+use crate::document::{Analysis, DefKind, Definition, RefKind, Reference};
 
 // ---------------------------------------------------------------------------
 // Analysis extraction - walk the AST to collect definitions and references
@@ -174,6 +174,10 @@ fn collect_import_names(
 
 /// Resolve the qualified access path segments from an obj node.
 /// For `a::b::c`, given the `c` node's obj (which is `a::b`), returns `["a", "b"]`.
+///
+/// The resolver may collapse a `QualifiedAccess` chain into a single
+/// `Ident(Var(...))` whose span covers the entire chain. We split on `::` to
+/// recover the segments in that case.
 fn collect_qualified_path(
     shared: &ast::SharedAst,
     ctx: &ast::ModuleContext,
@@ -184,7 +188,11 @@ fn collect_qualified_path(
     loop {
         match shared.arena.get(current) {
             ast::Node::Ident(_) => {
-                path.push(ctx.text(shared.arena.span(current)).to_owned());
+                // Walking tail-to-root, so push segments in reverse.
+                let text = ctx.text(shared.arena.span(current));
+                for part in text.rsplit("::") {
+                    path.push(part.trim().to_owned());
+                }
                 break;
             }
             ast::Node::QualifiedAccess { obj, member } => {
@@ -321,12 +329,6 @@ fn extract_references(
     references
 }
 
-/// Context passed to `analyze()` for lookup of in-memory text for open documents.
-pub struct AnalysisContext<'a> {
-    pub document_map: &'a dashmap::DashMap<Url, Document>,
-}
-
-
 /// Extract LSP analysis data from a module's resolved AST.
 ///
 /// `modules` contains all loaded modules (root + inherits + imports), produced
@@ -362,24 +364,7 @@ fn extract_analysis(
         extract_external_module(shared, modules, *idx)
     });
 
-    // Find imported modules: each `let x = import("...")` binding.
-    let mut import_modules = Vec::new();
-    for &item_id in &ctx.root_items {
-        let ast::Node::Let { name, value, .. } = shared.arena.get(item_id) else {
-            continue;
-        };
-        let ast::Node::ModuleRef {
-            import: true,
-            module: Some(idx),
-            ..
-        } = shared.arena.get(*value)
-        else {
-            continue;
-        };
-        if let Some(info) = extract_external_module(shared, modules, *idx) {
-            import_modules.push((ctx.text(*name).to_owned(), info));
-        }
-    }
+    let import_modules = collect_import_modules(shared, modules, ctx);
 
     Analysis {
         source: ctx.source.clone(),
@@ -393,7 +378,9 @@ fn extract_analysis(
     }
 }
 
-/// Extract `ExternalModuleInfo` for a module loaded into `modules`.
+/// Extract `ExternalModuleInfo` for a module loaded into `modules`. Recurses
+/// through the module's own `let x = import(...)` bindings so nested chains
+/// like `a::b::c` resolve.
 fn extract_external_module(
     shared: &ast::SharedAst,
     modules: &[nativedsl::Module],
@@ -405,15 +392,43 @@ fn extract_external_module(
     let defs = extract_definitions(shared, m_ctx, &scopes);
     let import_names = collect_import_names(shared, m_ctx);
     let refs = extract_references(shared, m_ctx, &import_names, &scopes);
+    let import_modules = collect_import_modules(shared, modules, m_ctx);
     Some(crate::document::ExternalModuleInfo {
         path: m_ctx.path.clone(),
         definitions: defs,
         references: refs,
         rope: Rope::from_str(&m_ctx.source),
-        import_modules: Vec::new(),
+        import_modules,
     })
 }
 
+/// Collect `(binding_name, ExternalModuleInfo)` for each `let x = import(...)`
+/// at the top level of `ctx`. Cycles are impossible here because the core
+/// `Loader` rejects them before we get a successful module list.
+fn collect_import_modules(
+    shared: &ast::SharedAst,
+    modules: &[nativedsl::Module],
+    ctx: &ast::ModuleContext,
+) -> Vec<(String, crate::document::ExternalModuleInfo)> {
+    let mut out = Vec::new();
+    for &item_id in &ctx.root_items {
+        let ast::Node::Let { name, value, .. } = shared.arena.get(item_id) else {
+            continue;
+        };
+        let ast::Node::ModuleRef {
+            import: true,
+            module: Some(idx),
+            ..
+        } = shared.arena.get(*value)
+        else {
+            continue;
+        };
+        if let Some(info) = extract_external_module(shared, modules, *idx) {
+            out.push((ctx.text(*name).to_owned(), info));
+        }
+    }
+    out
+}
 
 /// Scan lexer tokens for builtin combinator keywords and add them as references.
 /// Keywords inside the grammar block that are followed by `:` are config fields,
@@ -489,7 +504,7 @@ pub fn uri_to_grammar_path(uri: &Url) -> PathBuf {
 /// root module) is still available for mid-keystroke features.
 #[must_use]
 #[expect(clippy::missing_panics_doc, reason = "file always has a parent")]
-pub fn analyze(text: &str, uri: &Url, _ctx: Option<&AnalysisContext<'_>>) -> Analysis {
+pub fn analyze(text: &str, uri: &Url) -> Analysis {
     let grammar_path = uri_to_grammar_path(uri);
 
     let source = text.to_owned();
@@ -655,7 +670,7 @@ mod bench {
         // Full analyze
         let start = std::time::Instant::now();
         for _ in 0..n {
-            std::hint::black_box(analyze(&source, &uri, None));
+            std::hint::black_box(analyze(&source, &uri));
         }
         let total_time = start.elapsed() / n;
 

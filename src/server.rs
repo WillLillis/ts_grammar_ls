@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tower_lsp::{
     Client, LanguageServer, jsonrpc,
     lsp_types::{
@@ -16,7 +17,6 @@ use tower_lsp::{
     },
 };
 
-use crate::analysis::AnalysisContext;
 use crate::config::Config;
 use crate::diagnostics::GenerateChildSlot;
 use crate::document::Document;
@@ -25,9 +25,10 @@ use crate::handlers;
 pub struct Backend {
     pub client: Client,
     pub document_map: Arc<DashMap<Url, Document>>,
-    /// Tracks the latest version we've dispatched diagnostics for, so stale
-    /// results from debounced tasks can be discarded.
-    pub debounce_version: Arc<DashMap<Url, i32>>,
+    /// Pending diagnostic-publish task per document. Replaced on every
+    /// `did_change` and aborted on `did_save`/`did_open`/`did_close` so the
+    /// most recent publish always wins.
+    pub publish_handle: Arc<DashMap<Url, JoinHandle<()>>>,
     /// Handle to the currently running generate-check subprocess, if any.
     /// Killed on new edits to avoid stale work.
     pub generate_child: Arc<GenerateChildSlot>,
@@ -35,59 +36,41 @@ pub struct Backend {
     pub config: Arc<RwLock<Config>>,
 }
 
-impl Backend {
-    /// Build an `AnalysisContext` referencing this backend's cache and document map.
-    #[must_use]
-    pub fn analysis_context(&self) -> AnalysisContext<'_> {
-        AnalysisContext {
-            document_map: &self.document_map,
-        }
+/// Abort and discard any pending diagnostic-publish task for `uri`.
+pub fn cancel_pending_diagnostics(handles: &DashMap<Url, JoinHandle<()>>, uri: &Url) {
+    if let Some((_, handle)) = handles.remove(uri) {
+        handle.abort();
     }
+}
 
-    /// Get the cached analysis for a document, computing it if needed.
-    /// The result is cached on the `Document` so subsequent handler calls
-    /// within the same document version reuse it.
+impl Backend {
+    /// Run analysis for a document. Always re-runs the pipeline; the document
+    /// only retains a `last_good_analysis` fallback that's served when the
+    /// current text fails to parse (so features keep working mid-keystroke).
     #[must_use]
     pub fn get_analysis(
         &self,
         uri: &tower_lsp::lsp_types::Url,
     ) -> Option<std::sync::Arc<crate::document::Analysis>> {
-        // Fast path: cached analysis matches the current document version.
-        let (text, version, cached) = {
-            let doc = self.document_map.get(uri)?;
-            if let Some((v, analysis)) = &doc.analysis
-                && *v == doc.version
-            {
-                return Some(std::sync::Arc::clone(analysis));
+        // Snapshot the source text under the read guard, then drop it before
+        // calling analyze (which re-enters document_map for inherits/imports).
+        let text = self.document_map.get(uri)?.text.clone();
+        let fresh = crate::analysis::analyze(&text, uri);
+
+        if fresh.definitions.is_some() {
+            let arc = std::sync::Arc::new(fresh);
+            if let Some(mut doc) = self.document_map.get_mut(uri) {
+                doc.last_good_analysis = Some(std::sync::Arc::clone(&arc));
             }
-            (
-                doc.text.clone(),
-                doc.version,
-                doc.analysis.as_ref().map(|(_, a)| std::sync::Arc::clone(a)),
-            )
-        };
-
-        // Slow path: recompute. Guard is dropped before calling analyze,
-        // which accesses document_map internally for base grammar lookups.
-        let ctx = self.analysis_context();
-        let new = crate::analysis::analyze(&text, uri, Some(&ctx));
-
-        // If parse failed (definitions is None), keep the previous good
-        // analysis so features like completion still work mid-keystroke.
-        if new.definitions.is_none()
-            && let Some(old) = cached
-        {
-            return Some(old);
+            Some(arc)
+        } else {
+            // Parse failed: serve the last known-good analysis if we have one.
+            self.document_map
+                .get(uri)?
+                .last_good_analysis
+                .clone()
+                .or_else(|| Some(std::sync::Arc::new(fresh)))
         }
-
-        let analysis = std::sync::Arc::new(new);
-        // Only store if the document hasn't changed since we started.
-        if let Some(mut doc) = self.document_map.get_mut(uri)
-            && doc.version == version
-        {
-            doc.analysis = Some((version, std::sync::Arc::clone(&analysis)));
-        }
-        Some(analysis)
     }
 }
 

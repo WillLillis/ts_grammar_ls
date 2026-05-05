@@ -4,13 +4,16 @@ use tracing::info;
 
 use crate::diagnostics;
 use crate::document::{DiagnosticCache, Document};
-use crate::server::Backend;
+use crate::server::{Backend, cancel_pending_diagnostics};
 
 pub async fn did_open(backend: &Backend, params: DidOpenTextDocumentParams) {
     let uri = params.text_document.uri;
     let text = params.text_document.text;
     let version = params.text_document.version;
     info!("did_open: {uri}");
+
+    // If this URI already had a pending debounced publish, supersede it.
+    cancel_pending_diagnostics(&backend.publish_handle, &uri);
 
     backend.document_map.insert(
         uri.clone(),
@@ -19,7 +22,7 @@ pub async fn did_open(backend: &Backend, params: DidOpenTextDocumentParams) {
             text: text.clone(),
             version,
             diagnostics: DiagnosticCache::default(),
-            analysis: None,
+            last_good_analysis: None,
         },
     );
 

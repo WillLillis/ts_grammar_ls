@@ -75,7 +75,7 @@ async fn main() {
     let (service, socket) = LspService::build(|client| Backend {
         client,
         document_map: Arc::new(dashmap::DashMap::new()),
-        debounce_version: Arc::new(dashmap::DashMap::new()),
+        publish_handle: Arc::new(dashmap::DashMap::new()),
         generate_child: Arc::default(),
         config: Arc::default(),
     })

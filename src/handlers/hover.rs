@@ -11,11 +11,8 @@ pub fn hover(backend: &Backend, params: &HoverParams) -> Option<Hover> {
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
 
-    let offset = {
-        let doc = backend.document_map.get(uri)?;
-        text::position_to_offset(&doc.rope, pos)?
-    };
     let analysis = backend.get_analysis(uri)?;
+    let offset = text::position_to_offset(&analysis.rope, pos)?;
     let word = text::word_at_offset(&analysis.source, offset)?.to_owned();
 
     match analysis.cursor_context(offset, &analysis.source) {
@@ -74,9 +71,8 @@ fn identifier_hover(
                 // Run the pipeline to get the type from the type environment.
                 let ty = analysis::with_type_env(text, uri, |shared, ctx, env| {
                     ctx.root_items.iter().find_map(|&item_id| {
-                        if let tree_sitter_generate::nativedsl::ast::Node::Let {
-                            name, ..
-                        } = shared.arena.get(item_id)
+                        if let tree_sitter_generate::nativedsl::ast::Node::Let { name, .. } =
+                            shared.arena.get(item_id)
                             && ctx.text(*name) == word
                         {
                             env.vars.get(&item_id).copied()
