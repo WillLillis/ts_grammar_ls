@@ -79,6 +79,7 @@ fn compute_semantic_tokens(text: &str, rope: &Rope, analysis: &Analysis) -> Vec<
             DefKind::Let { .. }
             | DefKind::Import
             | DefKind::Inherit
+            | DefKind::External
             | DefKind::Parameter { .. } => (TYPE_VARIABLE, MOD_DECLARATION),
             DefKind::ObjectKey => continue,
         };

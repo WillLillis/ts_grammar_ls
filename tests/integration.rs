@@ -4218,6 +4218,128 @@ async fn rename_includes_closed_workspace_dependents() {
 }
 
 // ---------------------------------------------------------------------------
+// `external` decls
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn goto_def_external_from_qualified_access() {
+    // Helper declares an `external _foo`. Grammar references it as `h::_foo`.
+    // Goto-def on `_foo` should land on the external decl in the helper.
+    let dir = tempfile::tempdir().unwrap();
+
+    let helpers_text = "external _foo\n";
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, helpers_text).unwrap();
+
+    let grammar_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"test\", externals: [h::_foo] }}\nrule program {{ h::_foo }}\n",
+        helpers_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &grammar_text).unwrap();
+
+    let helpers_uri = Url::from_file_path(&helpers_path).unwrap();
+    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &grammar_text)]).await;
+
+    // Cursor on `_foo` in the rule body's `h::_foo`.
+    let body_offset = grammar_text.rfind("h::_foo").unwrap() + "h::".len();
+    let rope = ropey::Rope::from_str(&grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, body_offset as u32);
+
+    assert_eq!(
+        goto_def_at(&mut service, grammar_uri, pos).await,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: helpers_uri,
+            // `_foo` after `external `, line 0 col 9.
+            range: Range::new(Position::new(0, 9), Position::new(0, 13)),
+        }))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn goto_def_external_via_inherit() {
+    // Same shape as the import test but the external is in an inherited
+    // base grammar instead of an imported helper.
+    let dir = tempfile::tempdir().unwrap();
+
+    let base_text = "external _ws\ngrammar { language: \"base\", externals: [_ws] }\nrule program { _ws }\n";
+    let base_path = dir.path().join("base.tsg");
+    std::fs::write(&base_path, base_text).unwrap();
+
+    let derived_text = format!(
+        "let base = inherit(\"{}\")\ngrammar {{ language: \"derived\", inherits: base, externals: [base::_ws] }}\noverride rule program {{ base::_ws }}\n",
+        base_path.display()
+    );
+    let derived_path = dir.path().join("derived.tsg");
+    std::fs::write(&derived_path, &derived_text).unwrap();
+
+    let base_uri = Url::from_file_path(&base_path).unwrap();
+    let derived_uri = Url::from_file_path(&derived_path).unwrap();
+
+    let mut service = init(&[(derived_uri.clone(), &derived_text)]).await;
+
+    let body_offset = derived_text.rfind("base::_ws").unwrap() + "base::".len();
+    let rope = ropey::Rope::from_str(&derived_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, body_offset as u32);
+
+    assert_eq!(
+        goto_def_at(&mut service, derived_uri, pos).await,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: base_uri,
+            range: Range::new(Position::new(0, 9), Position::new(0, 12)),
+        }))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rename_external_propagates_across_files() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let helpers_text = "external _foo\n";
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, helpers_text).unwrap();
+
+    let grammar_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"test\", externals: [h::_foo] }}\nrule program {{ h::_foo }}\n",
+        helpers_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &grammar_text).unwrap();
+
+    let helpers_uri = Url::from_file_path(&helpers_path).unwrap();
+    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &grammar_text)]).await;
+
+    let body_offset = grammar_text.rfind("h::_foo").unwrap() + "h::".len();
+    let rope = ropey::Rope::from_str(&grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, body_offset as u32);
+
+    let edit = rename_at(&mut service, grammar_uri.clone(), pos, "_bar")
+        .await
+        .expect("rename should succeed on external access");
+    let changes = edit.changes.expect("changes present");
+
+    let mut keys: Vec<&Url> = changes.keys().collect();
+    keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    assert_eq!(
+        keys,
+        vec![&grammar_uri, &helpers_uri],
+        "external rename must edit both the decl site and call sites"
+    );
+    // grammar.tsg has 2 references (externals: [h::_foo] + body), helpers.tsg has 1 (decl).
+    assert_eq!(changes[&helpers_uri].len(), 1);
+    assert_eq!(changes[&grammar_uri].len(), 2);
+    for edits in changes.values() {
+        for e in edits {
+            assert_eq!(e.new_text, "_bar");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cross-file rename tests
 // ---------------------------------------------------------------------------
 

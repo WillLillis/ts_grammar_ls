@@ -37,6 +37,10 @@ const KEYWORDS: &[(&str, &str)] = &[
     ("override", "Override an inherited rule"),
     ("let", "Bind a value"),
     ("macro", "Define a macro"),
+    (
+        "external",
+        "Forward-declare an externally-provided (typically scanner-emitted) symbol",
+    ),
     ("for", "Iterate over a list"),
     ("in", "For-loop iterable"),
     (
@@ -161,6 +165,10 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
                                 CompletionItemKind::MODULE,
                                 format!("{} {} ({name})", d.kind.label(), d.name),
                             ),
+                            DefKind::External => (
+                                CompletionItemKind::CLASS,
+                                format!("external {} ({name})", d.name),
+                            ),
                             DefKind::ObjectKey | DefKind::Parameter { .. } => return None,
                         };
                         Some(CompletionItem {
@@ -201,6 +209,7 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             }
             DefKind::Function { signature } => (CompletionItemKind::FUNCTION, signature.clone()),
             DefKind::Let { .. } => (CompletionItemKind::VARIABLE, format!("let {}", def.name)),
+            DefKind::External => (CompletionItemKind::CLASS, format!("external {}", def.name)),
             DefKind::Import | DefKind::Inherit | DefKind::ObjectKey | DefKind::Parameter { .. } => {
                 continue;
             }

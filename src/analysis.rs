@@ -81,6 +81,14 @@ fn extract_definitions(
                     }
                 }
             }
+            ast::Node::External { name } => {
+                definitions.push(Definition {
+                    name: ctx.text(*name).to_owned(),
+                    kind: DefKind::External,
+                    name_span: *name,
+                    full_span: shared.arena.span(item_id),
+                });
+            }
             _ => {}
         }
     }

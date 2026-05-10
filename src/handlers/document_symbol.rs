@@ -28,6 +28,7 @@ pub fn document_symbol(
                 DefKind::Function { .. } => SymbolKind::FUNCTION,
                 DefKind::Let { .. } => SymbolKind::VARIABLE,
                 DefKind::Import | DefKind::Inherit => SymbolKind::MODULE,
+                DefKind::External => SymbolKind::CONSTANT,
                 DefKind::ObjectKey | DefKind::Parameter { .. } => return None,
             };
             let range = text::span_to_range(&analysis.rope, def.full_span);

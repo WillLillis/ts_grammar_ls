@@ -53,7 +53,8 @@ pub fn prepare_rename(
                 | DefKind::OverrideRule
                 | DefKind::Function { .. }
                 | DefKind::Let { .. }
-                | DefKind::Parameter { .. } => {}
+                | DefKind::Parameter { .. }
+                | DefKind::External => {}
                 DefKind::Import | DefKind::Inherit | DefKind::ObjectKey => return None,
             }
             let range = text::span_to_range(&analysis.rope, def.name_span);

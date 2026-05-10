@@ -50,6 +50,10 @@ pub enum DefKind {
     Import,
     /// An inherit binding (e.g. `base` in `let base = inherit("base.tsg")`).
     Inherit,
+    /// An `external <name>` declaration: forward-declares an externally-
+    /// provided symbol (typically scanner-emitted) accessible via qualified
+    /// access from importers.
+    External,
     /// A key in an object literal (e.g. `ADD` in `{ ADD: 1 }`).
     ObjectKey,
     /// A function parameter.
@@ -68,6 +72,7 @@ impl DefKind {
             Self::Let { .. } => "let",
             Self::Import => "import",
             Self::Inherit => "inherit",
+            Self::External => "external",
             Self::ObjectKey => "field",
             Self::Parameter { .. } => "parameter",
         }
@@ -83,6 +88,7 @@ impl DefKind {
             | Self::Function { .. }
             | Self::Import
             | Self::Inherit
+            | Self::External
             | Self::ObjectKey => None,
         }
     }
