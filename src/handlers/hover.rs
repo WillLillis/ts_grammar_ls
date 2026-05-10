@@ -1,7 +1,7 @@
 use tower_lsp::lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 
 use crate::analysis;
-use crate::document::{CursorContext, DefKind, RefKind};
+use crate::document::{BindingLocation, CursorContext, DefKind, RefKind};
 use crate::hover_docs;
 use crate::server::Backend;
 use crate::text;
@@ -58,36 +58,39 @@ fn identifier_hover(
         return Some(make_hover(content));
     }
 
-    // User-defined rules, functions, let bindings.
-    if let Some(def) = analysis
-        .definitions
-        .iter()
-        .flatten()
-        .find(|d| d.name == word)
-    {
-        let content = match &def.kind {
-            DefKind::Function { signature } => format!("```\n{signature}\n```"),
-            DefKind::Let { .. } => {
-                // Run the pipeline to get the type from the type environment.
-                let ty = analysis::with_type_env(text, uri, |shared, ctx, env| {
-                    ctx.root_items.iter().find_map(|&item_id| {
-                        if let tree_sitter_generate::nativedsl::ast::Node::Let { name, .. } =
-                            shared.arena.get(item_id)
-                            && ctx.text(*name) == word
-                        {
-                            env.vars.get(&item_id).copied()
-                        } else {
-                            None
-                        }
+    // User-defined names: local bindings first, then helper-rule and external
+    // bindings reachable by bare name from imports / inherits.
+    let scope = analysis.scope_at(offset);
+    if let Some(binding) = analysis.resolve_bare_name(word, scope) {
+        let content = match binding {
+            BindingLocation::Local(def) => match &def.kind {
+                DefKind::Function { signature } => format!("```\n{signature}\n```"),
+                DefKind::Let { .. } => {
+                    // Run the pipeline to get the type from the type environment.
+                    let ty = analysis::with_type_env(text, uri, |shared, ctx, env| {
+                        ctx.root_items.iter().find_map(|&item_id| {
+                            if let tree_sitter_generate::nativedsl::ast::Node::Let { name, .. } =
+                                shared.arena.get(item_id)
+                                && ctx.text(*name) == word
+                            {
+                                env.vars.get(&item_id).copied()
+                            } else {
+                                None
+                            }
+                        })
                     })
-                })
-                .flatten();
-                ty.map_or_else(
-                    || format!("```\nlet {}\n```", def.name),
-                    |ty| format!("```\nlet {}: {ty}\n```", def.name),
-                )
-            }
-            _ => format!("```\n{} {}\n```", def.kind.label(), def.name),
+                    .flatten();
+                    ty.map_or_else(
+                        || format!("```\nlet {}\n```", def.name),
+                        |ty| format!("```\nlet {}: {ty}\n```", def.name),
+                    )
+                }
+                _ => format!("```\n{} {}\n```", def.kind.label(), def.name),
+            },
+            BindingLocation::External { def, .. } => match &def.kind {
+                DefKind::Function { signature } => format!("```\n{signature}\n```"),
+                _ => format!("```\n{} {}\n```", def.kind.label(), def.name),
+            },
         };
         return Some(make_hover(content));
     }

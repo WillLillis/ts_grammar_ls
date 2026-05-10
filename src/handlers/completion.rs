@@ -201,8 +201,11 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
 
     let mut items = Vec::new();
 
-    // User-defined rules.
-    for def in analysis.definitions.iter().flatten() {
+    // User-defined names from this file + bare-name reachable from inherits
+    // and transitive imports (helper rules / macros / externals materialize
+    // into the importer's namespace).
+    let mut seen_names = rustc_hash::FxHashSet::default();
+    let mut emit = |def: &crate::document::Definition, items: &mut Vec<CompletionItem>| {
         let (kind, detail) = match &def.kind {
             DefKind::Rule | DefKind::OverrideRule => {
                 (CompletionItemKind::CLASS, format!("rule {}", def.name))
@@ -211,15 +214,38 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             DefKind::Let { .. } => (CompletionItemKind::VARIABLE, format!("let {}", def.name)),
             DefKind::External => (CompletionItemKind::CLASS, format!("external {}", def.name)),
             DefKind::Import | DefKind::Inherit | DefKind::ObjectKey | DefKind::Parameter { .. } => {
-                continue;
+                return;
             }
         };
-        items.push(CompletionItem {
-            label: def.name.clone(),
-            kind: Some(kind),
-            detail: Some(detail),
-            ..Default::default()
-        });
+        if seen_names.insert(def.name.clone()) {
+            items.push(CompletionItem {
+                label: def.name.clone(),
+                kind: Some(kind),
+                detail: Some(detail),
+                ..Default::default()
+            });
+        }
+    };
+    for def in analysis.definitions.iter().flatten() {
+        emit(def, &mut items);
+    }
+    fn walk_module(
+        info: &crate::document::ExternalModuleInfo,
+        emit: &mut impl FnMut(&crate::document::Definition),
+    ) {
+        for def in &info.definitions {
+            emit(def);
+        }
+        for (_, sub) in &info.import_modules {
+            walk_module(sub, emit);
+        }
+    }
+    let mut emit_external = |def: &crate::document::Definition| emit(def, &mut items);
+    if let Some(base) = &analysis.base_module {
+        walk_module(base, &mut emit_external);
+    }
+    for (_, info) in &analysis.import_modules {
+        walk_module(info, &mut emit_external);
     }
 
     // Builtin combinators.

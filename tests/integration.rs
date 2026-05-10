@@ -4222,6 +4222,66 @@ async fn rename_includes_closed_workspace_dependents() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "current_thread")]
+async fn completion_offers_helper_rules_by_bare_name() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let helpers_text = "rule shared_rule { \"x\" }\n";
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, helpers_text).unwrap();
+
+    let grammar_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"test\" }}\nrule program {{ shared_rule }}\n",
+        helpers_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &grammar_text).unwrap();
+
+    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
+    let mut service = init(&[(grammar_uri.clone(), &grammar_text)]).await;
+
+    // Cursor at the start of the rule body, before any identifier.
+    let s_offset = grammar_text.find("{ shared_rule }").unwrap() + "{ ".len();
+    let rope = ropey::Rope::from_str(&grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, s_offset as u32);
+
+    let items = completions_at(&mut service, grammar_uri, pos).await;
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"shared_rule"),
+        "bare-name completion should surface helper rules. got: {labels:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hover_helper_rule_via_bare_name() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let helpers_text = "rule shared_rule { \"x\" }\n";
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, helpers_text).unwrap();
+
+    let grammar_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"test\" }}\nrule program {{ shared_rule }}\n",
+        helpers_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &grammar_text).unwrap();
+
+    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &grammar_text)]).await;
+
+    let body_offset = grammar_text.find("{ shared_rule }").unwrap() + "{ ".len();
+    let rope = ropey::Rope::from_str(&grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, body_offset as u32);
+
+    assert_eq!(
+        hover_at(&mut service, grammar_uri, pos).await,
+        make_hover("```\nrule shared_rule\n```"),
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn goto_def_helper_rule_via_bare_name() {
     // A rule declared in an imported helper is reachable by bare name from
     // the importing grammar. Goto-def should jump into the helper.
