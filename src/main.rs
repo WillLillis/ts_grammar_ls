@@ -78,6 +78,8 @@ async fn main() {
         publish_handle: Arc::new(dashmap::DashMap::new()),
         generate_child: Arc::default(),
         dependents: Arc::new(dashmap::DashMap::new()),
+        closed_file_deps: Arc::new(dashmap::DashMap::new()),
+        workspace_roots: Arc::default(),
         config: Arc::default(),
     })
     .finish();

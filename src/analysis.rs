@@ -495,6 +495,44 @@ pub fn uri_to_grammar_path(uri: &Url) -> PathBuf {
         .unwrap_or_else(|()| PathBuf::from("grammar.tsg"))
 }
 
+/// Cheap lex+parse to extract the canonical paths of every file the grammar
+/// at `file_path` would inherit or import. Used by the workspace scanner to
+/// build a dep graph for *closed* files (so cross-file rename can reach them
+/// without opening every grammar in the workspace). Resolves relative paths
+/// against `file_path`'s directory and canonicalizes via `dunce`. Files that
+/// don't canonicalize (missing on disk, broken symlinks) are silently
+/// dropped - they'd fail the real loader anyway.
+#[must_use]
+pub fn extract_deps(text: &str, file_path: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(tokens) = nativedsl::lexer::Lexer::new(text).tokenize() else {
+        return Vec::new();
+    };
+    let mut shared = ast::SharedAst::new(text.len() / 30);
+    let Ok(ctx) =
+        nativedsl::parser::Parser::new(&tokens, text.to_owned(), file_path.to_path_buf(), &mut shared)
+            .parse()
+    else {
+        return Vec::new();
+    };
+    let module_dir = file_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut deps = Vec::new();
+    for &node_id in &ctx.module_refs {
+        if let ast::Node::ModuleRef { path, .. } = shared.arena.get(node_id) {
+            let path_str = ctx.text(*path);
+            let resolved = module_dir.join(path_str);
+            if let Ok(canonical) = dunce::canonicalize(&resolved)
+                && seen.insert(canonical.clone())
+            {
+                deps.push(canonical);
+            }
+        }
+    }
+    deps
+}
+
 /// Run the DSL pipeline on the given source text and return analysis data.
 /// Uses the core's `Loader` to load all imports/inherits and run the full
 /// resolve + typecheck pipeline on a single shared AST.

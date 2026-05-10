@@ -162,7 +162,7 @@ fn rename_cross_file(
         .map(|set| set.iter().filter(|u| *u != cursor_uri).cloned().collect())
         .unwrap_or_default();
     for dep_uri in dep_uris {
-        if let Some(dep_analysis) = backend.get_analysis(&dep_uri) {
+        if let Some(dep_analysis) = backend.analysis_for_uri(&dep_uri) {
             add_cross_refs_in_file(
                 &mut changes,
                 &dep_uri,

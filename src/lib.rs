@@ -9,3 +9,4 @@ pub mod handlers;
 pub mod hover_docs;
 pub mod server;
 pub mod text;
+pub mod workspace_index;

@@ -2,6 +2,7 @@ pub mod code_action;
 pub mod completion;
 pub mod did_change;
 pub mod did_change_configuration;
+pub mod did_change_watched_files;
 pub mod did_close;
 pub mod did_open;
 pub mod did_save;

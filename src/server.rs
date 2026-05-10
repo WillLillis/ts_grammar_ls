@@ -9,11 +9,13 @@ use tower_lsp::{
     Client, LanguageServer, jsonrpc,
     lsp_types::{
         CodeActionParams, CodeActionResponse, CompletionParams, CompletionResponse,
-        DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-        DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams,
+        DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+        DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+        DocumentFormattingParams,
         DocumentHighlight, DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse,
         GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
-        InitializeResult, Location, PrepareRenameResponse, ReferenceParams, RenameParams,
+        InitializeResult, InitializedParams, Location, PrepareRenameResponse, ReferenceParams,
+        RenameParams,
         SemanticTokensParams, SemanticTokensResult, TextDocumentPositionParams, TextEdit, Url,
         WorkspaceEdit,
     },
@@ -34,12 +36,20 @@ pub struct Backend {
     /// Handle to the currently running generate-check subprocess, if any.
     /// Killed on new edits to avoid stale work.
     pub generate_child: Arc<GenerateChildSlot>,
-    /// Reverse-dependency index: for each external file path, the set of open
-    /// document URIs whose last successful analysis loaded that path
-    /// (inherits + transitive imports). Used to find dependents that need
-    /// fresh diagnostics when an external file changes, and to extend
-    /// cross-file rename to other open files.
+    /// Reverse-dependency index: for each external file path, the set of
+    /// document URIs (open or closed-but-on-disk-in-workspace) whose last
+    /// known dependency set loaded that path. Used to find dependents that
+    /// need fresh diagnostics when an external file changes, and to extend
+    /// cross-file rename across the workspace.
     pub dependents: Arc<DashMap<PathBuf, FxHashSet<Url>>>,
+    /// Forward dep list for closed `.tsg` files indexed via the workspace
+    /// scanner. Open files store their deps directly on `Document.deps`;
+    /// closed files have no `Document` so we track them here for diff-based
+    /// updates when a watcher event fires.
+    pub closed_file_deps: Arc<DashMap<PathBuf, Vec<PathBuf>>>,
+    /// Workspace folders advertised by the client at `initialize`; used by
+    /// the workspace scanner to know where to look for `.tsg` files.
+    pub workspace_roots: Arc<RwLock<Vec<PathBuf>>>,
     /// Server configuration (can be updated at runtime).
     pub config: Arc<RwLock<Config>>,
 }
@@ -139,6 +149,28 @@ impl Backend {
                 .or_else(|| Some(std::sync::Arc::new(fresh)))
         }
     }
+
+    /// Resolve `uri` to an analysis regardless of open/closed status. For
+    /// open files this is `get_analysis` (with all its caching/fallback
+    /// behavior); for closed files we read from disk and run the pipeline
+    /// once. Used by cross-file rename to reach workspace dependents that
+    /// the user hasn't opened in their editor.
+    #[must_use]
+    pub fn analysis_for_uri(
+        &self,
+        uri: &tower_lsp::lsp_types::Url,
+    ) -> Option<std::sync::Arc<crate::document::Analysis>> {
+        if self.document_map.contains_key(uri) {
+            return self.get_analysis(uri);
+        }
+        let path = uri.to_file_path().ok()?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let analysis = crate::analysis::analyze(&text, uri);
+        analysis
+            .definitions
+            .is_some()
+            .then(|| std::sync::Arc::new(analysis))
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -147,12 +179,20 @@ impl LanguageServer for Backend {
         Ok(handlers::initialize::initialize(self, params).await)
     }
 
+    async fn initialized(&self, _params: InitializedParams) {
+        handlers::initialize::initialized(self).await;
+    }
+
     async fn shutdown(&self) -> jsonrpc::Result<()> {
         Ok(())
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         handlers::did_change_configuration::did_change_configuration(self, params).await;
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        handlers::did_change_watched_files::did_change_watched_files(self, params).await;
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {

@@ -4,7 +4,7 @@ use tracing::info;
 
 use crate::diagnostics;
 use crate::document::{DiagnosticCache, Document};
-use crate::server::{Backend, cancel_pending_diagnostics};
+use crate::server::{Backend, cancel_pending_diagnostics, drop_dependents};
 
 pub async fn did_open(backend: &Backend, params: DidOpenTextDocumentParams) {
     let uri = params.text_document.uri;
@@ -14,6 +14,17 @@ pub async fn did_open(backend: &Backend, params: DidOpenTextDocumentParams) {
 
     // If this URI already had a pending debounced publish, supersede it.
     cancel_pending_diagnostics(&backend.publish_handle, &uri);
+
+    // If this file was previously tracked as closed-on-disk, drop those
+    // index entries; `Document.deps` will become the canonical source once
+    // analyze runs. Otherwise the URI shows up twice in `dependents`
+    // (harmless but messy) and `closed_file_deps` keeps a stale list.
+    if let Ok(path) = uri.to_file_path()
+        && let Ok(canonical) = dunce::canonicalize(&path)
+        && let Some((_, prev_deps)) = backend.closed_file_deps.remove(&canonical)
+    {
+        drop_dependents(&backend.dependents, &prev_deps, &uri);
+    }
 
     backend.document_map.insert(
         uri.clone(),

@@ -3,6 +3,7 @@ use tracing::info;
 
 use crate::diagnostics;
 use crate::server::{Backend, cancel_pending_diagnostics, drop_dependents};
+use crate::workspace_index;
 
 #[allow(clippy::unused_async, reason = "required by LanguageServer trait")]
 pub async fn did_close(backend: &Backend, params: DidCloseTextDocumentParams) {
@@ -13,6 +14,21 @@ pub async fn did_close(backend: &Backend, params: DidCloseTextDocumentParams) {
     // document; we need its deps to know which entries to clean up.
     if let Some((_, doc)) = backend.document_map.remove(&uri) {
         drop_dependents(&backend.dependents, &doc.deps, &uri);
+    }
+    // Re-index the file as closed (using disk content) so cross-file rename
+    // can still reach it. If the file lives in the workspace this restores
+    // the dependents/closed_file_deps entries we just removed; if it lives
+    // outside we silently drop it from the workspace graph.
+    if let Ok(path) = uri.to_file_path()
+        && let Ok(canonical) = dunce::canonicalize(&path)
+    {
+        let prev = backend
+            .closed_file_deps
+            .get(&canonical)
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        let new_deps = workspace_index::index_file(&backend.dependents, &canonical, &prev);
+        backend.closed_file_deps.insert(canonical, new_deps);
     }
     cancel_pending_diagnostics(&backend.publish_handle, &uri);
     // Kill any in-flight generate-check subprocess for this document.

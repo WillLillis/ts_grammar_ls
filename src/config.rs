@@ -101,18 +101,32 @@ fn read_config(path: &Path) -> Option<Config> {
 pub fn workspace_root_from_params(
     params: &tower_lsp::lsp_types::InitializeParams,
 ) -> Option<PathBuf> {
-    // Prefer workspace folders (modern LSP).
-    if let Some(folders) = &params.workspace_folders
-        && let Some(folder) = folders.first()
-    {
-        return folder.uri.to_file_path().ok();
+    workspace_roots_from_params(params).into_iter().next()
+}
+
+/// All workspace roots the client advertised, in order. Multi-root clients
+/// (VS Code with multiple folders) get all of them; single-root clients fall
+/// back to `rootUri`.
+#[must_use]
+pub fn workspace_roots_from_params(
+    params: &tower_lsp::lsp_types::InitializeParams,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(folders) = &params.workspace_folders {
+        for folder in folders {
+            if let Ok(path) = folder.uri.to_file_path() {
+                out.push(path);
+            }
+        }
     }
-    // Fall back to deprecated root_uri / root_path.
     #[allow(deprecated)]
-    if let Some(uri) = &params.root_uri {
-        return uri.to_file_path().ok();
+    if out.is_empty()
+        && let Some(uri) = &params.root_uri
+        && let Ok(path) = uri.to_file_path()
+    {
+        out.push(path);
     }
-    None
+    out
 }
 
 #[cfg(test)]

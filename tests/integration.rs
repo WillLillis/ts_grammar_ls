@@ -5,8 +5,8 @@ use tower::{Service, ServiceExt};
 use tower_lsp::LspService;
 use tower_lsp::jsonrpc::Request;
 use tower_lsp::lsp_types::notification::{
-    DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
-    DidSaveTextDocument,
+    DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
+    DidOpenTextDocument, DidSaveTextDocument, Initialized,
 };
 use tower_lsp::lsp_types::request::{
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting,
@@ -27,10 +27,17 @@ const ID: i64 = 1;
 type PublishLog = Arc<tokio::sync::Mutex<Vec<PublishDiagnosticsParams>>>;
 
 async fn init(documents: &[(Url, &str)]) -> LspService<Backend> {
-    init_with_capture(documents).await.0
+    init_with_capture(documents, None).await.0
 }
 
-async fn init_with_capture(documents: &[(Url, &str)]) -> (LspService<Backend>, PublishLog) {
+/// Spin up a service, optionally advertising a workspace folder (which
+/// triggers the `initialized` -> watcher registration + workspace scan
+/// flow). Returns the service plus a log of all `publishDiagnostics`
+/// notifications observed since startup.
+async fn init_with_capture(
+    documents: &[(Url, &str)],
+    workspace_root: Option<&std::path::Path>,
+) -> (LspService<Backend>, PublishLog) {
     let config = Config {
         diagnostics: DiagnosticConfig {
             generate_diagnostics: false,
@@ -43,6 +50,8 @@ async fn init_with_capture(documents: &[(Url, &str)]) -> (LspService<Backend>, P
         publish_handle: Arc::new(dashmap::DashMap::new()),
         generate_child: Arc::default(),
         dependents: Arc::new(dashmap::DashMap::new()),
+        closed_file_deps: Arc::new(dashmap::DashMap::new()),
+        workspace_roots: Arc::default(),
         config: Arc::new(config.into()),
     })
     .finish();
@@ -67,6 +76,13 @@ async fn init_with_capture(documents: &[(Url, &str)]) -> (LspService<Backend>, P
         }
     });
 
+    let workspace_folders = workspace_root.map(|p| {
+        vec![WorkspaceFolder {
+            uri: Url::from_file_path(p).unwrap(),
+            name: "test-workspace".into(),
+        }]
+    });
+
     lsp_request::<Initialize>(
         &mut service,
         InitializeParams {
@@ -74,10 +90,19 @@ async fn init_with_capture(documents: &[(Url, &str)]) -> (LspService<Backend>, P
             initialization_options: Some(serde_json::json!({
                 "diagnostics": { "generate_diagnostics": false }
             })),
+            workspace_folders,
             ..Default::default()
         },
     )
     .await;
+
+    if workspace_root.is_some() {
+        // Triggers `initialized` -> watcher registration + workspace scan.
+        // The scan is spawn_blocking; sleep gives it time to finish before
+        // tests inspect the resulting index.
+        lsp_notify::<Initialized>(&mut service, InitializedParams {}).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     for (uri, text) in documents {
         lsp_notify::<DidOpenTextDocument>(
@@ -3881,10 +3906,13 @@ async fn dependent_diagnostics_republish_on_helper_change() {
     let helpers_uri = Url::from_file_path(&helpers_path).unwrap();
     let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
 
-    let (mut service, publish_log) = init_with_capture(&[
-        (helpers_uri.clone(), helpers_text_v1),
-        (grammar_uri.clone(), &grammar_text),
-    ])
+    let (mut service, publish_log) = init_with_capture(
+        &[
+            (helpers_uri.clone(), helpers_text_v1),
+            (grammar_uri.clone(), &grammar_text),
+        ],
+        None,
+    )
     .await;
 
     // Force the grammar's analysis to run so the dependents index is populated
@@ -4058,6 +4086,135 @@ async fn rename_does_not_touch_unrelated_imports_with_same_name() {
         vec![&grammar_a_uri, &helpers_uri],
         "grammar_b uses a different module's foo and must not be edited"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn watched_files_change_republishes_open_dependents() {
+    // helpers.tsg is NOT open in the editor; only grammar.tsg is. When the
+    // client signals an on-disk change to helpers.tsg via didChangeWatchedFiles,
+    // grammar.tsg's diagnostics should refresh (loader reads the new helpers
+    // content from disk).
+    let dir = tempfile::tempdir().unwrap();
+
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, "macro foo(x: rule_t) rule_t { x }\n").unwrap();
+
+    let grammar_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"test\" }}\nrule program {{ h::foo(\"x\") }}\n",
+        helpers_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &grammar_text).unwrap();
+
+    let helpers_uri = Url::from_file_path(&helpers_path).unwrap();
+    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
+
+    let (mut service, publish_log) =
+        init_with_capture(&[(grammar_uri.clone(), &grammar_text)], None).await;
+
+    // Force grammar.tsg's analysis so the dependents index records helpers.
+    let _ = hover_at(
+        &mut service,
+        grammar_uri.clone(),
+        Position::new(2, 17),
+    )
+    .await;
+
+    publish_log.lock().await.clear();
+
+    // Simulate the client telling us helpers.tsg changed on disk.
+    lsp_notify::<DidChangeWatchedFiles>(
+        &mut service,
+        DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: helpers_uri.clone(),
+                typ: FileChangeType::CHANGED,
+            }],
+        },
+    )
+    .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let log = publish_log.lock().await;
+    let uris: Vec<&Url> = log.iter().map(|p| &p.uri).collect();
+    assert!(
+        uris.contains(&&grammar_uri),
+        "grammar.tsg should be republished after watcher event for helpers.tsg. got: {uris:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rename_includes_closed_workspace_dependents() {
+    // Three grammars in a workspace, all import the same helper. Only one
+    // is open in the editor; the workspace scan must discover the other two
+    // from disk and rename should produce edits for all of them.
+    let dir = tempfile::tempdir().unwrap();
+
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, "macro foo(x: rule_t) rule_t { x }\n").unwrap();
+
+    let parser_a_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"a\" }}\nrule program {{ h::foo(\"x\") }}\n",
+        helpers_path.display()
+    );
+    let parser_a_path = dir.path().join("parser_a.tsg");
+    std::fs::write(&parser_a_path, &parser_a_text).unwrap();
+
+    let parser_b_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"b\" }}\nrule program {{ h::foo(\"y\") }}\n",
+        helpers_path.display()
+    );
+    let parser_b_path = dir.path().join("parser_b.tsg");
+    std::fs::write(&parser_b_path, &parser_b_text).unwrap();
+
+    let parser_c_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"c\" }}\nrule program {{ h::foo(\"z\") }}\n",
+        helpers_path.display()
+    );
+    let parser_c_path = dir.path().join("parser_c.tsg");
+    std::fs::write(&parser_c_path, &parser_c_text).unwrap();
+
+    let helpers_uri = Url::from_file_path(&helpers_path).unwrap();
+    let parser_a_uri = Url::from_file_path(&parser_a_path).unwrap();
+    let parser_b_uri = Url::from_file_path(&parser_b_path).unwrap();
+    let parser_c_uri = Url::from_file_path(&parser_c_path).unwrap();
+
+    // Only parser_a is open. Workspace scan should pick up b and c.
+    let (mut service, _log) = init_with_capture(
+        &[(parser_a_uri.clone(), &parser_a_text)],
+        Some(dir.path()),
+    )
+    .await;
+
+    // Force parser_a's analysis so dependents picks up its open-file deps too.
+    let _ = hover_at(
+        &mut service,
+        parser_a_uri.clone(),
+        Position::new(2, 17),
+    )
+    .await;
+
+    let offset = parser_a_text.find("h::foo").unwrap() + "h::".len();
+    let rope = ropey::Rope::from_str(&parser_a_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    let edit = rename_at(&mut service, parser_a_uri.clone(), pos, "bar")
+        .await
+        .expect("rename should succeed");
+    let changes = edit.changes.expect("changes present");
+
+    let mut keys: Vec<&Url> = changes.keys().collect();
+    keys.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+    assert_eq!(
+        keys,
+        vec![&helpers_uri, &parser_a_uri, &parser_b_uri, &parser_c_uri],
+        "rename must reach closed workspace dependents (parser_b, parser_c)"
+    );
+    for (uri, edits) in &changes {
+        assert_eq!(edits.len(), 1, "{uri} should have one edit");
+        assert_eq!(edits[0].new_text, "bar");
+    }
 }
 
 // ---------------------------------------------------------------------------
