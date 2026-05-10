@@ -32,6 +32,7 @@ pub async fn did_change(backend: &Backend, params: DidChangeTextDocumentParams) 
     let client = backend.client.clone();
     let document_map = Arc::clone(&backend.document_map);
     let generate_child = Arc::clone(&backend.generate_child);
+    let dependents = Arc::clone(&backend.dependents);
     let uri_clone = uri.clone();
 
     // Typing path: DSL diagnostics only, off the LSP request task so a slow
@@ -44,6 +45,7 @@ pub async fn did_change(backend: &Backend, params: DidChangeTextDocumentParams) 
             &client,
             &document_map,
             &generate_child,
+            &dependents,
             false,
             uri_clone,
             text,

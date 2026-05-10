@@ -21,9 +21,16 @@ use ts_grammar_ls::server::Backend;
 
 const ID: i64 = 1;
 
+/// Shared log of `textDocument/publishDiagnostics` notifications observed
+/// during a test, in order. Tests inspect this to verify cross-file
+/// republishing behavior.
+type PublishLog = Arc<tokio::sync::Mutex<Vec<PublishDiagnosticsParams>>>;
+
 async fn init(documents: &[(Url, &str)]) -> LspService<Backend> {
-    // Disable generate diagnostics in tests - the test binary doesn't have
-    // the generate-check subcommand.
+    init_with_capture(documents).await.0
+}
+
+async fn init_with_capture(documents: &[(Url, &str)]) -> (LspService<Backend>, PublishLog) {
     let config = Config {
         diagnostics: DiagnosticConfig {
             generate_diagnostics: false,
@@ -35,16 +42,29 @@ async fn init(documents: &[(Url, &str)]) -> LspService<Backend> {
         document_map: Arc::new(dashmap::DashMap::new()),
         publish_handle: Arc::new(dashmap::DashMap::new()),
         generate_child: Arc::default(),
+        dependents: Arc::new(dashmap::DashMap::new()),
         config: Arc::new(config.into()),
     })
     .finish();
 
     // Drain server-to-client messages so internal buffers don't fill up
     // (multiple `publish_diagnostics` calls would otherwise deadlock).
+    // While draining, capture publishDiagnostics notifications for tests
+    // that need to verify cross-file republishing.
+    let publish_log: PublishLog = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let log_writer = Arc::clone(&publish_log);
     let mut socket = socket;
     tokio::spawn(async move {
         use futures_util::stream::StreamExt;
-        while socket.next().await.is_some() {}
+        while let Some(msg) = socket.next().await {
+            if msg.method() == "textDocument/publishDiagnostics"
+                && let Some(params) = msg.params()
+                && let Ok(parsed) =
+                    serde_json::from_value::<PublishDiagnosticsParams>(params.clone())
+            {
+                log_writer.lock().await.push(parsed);
+            }
+        }
     });
 
     lsp_request::<Initialize>(
@@ -75,7 +95,7 @@ async fn init(documents: &[(Url, &str)]) -> LspService<Backend> {
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    service
+    (service, publish_log)
 }
 
 async fn lsp_request<R: tower_lsp::lsp_types::request::Request>(
@@ -1649,7 +1669,7 @@ grammar {{
     language: "derived_lang",
     inherits: base,
 }}
-rule program {{ base::wrap("y") }}
+override rule program {{ base::wrap("y") }}
 "#,
         base_path.display()
     );
@@ -3833,6 +3853,81 @@ rule program { seq("a", "b") }
         prepare_rename_at(&mut service, uri, pos).await,
         None,
         "builtins should not be renameable"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-file dependency tracking
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn dependent_diagnostics_republish_on_helper_change() {
+    // grammar imports helpers; both are open. Editing helpers (a no-op-ish
+    // change that still bumps the version) should cause grammar's diagnostics
+    // to be republished, even though grammar's own text didn't change.
+    let dir = tempfile::tempdir().unwrap();
+
+    let helpers_text_v1 = "macro foo(x: rule_t) rule_t { x }\n";
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, helpers_text_v1).unwrap();
+
+    let grammar_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"test\" }}\nrule program {{ h::foo(\"x\") }}\n",
+        helpers_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &grammar_text).unwrap();
+
+    let helpers_uri = Url::from_file_path(&helpers_path).unwrap();
+    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
+
+    let (mut service, publish_log) = init_with_capture(&[
+        (helpers_uri.clone(), helpers_text_v1),
+        (grammar_uri.clone(), &grammar_text),
+    ])
+    .await;
+
+    // Force the grammar's analysis to run so the dependents index is populated
+    // (analysis is lazy; otherwise no-one has loaded helpers as a dep yet).
+    let _ = hover_at(
+        &mut service,
+        grammar_uri.clone(),
+        Position::new(2, 17),
+    )
+    .await;
+
+    publish_log.lock().await.clear();
+
+    // Now edit helpers (different but still valid).
+    let helpers_text_v2 = "macro foo(x: rule_t) rule_t { seq(x, x) }\n";
+    lsp_notify::<DidChangeTextDocument>(
+        &mut service,
+        DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: helpers_uri.clone(),
+                version: 1,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: helpers_text_v2.into(),
+            }],
+        },
+    )
+    .await;
+
+    // Give the spawned publish task time to run.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let log = publish_log.lock().await;
+    let uris: Vec<&Url> = log.iter().map(|p| &p.uri).collect();
+    assert!(
+        uris.contains(&&helpers_uri),
+        "helpers.tsg should be republished after its own didChange. got: {uris:?}"
+    );
+    assert!(
+        uris.contains(&&grammar_uri),
+        "grammar.tsg should be republished as a dependent of helpers.tsg. got: {uris:?}"
     );
 }
 

@@ -91,12 +91,12 @@ fn extract_definitions(
             let for_span = shared.arena.span(node_id);
             let config = shared.pools.get_for(*for_id);
             let scope = scopes.find(for_span).unwrap_or(for_span);
-            for &(binding_span, _) in &config.bindings {
+            for binding in &config.bindings {
                 definitions.push(Definition {
-                    name: ctx.text(binding_span).to_owned(),
+                    name: ctx.text(binding.name).to_owned(),
                     kind: DefKind::Parameter { scope },
-                    name_span: binding_span,
-                    full_span: binding_span,
+                    name_span: binding.name,
+                    full_span: binding.name,
                 });
             }
         }
@@ -300,7 +300,7 @@ fn extract_references(
             // For-loop binding usage: resolve to the binding name via for_id.
             ast::Node::ForBinding { for_id, index, .. } => {
                 let cfg = shared.pools.get_for(*for_id);
-                let (binding_span, _) = cfg.bindings[*index as usize];
+                let binding_span = cfg.bindings[*index as usize].name;
                 references.push(Reference {
                     span,
                     kind: RefKind::Variable(ctx.text(binding_span).to_owned()),
@@ -534,6 +534,7 @@ pub fn analyze(text: &str, uri: &Url) -> Analysis {
             env: &mut env,
             state: &mut state,
             ancestor_paths: vec![canonical.clone()],
+            loaded: Vec::new(),
         };
         if loader
             .load_module(text, &canonical, nativedsl::loader::ModuleKind::Grammar)
@@ -548,7 +549,7 @@ pub fn analyze(text: &str, uri: &Url) -> Analysis {
     // Fall back to manual lex+parse so we still get partial analysis.
     let mut shared = ast::SharedAst::new(text.len() / 30);
     let Ok(module_ctx) =
-        nativedsl::parser::Parser::new(&tokens, text.to_owned(), &grammar_path, &mut shared)
+        nativedsl::parser::Parser::new(&tokens, text.to_owned(), grammar_path.clone(), &mut shared)
             .parse()
     else {
         tracing::warn!("analyze: parse failed for {uri}");
@@ -562,7 +563,7 @@ pub fn analyze(text: &str, uri: &Url) -> Analysis {
 
     // Resolve what we can without loaded children. Imports/inherits won't
     // resolve, but local Ident -> RuleRef/VarRef rewrites will happen.
-    let _ = nativedsl::resolve::resolve(&mut shared, &module_ctx, &[], None, &grammar_path);
+    let _ = nativedsl::resolve::resolve(&mut shared, &module_ctx, &[], None);
 
     // Extract analysis from this single module (no loaded children).
     let modules: Vec<nativedsl::Module> = Vec::new();
@@ -580,7 +581,7 @@ pub fn with_ast<T>(
     let tokens = nativedsl::lexer::Lexer::new(text).tokenize().ok()?;
     let mut shared = ast::SharedAst::new(text.len() / 30);
     let module_ctx =
-        nativedsl::parser::Parser::new(&tokens, text.to_owned(), &grammar_path, &mut shared)
+        nativedsl::parser::Parser::new(&tokens, text.to_owned(), grammar_path.clone(), &mut shared)
             .parse()
             .ok()?;
     Some(f(&shared, &module_ctx))
@@ -634,6 +635,7 @@ pub fn with_type_env<T>(
         env: &mut env,
         state: &mut state,
         ancestor_paths: vec![canonical.clone()],
+        loaded: Vec::new(),
     };
     loader
         .load_module(text, &canonical, nativedsl::loader::ModuleKind::Grammar)

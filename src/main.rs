@@ -77,6 +77,7 @@ async fn main() {
         document_map: Arc::new(dashmap::DashMap::new()),
         publish_handle: Arc::new(dashmap::DashMap::new()),
         generate_child: Arc::default(),
+        dependents: Arc::new(dashmap::DashMap::new()),
         config: Arc::default(),
     })
     .finish();

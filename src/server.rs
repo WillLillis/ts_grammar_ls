@@ -1,6 +1,8 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use rustc_hash::FxHashSet;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tower_lsp::{
@@ -32,6 +34,12 @@ pub struct Backend {
     /// Handle to the currently running generate-check subprocess, if any.
     /// Killed on new edits to avoid stale work.
     pub generate_child: Arc<GenerateChildSlot>,
+    /// Reverse-dependency index: for each external file path, the set of open
+    /// document URIs whose last successful analysis loaded that path
+    /// (inherits + transitive imports). Used to find dependents that need
+    /// fresh diagnostics when an external file changes, and to extend
+    /// cross-file rename to other open files.
+    pub dependents: Arc<DashMap<PathBuf, FxHashSet<Url>>>,
     /// Server configuration (can be updated at runtime).
     pub config: Arc<RwLock<Config>>,
 }
@@ -40,6 +48,63 @@ pub struct Backend {
 pub fn cancel_pending_diagnostics(handles: &DashMap<Url, JoinHandle<()>>, uri: &Url) {
     if let Some((_, handle)) = handles.remove(uri) {
         handle.abort();
+    }
+}
+
+/// Walk an analysis's external modules (inherit + transitive imports) and
+/// collect their canonical paths.
+fn collect_deps(analysis: &crate::document::Analysis) -> Vec<PathBuf> {
+    fn walk(out: &mut Vec<PathBuf>, info: &crate::document::ExternalModuleInfo) {
+        out.push(info.path.clone());
+        for (_, sub) in &info.import_modules {
+            walk(out, sub);
+        }
+    }
+    let mut deps = Vec::new();
+    if let Some(base) = &analysis.base_module {
+        walk(&mut deps, base);
+    }
+    for (_, info) in &analysis.import_modules {
+        walk(&mut deps, info);
+    }
+    deps
+}
+
+/// Reconcile `Document.deps` and the reverse `dependents` index against a
+/// fresh analysis. Inserts/removes only the paths that changed.
+fn update_dependents(
+    dependents: &DashMap<PathBuf, FxHashSet<Url>>,
+    doc: &mut Document,
+    uri: &Url,
+    new_deps: Vec<PathBuf>,
+) {
+    let old_deps = std::mem::replace(&mut doc.deps, new_deps);
+    let old_set: FxHashSet<&PathBuf> = old_deps.iter().collect();
+    let new_set: FxHashSet<&PathBuf> = doc.deps.iter().collect();
+
+    for path in old_set.difference(&new_set) {
+        if let Some(mut entry) = dependents.get_mut(*path) {
+            entry.remove(uri);
+        }
+    }
+    for path in new_set.difference(&old_set) {
+        dependents
+            .entry((*path).clone())
+            .or_default()
+            .insert(uri.clone());
+    }
+}
+
+/// Drop a URI's entries from the reverse index; called from `did_close`.
+pub fn drop_dependents(
+    dependents: &DashMap<PathBuf, FxHashSet<Url>>,
+    deps: &[PathBuf],
+    uri: &Url,
+) {
+    for path in deps {
+        if let Some(mut entry) = dependents.get_mut(path) {
+            entry.remove(uri);
+        }
     }
 }
 
@@ -58,9 +123,11 @@ impl Backend {
         let fresh = crate::analysis::analyze(&text, uri);
 
         if fresh.definitions.is_some() {
+            let new_deps = collect_deps(&fresh);
             let arc = std::sync::Arc::new(fresh);
             if let Some(mut doc) = self.document_map.get_mut(uri) {
                 doc.last_good_analysis = Some(std::sync::Arc::clone(&arc));
+                update_dependents(&self.dependents, &mut doc, uri, new_deps);
             }
             Some(arc)
         } else {

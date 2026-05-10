@@ -21,6 +21,7 @@ pub async fn did_save(backend: &Backend, params: DidSaveTextDocumentParams) {
         &backend.client,
         &backend.document_map,
         &backend.generate_child,
+        &backend.dependents,
         generate_enabled,
         uri,
         text,

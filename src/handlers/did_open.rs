@@ -23,6 +23,7 @@ pub async fn did_open(backend: &Backend, params: DidOpenTextDocumentParams) {
             version,
             diagnostics: DiagnosticCache::default(),
             last_good_analysis: None,
+            deps: Vec::new(),
         },
     );
 
@@ -31,6 +32,7 @@ pub async fn did_open(backend: &Backend, params: DidOpenTextDocumentParams) {
         &backend.client,
         &backend.document_map,
         &backend.generate_child,
+        &backend.dependents,
         generate_enabled,
         uri,
         text,

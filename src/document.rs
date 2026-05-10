@@ -393,6 +393,11 @@ pub struct Document {
     /// `get_analysis` re-runs analyze and serves the fresh result if it
     /// parsed.
     pub last_good_analysis: Option<std::sync::Arc<Analysis>>,
+    /// Canonical paths of external files (inherits + transitive imports) this
+    /// document's last successful analysis loaded. Maintained alongside the
+    /// `Backend.dependents` reverse index; on update we diff against the new
+    /// dep set to keep both sides consistent without iterating the whole map.
+    pub deps: Vec<PathBuf>,
 }
 
 #[cfg(test)]

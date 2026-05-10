@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use ropey::Rope;
+use rustc_hash::FxHashSet;
 
 use tower_lsp::{
     Client,
@@ -82,32 +83,51 @@ fn run_dsl_pipeline(text: &str, rope: &Rope, grammar_path: &Path) -> Vec<Diagnos
 /// (`did_change`) passes `false` to avoid burning CPU on a generate run that
 /// will be killed by the next keystroke; save/open pass the user-configured
 /// flag so a real check happens at points where the file is "settled".
+///
+/// After publishing for `uri`, also republishes DSL diagnostics for every
+/// open document whose last analysis depended on this file (transitively
+/// tracked in `dependents`). Generate-check is only triggered for `uri`
+/// itself, never for the dependents.
 pub async fn run_and_publish(
     client: &Client,
     document_map: &Arc<DashMap<Url, Document>>,
     generate_child: &Arc<GenerateChildSlot>,
+    dependents: &Arc<DashMap<PathBuf, FxHashSet<Url>>>,
     include_generate_check: bool,
     uri: Url,
     text: String,
     version: i32,
 ) {
     let grammar_path = uri_to_grammar_path(&uri);
-    let rope = Rope::from_str(&text);
-    let dsl_diagnostics = run_dsl_pipeline(&text, &rope, &grammar_path);
+    let dsl_ok = publish_dsl_diagnostics(client, document_map, &uri, &text, &grammar_path, version).await;
 
-    let dsl_ok = dsl_diagnostics.is_empty();
-
-    // Write diagnostics under the lock, then release before awaiting the client.
-    let all = {
-        let Some(mut doc) = document_map.get_mut(&uri) else {
-            return;
-        };
-        doc.diagnostics.dsl = dsl_diagnostics;
-        doc.diagnostics.all()
-    };
-    client
-        .publish_diagnostics(uri.clone(), all, Some(version))
-        .await;
+    // Republish DSL diagnostics for any open file that depends on this one.
+    // Snapshot the set under the dashmap guard then drop it before awaiting.
+    let dep_uris: Vec<Url> = dunce::canonicalize(&grammar_path)
+        .ok()
+        .and_then(|canonical| {
+            dependents
+                .get(&canonical)
+                .map(|set| set.iter().filter(|u| **u != uri).cloned().collect())
+        })
+        .unwrap_or_default();
+    for dep_uri in dep_uris {
+        let snapshot = document_map
+            .get(&dep_uri)
+            .map(|d| (d.text.clone(), d.version));
+        if let Some((dep_text, dep_version)) = snapshot {
+            let dep_path = uri_to_grammar_path(&dep_uri);
+            publish_dsl_diagnostics(
+                client,
+                document_map,
+                &dep_uri,
+                &dep_text,
+                &dep_path,
+                dep_version,
+            )
+            .await;
+        }
+    }
 
     if dsl_ok && include_generate_check {
         spawn_generate_check(
@@ -120,6 +140,34 @@ pub async fn run_and_publish(
             version,
         );
     }
+}
+
+/// Run the DSL pipeline for one document and publish the result. Returns
+/// whether the pipeline produced no errors (so the caller can decide whether
+/// to gate further work like generate-check on a clean DSL pass).
+async fn publish_dsl_diagnostics(
+    client: &Client,
+    document_map: &Arc<DashMap<Url, Document>>,
+    uri: &Url,
+    text: &str,
+    grammar_path: &Path,
+    version: i32,
+) -> bool {
+    let rope = Rope::from_str(text);
+    let dsl_diagnostics = run_dsl_pipeline(text, &rope, grammar_path);
+    let dsl_ok = dsl_diagnostics.is_empty();
+
+    let all = {
+        let Some(mut doc) = document_map.get_mut(uri) else {
+            return dsl_ok;
+        };
+        doc.diagnostics.dsl = dsl_diagnostics;
+        doc.diagnostics.all()
+    };
+    client
+        .publish_diagnostics(uri.clone(), all, Some(version))
+        .await;
+    dsl_ok
 }
 
 // ---------------------------------------------------------------------------
