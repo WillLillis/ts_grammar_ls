@@ -120,8 +120,16 @@ pub fn drop_dependents(
 
 impl Backend {
     /// Run analysis for a document. Always re-runs the pipeline; the document
-    /// only retains a `last_good_analysis` fallback that's served when the
-    /// current text fails to parse (so features keep working mid-keystroke).
+    /// retains a `last_good_analysis` fallback (snapshot from the last full
+    /// Loader-pipeline success) so features keep working mid-keystroke when
+    /// the current text fails to parse / resolve / typecheck.
+    ///
+    /// `last_good_analysis` only updates when `analyze` reports
+    /// `loader_succeeded`. The manual-parse fallback inside `analyze` (which
+    /// runs when any Loader stage failed - including resolve errors from
+    /// unresolved-name typos mid-edit) lacks cross-file info, so we serve
+    /// the previous full snapshot instead of letting features silently lose
+    /// their `base_module` / `import_modules`.
     #[must_use]
     pub fn get_analysis(
         &self,
@@ -132,7 +140,7 @@ impl Backend {
         let text = self.document_map.get(uri)?.text.clone();
         let fresh = crate::analysis::analyze(&text, uri);
 
-        if fresh.definitions.is_some() {
+        if fresh.loader_succeeded {
             let new_deps = collect_deps(&fresh);
             let arc = std::sync::Arc::new(fresh);
             if let Some(mut doc) = self.document_map.get_mut(uri) {
@@ -141,7 +149,9 @@ impl Backend {
             }
             Some(arc)
         } else {
-            // Parse failed: serve the last known-good analysis if we have one.
+            // Loader failed (or parse failed): serve the last known-good
+            // snapshot if we have one, else fall back to whatever partial
+            // analysis we managed to produce.
             self.document_map
                 .get(uri)?
                 .last_good_analysis

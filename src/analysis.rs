@@ -348,6 +348,7 @@ fn extract_analysis(
     shared: &ast::SharedAst,
     modules: &[nativedsl::Module],
     ctx: &ast::ModuleContext,
+    loader_succeeded: bool,
 ) -> Analysis {
     let grammar_span = ctx
         .root_items
@@ -383,6 +384,7 @@ fn extract_analysis(
         references: Some(references),
         base_module,
         import_modules,
+        loader_succeeded,
     }
 }
 
@@ -587,7 +589,7 @@ pub fn analyze(text: &str, uri: &Url) -> Analysis {
             .is_ok()
         {
             let root = modules.last().expect("root module pushed on success");
-            return extract_analysis(&tokens, &shared, &modules, root.ctx());
+            return extract_analysis(&tokens, &shared, &modules, root.ctx(), true);
         }
     }
 
@@ -613,7 +615,7 @@ pub fn analyze(text: &str, uri: &Url) -> Analysis {
 
     // Extract analysis from this single module (no loaded children).
     let modules: Vec<nativedsl::Module> = Vec::new();
-    extract_analysis(&tokens, &shared, &modules, &module_ctx)
+    extract_analysis(&tokens, &shared, &modules, &module_ctx, false)
 }
 
 /// Run lex+parse and invoke `f` with the parsed AST. Returns `None` if either stage fails.

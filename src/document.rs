@@ -262,6 +262,13 @@ pub struct Analysis {
     /// Imported modules, paired with their let-binding name (e.g. `"helpers"` for
     /// `let helpers = import("helpers.tsg")`).
     pub import_modules: Vec<(String, ExternalModuleInfo)>,
+    /// Whether the full Loader pipeline ran successfully (parse + validate +
+    /// resolve + typecheck + lower + load all inherits/imports). When false,
+    /// `base_module` and `import_modules` reflect the manual-parse fallback
+    /// and may be empty even if the file textually has imports. Callers that
+    /// need cross-file info (rename, references, etc.) should prefer the
+    /// previous full-success snapshot via `Document.last_good_analysis`.
+    pub loader_succeeded: bool,
 }
 
 impl Analysis {

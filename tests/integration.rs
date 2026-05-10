@@ -4253,6 +4253,69 @@ async fn completion_offers_helper_rules_by_bare_name() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn cross_file_features_survive_unresolved_name_mid_edit() {
+    // After the file has been analyzed once successfully, introducing an
+    // unresolved name (which fails the Loader's resolve stage) shouldn't
+    // wipe out the cross-file `import_modules` info. Hover on a helper rule
+    // by bare name should still work.
+    let dir = tempfile::tempdir().unwrap();
+
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, "rule shared_rule { \"x\" }\n").unwrap();
+
+    let original = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"test\" }}\nrule program {{ shared_rule }}\n",
+        helpers_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &original).unwrap();
+
+    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
+    let mut service = init(&[(grammar_uri.clone(), &original)]).await;
+
+    // Force the first analysis to populate `last_good_analysis`.
+    let body_offset = original.find("{ shared_rule }").unwrap() + "{ ".len();
+    let rope = ropey::Rope::from_str(&original);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, body_offset as u32);
+    assert!(
+        hover_at(&mut service, grammar_uri.clone(), pos).await.is_some(),
+        "baseline hover should work"
+    );
+
+    // Edit the buffer to introduce an unresolved name AFTER the helper
+    // reference - resolve will fail but the helper reference is still valid.
+    let broken = original.replace(
+        "rule program { shared_rule }",
+        "rule program { shared_rule }\nrule other { undefined_name }",
+    );
+    lsp_notify::<DidChangeTextDocument>(
+        &mut service,
+        DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: grammar_uri.clone(),
+                version: 1,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: broken.clone(),
+            }],
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Hover should still resolve `shared_rule` to its helper definition,
+    // even though the document as a whole no longer passes the full pipeline.
+    let rope2 = ropey::Rope::from_str(&broken);
+    let pos2 = ts_grammar_ls::text::offset_to_position(&rope2, body_offset as u32);
+    assert_eq!(
+        hover_at(&mut service, grammar_uri, pos2).await,
+        make_hover("```\nrule shared_rule\n```"),
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn hover_helper_rule_via_bare_name() {
     let dir = tempfile::tempdir().unwrap();
 
