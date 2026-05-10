@@ -3820,8 +3820,8 @@ rule program { "x" }
         None
     );
 
-    // DSL keywords would produce a syntactically broken file when substituted in.
-    // Includes block keywords, builtin combinators, and `grammar_config`.
+    // DSL keywords are accepted as rename targets but auto-escaped: the
+    // resulting TextEdit substitutes `r#keyword` so the source stays valid.
     for kw in [
         "grammar",
         "rule",
@@ -3852,11 +3852,17 @@ rule program { "x" }
         "prec_right",
         "prec_dynamic",
     ] {
-        assert_eq!(
-            rename_at(&mut service, uri.clone(), pos, kw).await,
-            None,
-            "rename to keyword `{kw}` should be rejected"
-        );
+        let edit = rename_at(&mut service, uri.clone(), pos, kw)
+            .await
+            .unwrap_or_else(|| panic!("rename to keyword `{kw}` should auto-escape, not be rejected"));
+        let edits = &edit.changes.unwrap()[&uri];
+        for e in edits {
+            assert_eq!(
+                e.new_text,
+                format!("r#{kw}"),
+                "keyword target `{kw}` should produce `r#{kw}`"
+            );
+        }
     }
 }
 
@@ -4214,6 +4220,101 @@ async fn rename_includes_closed_workspace_dependents() {
     for (uri, edits) in &changes {
         assert_eq!(edits.len(), 1, "{uri} should have one edit");
         assert_eq!(edits[0].new_text, "bar");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw identifier syntax (`r#name`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn hover_raw_ident_rule_on_bare_name_part() {
+    // `r#let` defines a rule whose name is `let`. Hovering on the `let`
+    // part should show "rule let".
+    let grammar = "grammar { language: \"test\" }\nrule r#let { \"x\" }\n";
+    let mut service = init(&[(test_uri(), grammar)]).await;
+
+    // Cursor on `l` of `r#let`.
+    let l_offset = grammar.find("r#let").unwrap() + "r#".len();
+    let rope = ropey::Rope::from_str(grammar);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, l_offset as u32);
+
+    assert_eq!(
+        hover_at(&mut service, test_uri(), pos).await,
+        make_hover("```\nrule let\n```"),
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hover_raw_ident_rule_on_prefix_part() {
+    // Hovering on the `r` or `#` of `r#let` should still produce something
+    // useful, since the user clicked on the rule's name.
+    let grammar = "grammar { language: \"test\" }\nrule r#let { \"x\" }\n";
+    let mut service = init(&[(test_uri(), grammar)]).await;
+
+    let r_offset = grammar.find("r#let").unwrap();
+    let rope = ropey::Rope::from_str(grammar);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, r_offset as u32);
+
+    assert_eq!(
+        hover_at(&mut service, test_uri(), pos).await,
+        make_hover("```\nrule let\n```"),
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rename_raw_ident_rule_to_normal_name() {
+    // Rename `r#let` (rule whose name is the keyword `let`) to a non-keyword.
+    // The source should end up as just `bar`, not `r#bar` (since `bar` is
+    // a regular identifier, the `r#` is redundant and should be dropped).
+    let grammar = "grammar { language: \"test\" }\nrule r#let { \"x\" }\nrule program { r#let }\n";
+    let uri = test_uri();
+    let mut service = init(&[(uri.clone(), grammar)]).await;
+
+    let l_offset = (grammar.find("r#let").unwrap() + "r#".len()) as u32;
+    let rope = ropey::Rope::from_str(grammar);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, l_offset);
+
+    let edit = rename_at(&mut service, uri.clone(), pos, "bar")
+        .await
+        .expect("rename should succeed");
+    let edits = &edit.changes.unwrap()[&uri];
+
+    // Apply the edits to the source and verify it's clean.
+    let mut after = grammar.to_owned();
+    let mut sorted = edits.clone();
+    sorted.sort_by(|a, b| b.range.start.cmp(&a.range.start));
+    let after_rope = ropey::Rope::from_str(grammar);
+    for e in &sorted {
+        let s = ts_grammar_ls::text::position_to_offset(&after_rope, e.range.start).unwrap()
+            as usize;
+        let n = ts_grammar_ls::text::position_to_offset(&after_rope, e.range.end).unwrap() as usize;
+        after.replace_range(s..n, &e.new_text);
+    }
+    assert_eq!(
+        after,
+        "grammar { language: \"test\" }\nrule bar { \"x\" }\nrule program { bar }\n"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rename_normal_rule_to_keyword_uses_raw_syntax() {
+    // Renaming `foo` to `let` (a keyword) should produce `r#let` in source
+    // so the result is still valid DSL.
+    let grammar = "grammar { language: \"test\" }\nrule foo { \"x\" }\nrule program { foo }\n";
+    let uri = test_uri();
+    let mut service = init(&[(uri.clone(), grammar)]).await;
+
+    let foo_offset = grammar.find("rule foo").unwrap() + "rule ".len();
+    let rope = ropey::Rope::from_str(grammar);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, foo_offset as u32);
+
+    let edit = rename_at(&mut service, uri.clone(), pos, "let")
+        .await
+        .expect("rename should succeed (keyword target should auto-escape)");
+    let edits = &edit.changes.unwrap()[&uri];
+    for e in edits {
+        assert_eq!(e.new_text, "r#let", "keyword target needs r# escaping");
     }
 }
 

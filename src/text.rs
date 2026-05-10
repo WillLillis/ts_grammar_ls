@@ -44,11 +44,46 @@ pub fn position_to_offset(rope: &Rope, pos: Position) -> Option<u32> {
 /// The cursor is considered "in" a word if the byte at `offset` is an
 /// identifier char, OR if the byte at `offset - 1` is (i.e. the cursor sits
 /// just past the end of a word, which is a common LSP cursor position).
+///
+/// Raw identifiers (`r#name`) are recognized: a cursor on the leading `r`,
+/// `#`, or anywhere inside the bare-name part returns the bare name (i.e.
+/// `r#let` → `"let"`), matching what the lexer / AST extracted.
 #[must_use]
 pub fn word_at_offset(text: &str, offset: u32) -> Option<&str> {
     let bytes = text.as_bytes();
     let offset = offset as usize;
     let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let is_ident_start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
+
+    // Cursor on the `r` of `r#name` (preceded by a non-ident char or BOF).
+    if offset < bytes.len()
+        && bytes[offset] == b'r'
+        && offset + 2 < bytes.len()
+        && bytes[offset + 1] == b'#'
+        && is_ident_start(bytes[offset + 2])
+        && (offset == 0 || !is_ident_byte(bytes[offset - 1]))
+    {
+        let start = offset + 2;
+        let end = text[start..]
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .map_or(text.len(), |i| start + i);
+        return Some(&text[start..end]);
+    }
+    // Cursor on the `#` of `r#name`.
+    if offset < bytes.len()
+        && bytes[offset] == b'#'
+        && offset > 0
+        && bytes[offset - 1] == b'r'
+        && offset + 1 < bytes.len()
+        && is_ident_start(bytes[offset + 1])
+        && (offset < 2 || !is_ident_byte(bytes[offset - 2]))
+    {
+        let start = offset + 1;
+        let end = text[start..]
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .map_or(text.len(), |i| start + i);
+        return Some(&text[start..end]);
+    }
 
     let probe = if offset < bytes.len() && is_ident_byte(bytes[offset]) {
         offset

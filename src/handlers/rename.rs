@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
+use ropey::Rope;
 use tower_lsp::lsp_types::{
     PrepareRenameResponse, RenameParams, TextDocumentPositionParams, TextEdit, Url, WorkspaceEdit,
 };
+use tree_sitter_generate::nativedsl::ast;
 
 use crate::document::{BindingLocation, CursorContext, DefKind, ExternalModuleInfo, RefKind};
 use crate::server::Backend;
@@ -68,12 +70,10 @@ pub fn prepare_rename(
 pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit> {
     let uri = &params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
-    let new_name = &params.new_name;
-
-    // Validate the new name is a valid identifier.
-    if !is_valid_identifier(new_name) {
-        return None;
-    }
+    // Validate + normalize the new name. Accepts `foo`, `r#let`, or bare
+    // keywords; returns the bare identifier (auto-escape happens at edit
+    // emission time).
+    let new_name = parse_rename_target(&params.new_name)?;
 
     let analysis = backend.get_analysis(uri)?;
     let offset = text::position_to_offset(&analysis.rope, pos)?;
@@ -82,7 +82,7 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
     match analysis.cursor_context(offset, &analysis.source) {
         CursorContext::BaseRuleAccess => {
             let target_path = analysis.base_module.as_ref()?.path.clone();
-            rename_cross_file(backend, uri, &analysis, &target_path, word, new_name)
+            rename_cross_file(backend, uri, &analysis, &target_path, word, &new_name)
         }
         CursorContext::ImportModuleAccess { .. } => {
             let qualifier = text::qualified_access_module(
@@ -91,7 +91,7 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
                 offset,
             )?;
             let target_path = analysis.get_module(qualifier)?.path.clone();
-            rename_cross_file(backend, uri, &analysis, &target_path, word, new_name)
+            rename_cross_file(backend, uri, &analysis, &target_path, word, &new_name)
         }
         CursorContext::Identifier { scope } => match analysis.resolve_bare_name(word, scope) {
             Some(BindingLocation::External { module, .. }) => rename_cross_file(
@@ -100,9 +100,9 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
                 &analysis,
                 &module.path.clone(),
                 word,
-                new_name,
+                &new_name,
             ),
-            _ => rename_local(uri, &analysis, word, new_name, scope),
+            _ => rename_local(uri, &analysis, word, &new_name, scope),
         },
         CursorContext::GrammarConfigField => None,
     }
@@ -133,10 +133,11 @@ fn rename_cross_file(
     let mut external_edits = Vec::new();
     for def in &target_module.definitions {
         if def.name == word {
-            external_edits.push(TextEdit {
-                range: text::span_to_range(&target_module.rope, def.name_span),
-                new_text: new_name.into(),
-            });
+            external_edits.push(make_rename_edit(
+                &target_module.rope,
+                def.name_span,
+                new_name,
+            ));
         }
     }
     for reference in &target_module.references {
@@ -145,10 +146,11 @@ fn rename_cross_file(
             _ => false,
         };
         if name_matches {
-            external_edits.push(TextEdit {
-                range: text::span_to_range(&target_module.rope, reference.span),
-                new_text: new_name.into(),
-            });
+            external_edits.push(make_rename_edit(
+                &target_module.rope,
+                reference.span,
+                new_name,
+            ));
         }
     }
     if !external_edits.is_empty() {
@@ -270,10 +272,7 @@ fn add_cross_refs_in_file(
             _ => false,
         };
         if bound_to_target {
-            local_edits.push(TextEdit {
-                range: text::span_to_range(&analysis.rope, reference.span),
-                new_text: new_name.into(),
-            });
+            local_edits.push(make_rename_edit(&analysis.rope, reference.span, new_name));
             edited_starts.insert(reference.span.start);
         }
     }
@@ -306,10 +305,7 @@ fn rename_local(
     // binding.)
     for def in analysis.definitions.iter().flatten() {
         if def.name == word && def.kind.scope() == target.kind.scope() {
-            edits.push(TextEdit {
-                range: text::span_to_range(&analysis.rope, def.name_span),
-                new_text: new_name.into(),
-            });
+            edits.push(make_rename_edit(&analysis.rope, def.name_span, new_name));
         }
     }
 
@@ -338,10 +334,7 @@ fn rename_local(
             .binding_for(word, reference.scope)
             .is_some_and(|d| d.name_span == target_id)
         {
-            edits.push(TextEdit {
-                range: text::span_to_range(&analysis.rope, reference.span),
-                new_text: new_name.into(),
-            });
+            edits.push(make_rename_edit(&analysis.rope, reference.span, new_name));
         }
     }
 
@@ -357,18 +350,69 @@ fn rename_local(
     })
 }
 
-/// Check that `name` is a valid DSL identifier: it must lex as exactly one
-/// `Ident` token (with EOF following), which rules out empty strings, leading
-/// digits, whitespace, punctuation, and DSL keywords like `rule`/`let`/`macro`.
-fn is_valid_identifier(name: &str) -> bool {
+/// Validate `name` and return the *bare* identifier it represents.
+///
+/// Accepts:
+///   * a regular identifier (`foo`, `_x`),
+///   * a raw-prefixed identifier (`r#let` -> bare name `let`),
+///   * a bare keyword (`let` -> bare name `let`; the caller will auto-escape).
+///
+/// Rejects empty strings, leading digits, whitespace, and anything else that
+/// doesn't lex cleanly to a single ident-or-keyword token.
+fn parse_rename_target(name: &str) -> Option<String> {
     use tree_sitter_generate::nativedsl::lexer::{Lexer, TokenKind};
-    let Ok(tokens) = Lexer::new(name).tokenize() else {
-        return false;
+    let tokens = Lexer::new(name).tokenize().ok()?;
+    let [t, eof] = tokens.as_slice() else {
+        return None;
     };
-    matches!(
-        tokens.as_slice(),
-        [t, eof] if t.kind == TokenKind::Ident && eof.kind == TokenKind::Eof
-    )
+    if eof.kind != TokenKind::Eof {
+        return None;
+    }
+    if t.kind == TokenKind::Ident || t.kind.is_keyword() {
+        // Raw idents have their `r#` stripped by the lexer (span = bare name);
+        // keywords' span is their literal text. Either way, span is the bare
+        // name we want to emit (with auto-escape on output if needed).
+        Some(name[t.span.start as usize..t.span.end as usize].to_owned())
+    } else {
+        None
+    }
+}
+
+/// True if `name` lexes as a DSL keyword (so emitting it as a raw identifier
+/// in source requires an `r#` prefix).
+fn name_is_keyword(name: &str) -> bool {
+    use tree_sitter_generate::nativedsl::lexer::Lexer;
+    Lexer::new(name)
+        .tokenize()
+        .ok()
+        .and_then(|tokens| tokens.first().map(|t| t.kind.is_keyword()))
+        .unwrap_or(false)
+}
+
+/// Build a rename `TextEdit` for an identifier at `span` in `rope`.
+///
+/// Handles raw-identifier syntax: if the existing identifier is preceded by
+/// `r#` in source, the edit range is extended backward so the result drops
+/// the prefix when not needed. If `bare_new_name` is itself a DSL keyword,
+/// the `new_text` is prepended with `r#` so the output stays valid.
+fn make_rename_edit(rope: &Rope, span: ast::Span, bare_new_name: &str) -> TextEdit {
+    let has_raw_prefix = span.start >= 2
+        && rope.byte((span.start - 2) as usize) == b'r'
+        && rope.byte((span.start - 1) as usize) == b'#';
+    let start = if has_raw_prefix {
+        span.start - 2
+    } else {
+        span.start
+    };
+    let new_text = if name_is_keyword(bare_new_name) {
+        format!("r#{bare_new_name}")
+    } else {
+        bare_new_name.to_owned()
+    };
+    TextEdit {
+        range: text::span_to_range(rope, ast::Span::new(start, span.end)),
+        new_text,
+    }
 }
 
 #[cfg(test)]
@@ -376,21 +420,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn valid_identifiers() {
-        assert!(is_valid_identifier("foo"));
-        assert!(is_valid_identifier("_bar"));
-        assert!(is_valid_identifier("foo_bar"));
-        assert!(is_valid_identifier("x1"));
-        assert!(is_valid_identifier("_"));
+    fn parse_rename_target_accepts_plain_idents() {
+        assert_eq!(parse_rename_target("foo"), Some("foo".into()));
+        assert_eq!(parse_rename_target("_bar"), Some("_bar".into()));
+        assert_eq!(parse_rename_target("foo_bar"), Some("foo_bar".into()));
+        assert_eq!(parse_rename_target("x1"), Some("x1".into()));
+        assert_eq!(parse_rename_target("_"), Some("_".into()));
     }
 
     #[test]
-    fn invalid_identifiers() {
-        assert!(!is_valid_identifier(""));
-        assert!(!is_valid_identifier("1foo"));
-        assert!(!is_valid_identifier("foo bar"));
-        assert!(!is_valid_identifier("foo-bar"));
-        assert!(!is_valid_identifier("foo::bar"));
-        assert!(!is_valid_identifier("foo.bar"));
+    fn parse_rename_target_strips_raw_prefix() {
+        // Lexer skips `r#` and the span covers just the bare name.
+        assert_eq!(parse_rename_target("r#foo"), Some("foo".into()));
+        assert_eq!(parse_rename_target("r#let"), Some("let".into()));
+    }
+
+    #[test]
+    fn parse_rename_target_accepts_keywords_for_auto_escape() {
+        // The caller will prefix with `r#` at edit emission time.
+        assert_eq!(parse_rename_target("let"), Some("let".into()));
+        assert_eq!(parse_rename_target("rule"), Some("rule".into()));
+        assert_eq!(parse_rename_target("macro"), Some("macro".into()));
+    }
+
+    #[test]
+    fn parse_rename_target_rejects_invalid() {
+        assert_eq!(parse_rename_target(""), None);
+        assert_eq!(parse_rename_target("1foo"), None);
+        assert_eq!(parse_rename_target("foo bar"), None);
+        assert_eq!(parse_rename_target("foo-bar"), None);
+        assert_eq!(parse_rename_target("foo::bar"), None);
+        assert_eq!(parse_rename_target("foo.bar"), None);
     }
 }
