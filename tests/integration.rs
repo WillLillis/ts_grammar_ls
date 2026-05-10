@@ -4218,6 +4218,152 @@ async fn rename_includes_closed_workspace_dependents() {
 }
 
 // ---------------------------------------------------------------------------
+// Helper-file rules (bare-name access from importer)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn goto_def_helper_rule_via_bare_name() {
+    // A rule declared in an imported helper is reachable by bare name from
+    // the importing grammar. Goto-def should jump into the helper.
+    let dir = tempfile::tempdir().unwrap();
+
+    let helpers_text = "rule shared_rule { \"x\" }\n";
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, helpers_text).unwrap();
+
+    let grammar_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"test\" }}\nrule program {{ shared_rule }}\n",
+        helpers_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &grammar_text).unwrap();
+
+    let helpers_uri = Url::from_file_path(&helpers_path).unwrap();
+    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &grammar_text)]).await;
+
+    // Cursor on bare `shared_rule` in grammar.
+    let body_offset = grammar_text.find("{ shared_rule }").unwrap() + "{ ".len();
+    let rope = ropey::Rope::from_str(&grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, body_offset as u32);
+
+    assert_eq!(
+        goto_def_at(&mut service, grammar_uri, pos).await,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: helpers_uri,
+            range: Range::new(Position::new(0, 5), Position::new(0, 16)),
+        }))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn references_helper_rule_via_bare_name() {
+    // Two grammars import the same helper, both reference its rule by bare
+    // name. References from one grammar's call site should find the helper's
+    // def + both grammars' call sites.
+    let dir = tempfile::tempdir().unwrap();
+
+    let helpers_text = "rule shared_rule { \"x\" }\n";
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, helpers_text).unwrap();
+
+    let grammar_a_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"a\" }}\nrule program {{ shared_rule }}\n",
+        helpers_path.display()
+    );
+    let grammar_a_path = dir.path().join("grammar_a.tsg");
+    std::fs::write(&grammar_a_path, &grammar_a_text).unwrap();
+
+    let grammar_b_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"b\" }}\nrule program {{ shared_rule }}\n",
+        helpers_path.display()
+    );
+    let grammar_b_path = dir.path().join("grammar_b.tsg");
+    std::fs::write(&grammar_b_path, &grammar_b_text).unwrap();
+
+    let helpers_uri = Url::from_file_path(&helpers_path).unwrap();
+    let grammar_a_uri = Url::from_file_path(&grammar_a_path).unwrap();
+    let grammar_b_uri = Url::from_file_path(&grammar_b_path).unwrap();
+
+    let mut service = init(&[
+        (grammar_a_uri.clone(), &grammar_a_text),
+        (grammar_b_uri.clone(), &grammar_b_text),
+    ])
+    .await;
+
+    let _ = hover_at(&mut service, grammar_a_uri.clone(), Position::new(2, 17)).await;
+    let _ = hover_at(&mut service, grammar_b_uri.clone(), Position::new(2, 17)).await;
+
+    let offset = grammar_a_text.find("{ shared_rule }").unwrap() + "{ ".len();
+    let rope = ropey::Rope::from_str(&grammar_a_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    let mut result = references_at(&mut service, grammar_a_uri.clone(), pos, true)
+        .await
+        .expect("references should succeed");
+    result.sort_by(|x, y| x.uri.as_str().cmp(y.uri.as_str()));
+
+    let uris: Vec<&Url> = result.iter().map(|l| &l.uri).collect();
+    assert!(
+        uris.contains(&&helpers_uri) && uris.contains(&&grammar_a_uri) && uris.contains(&&grammar_b_uri),
+        "refs should span helper + both importers, got {uris:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rename_helper_rule_via_bare_name() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let helpers_text = "rule shared_rule { \"x\" }\n";
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, helpers_text).unwrap();
+
+    let grammar_a_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"a\" }}\nrule program {{ shared_rule }}\n",
+        helpers_path.display()
+    );
+    let grammar_a_path = dir.path().join("grammar_a.tsg");
+    std::fs::write(&grammar_a_path, &grammar_a_text).unwrap();
+
+    let grammar_b_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"b\" }}\nrule program {{ shared_rule }}\n",
+        helpers_path.display()
+    );
+    let grammar_b_path = dir.path().join("grammar_b.tsg");
+    std::fs::write(&grammar_b_path, &grammar_b_text).unwrap();
+
+    let helpers_uri = Url::from_file_path(&helpers_path).unwrap();
+    let grammar_a_uri = Url::from_file_path(&grammar_a_path).unwrap();
+    let grammar_b_uri = Url::from_file_path(&grammar_b_path).unwrap();
+
+    let mut service = init(&[
+        (grammar_a_uri.clone(), &grammar_a_text),
+        (grammar_b_uri.clone(), &grammar_b_text),
+    ])
+    .await;
+
+    let _ = hover_at(&mut service, grammar_a_uri.clone(), Position::new(2, 17)).await;
+    let _ = hover_at(&mut service, grammar_b_uri.clone(), Position::new(2, 17)).await;
+
+    let offset = grammar_a_text.find("{ shared_rule }").unwrap() + "{ ".len();
+    let rope = ropey::Rope::from_str(&grammar_a_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    let edit = rename_at(&mut service, grammar_a_uri.clone(), pos, "renamed")
+        .await
+        .expect("rename should succeed");
+    let changes = edit.changes.expect("changes present");
+    let mut keys: Vec<&Url> = changes.keys().collect();
+    keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    assert_eq!(
+        keys,
+        vec![&grammar_a_uri, &grammar_b_uri, &helpers_uri],
+        "rename should span helper + both importers"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // `external` decls
 // ---------------------------------------------------------------------------
 

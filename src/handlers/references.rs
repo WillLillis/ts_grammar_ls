@@ -1,6 +1,6 @@
 use tower_lsp::lsp_types::{Location, ReferenceParams, Url};
 
-use crate::document::{CursorContext, RefKind};
+use crate::document::{BindingLocation, CursorContext, RefKind};
 use crate::server::Backend;
 use crate::text;
 
@@ -36,15 +36,129 @@ pub fn references(backend: &Backend, params: &ReferenceParams) -> Option<Vec<Loc
                 include_declaration,
             )
         }
-        CursorContext::Identifier { scope } => local_references(
-            &analysis,
-            uri,
-            &analysis.source,
-            &analysis.rope,
-            &word,
-            scope,
-            include_declaration,
-        ),
+        CursorContext::Identifier { scope } => match analysis.resolve_bare_name(&word, scope) {
+            Some(BindingLocation::External { module, .. }) => bare_name_external_references(
+                backend,
+                &analysis,
+                uri,
+                &module.path.clone(),
+                &word,
+                include_declaration,
+            ),
+            _ => local_references(
+                &analysis,
+                uri,
+                &analysis.source,
+                &analysis.rope,
+                &word,
+                scope,
+                include_declaration,
+            ),
+        },
+    }
+}
+
+/// References for a bare name (rule/macro/let) that resolves to a definition
+/// in an external module - typically a rule defined in a helper that the
+/// importer reaches by bare name. Includes the helper's own def + internal
+/// refs and every open dependent's bare-name uses that bind to this target.
+fn bare_name_external_references(
+    backend: &Backend,
+    cursor_analysis: &crate::document::Analysis,
+    cursor_uri: &Url,
+    target_path: &std::path::Path,
+    word: &str,
+    include_declaration: bool,
+) -> Option<Vec<Location>> {
+    let mut locations = Vec::new();
+
+    // Helper file: declaration + internal references.
+    let target_module = cursor_analysis
+        .base_module
+        .as_ref()
+        .filter(|m| m.path == target_path)
+        .or_else(|| {
+            cursor_analysis
+                .import_modules
+                .iter()
+                .map(|(_, m)| m)
+                .find(|m| m.path == target_path)
+        })?;
+    if let Ok(module_uri) = Url::from_file_path(&target_module.path) {
+        if include_declaration
+            && let Some(def) = target_module
+                .definitions
+                .iter()
+                .find(|d| d.name == word)
+        {
+            locations.push(Location {
+                uri: module_uri.clone(),
+                range: text::span_to_range(&target_module.rope, def.name_span),
+            });
+        }
+        for reference in &target_module.references {
+            if matches!(
+                &reference.kind,
+                RefKind::Rule(name) | RefKind::Variable(name) if name == word
+            ) {
+                locations.push(Location {
+                    uri: module_uri.clone(),
+                    range: text::span_to_range(&target_module.rope, reference.span),
+                });
+            }
+        }
+    }
+
+    // Cursor file + open dependents.
+    add_bare_name_refs_in_file(&mut locations, cursor_uri, cursor_analysis, target_path, word);
+    let dep_uris: Vec<Url> = backend
+        .dependents
+        .get(target_path)
+        .map(|set| set.iter().filter(|u| *u != cursor_uri).cloned().collect())
+        .unwrap_or_default();
+    for dep_uri in dep_uris {
+        if let Some(dep_analysis) = backend.analysis_for_uri(&dep_uri) {
+            add_bare_name_refs_in_file(
+                &mut locations,
+                &dep_uri,
+                &dep_analysis,
+                target_path,
+                word,
+            );
+        }
+    }
+
+    (!locations.is_empty()).then_some(locations)
+}
+
+/// Append locations of bare-name references in `analysis` that bind to the
+/// definition at `target_path`. Uses `resolve_bare_name` per-reference so
+/// e.g. a local parameter shadowing the helper rule isn't mistakenly
+/// matched.
+fn add_bare_name_refs_in_file(
+    out: &mut Vec<Location>,
+    uri: &Url,
+    analysis: &crate::document::Analysis,
+    target_path: &std::path::Path,
+    word: &str,
+) {
+    for reference in analysis.references.iter().flatten() {
+        let name_matches = matches!(
+            &reference.kind,
+            RefKind::Rule(name) | RefKind::Variable(name) if name == word,
+        );
+        if !name_matches {
+            continue;
+        }
+        if matches!(
+            analysis.resolve_bare_name(word, reference.scope),
+            Some(BindingLocation::External { module, .. }) if module.path == target_path
+        ) {
+            out.push(Location {
+                uri: uri.clone(),
+                range: text::span_to_range(&analysis.rope, reference.span),
+            });
+        }
     }
 }
 

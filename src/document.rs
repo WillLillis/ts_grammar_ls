@@ -175,6 +175,37 @@ impl Reference {
     }
 }
 
+/// Where a bare-name lookup landed. Distinguishes "in this file" (so the
+/// caller can use `analysis.rope` and the current URI) from "in some external
+/// module" (where the caller needs the module's path + rope).
+#[derive(Clone, Copy)]
+pub enum BindingLocation<'a> {
+    Local(&'a Definition),
+    External {
+        module: &'a ExternalModuleInfo,
+        def: &'a Definition,
+    },
+}
+
+/// Walk an external module recursively for a top-level definition with
+/// `name`, returning the owning module and the def. Used by
+/// `Analysis::resolve_bare_name`.
+#[must_use]
+fn find_in_module<'a>(
+    info: &'a ExternalModuleInfo,
+    name: &str,
+) -> Option<(&'a ExternalModuleInfo, &'a Definition)> {
+    if let Some(def) = info.definitions.iter().find(|d| d.name == name) {
+        return Some((info, def));
+    }
+    for (_, sub) in &info.import_modules {
+        if let Some(found) = find_in_module(sub, name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Cached info about an external module (inherited or imported), for IDE features.
 #[derive(Clone)]
 pub struct ExternalModuleInfo {
@@ -273,6 +304,33 @@ impl Analysis {
                 Some(s) => (0u8, s.end - s.start),
                 None => (1, 0),
             })
+    }
+
+    /// Resolve a bare `name` from `scope` to either a local binding or an
+    /// external module's definition. Local lookup takes precedence (lexical
+    /// scoping); on miss we walk inherited base + transitive imports for a
+    /// matching def, since helper rules and externals are reachable from the
+    /// importer by bare name.
+    #[must_use]
+    pub fn resolve_bare_name(
+        &self,
+        name: &str,
+        scope: Option<Span>,
+    ) -> Option<BindingLocation<'_>> {
+        if let Some(def) = self.binding_for(name, scope) {
+            return Some(BindingLocation::Local(def));
+        }
+        if let Some(base) = &self.base_module
+            && let Some((module, def)) = find_in_module(base, name)
+        {
+            return Some(BindingLocation::External { module, def });
+        }
+        for (_, info) in &self.import_modules {
+            if let Some((module, def)) = find_in_module(info, name) {
+                return Some(BindingLocation::External { module, def });
+            }
+        }
+        None
     }
 
     /// Walk a qualified-access chain to the leaf module. For `a::b::c`, given

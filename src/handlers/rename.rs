@@ -4,7 +4,7 @@ use tower_lsp::lsp_types::{
     PrepareRenameResponse, RenameParams, TextDocumentPositionParams, TextEdit, Url, WorkspaceEdit,
 };
 
-use crate::document::{CursorContext, DefKind, ExternalModuleInfo, RefKind};
+use crate::document::{BindingLocation, CursorContext, DefKind, ExternalModuleInfo, RefKind};
 use crate::server::Backend;
 use crate::text;
 
@@ -93,7 +93,17 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
             let target_path = analysis.get_module(qualifier)?.path.clone();
             rename_cross_file(backend, uri, &analysis, &target_path, word, new_name)
         }
-        CursorContext::Identifier { scope } => rename_local(uri, &analysis, word, new_name, scope),
+        CursorContext::Identifier { scope } => match analysis.resolve_bare_name(word, scope) {
+            Some(BindingLocation::External { module, .. }) => rename_cross_file(
+                backend,
+                uri,
+                &analysis,
+                &module.path.clone(),
+                word,
+                new_name,
+            ),
+            _ => rename_local(uri, &analysis, word, new_name, scope),
+        },
         CursorContext::GrammarConfigField => None,
     }
 }
@@ -232,8 +242,16 @@ fn add_cross_refs_in_file(
     word: &str,
     new_name: &str,
 ) {
+    // A `QualifiedCall` like `h::foo` produces two overlapping references at
+    // the `foo` span: an inner `Variable("foo")` (the resolved Ident) and an
+    // outer `ImportedMember`. Both can match the target binding. Track which
+    // spans we've already emitted so we don't double-edit.
     let mut local_edits = Vec::new();
+    let mut edited_starts = rustc_hash::FxHashSet::default();
     for reference in analysis.references.iter().flatten() {
+        if edited_starts.contains(&reference.span.start) {
+            continue;
+        }
         let bound_to_target = match &reference.kind {
             RefKind::BaseRule(name) if name == word => analysis
                 .base_module
@@ -242,6 +260,13 @@ fn add_cross_refs_in_file(
             RefKind::ImportedMember { path, member } if member == word => analysis
                 .resolve_import_chain(path)
                 .is_some_and(|m| m.path == target_path),
+            // Bare-name reference (e.g. `shared_rule` in the importer's body)
+            // - resolve through the importer's analysis and check the binding
+            // lands in the target module.
+            RefKind::Rule(name) | RefKind::Variable(name) if name == word => matches!(
+                analysis.resolve_bare_name(word, reference.scope),
+                Some(BindingLocation::External { module, .. }) if module.path == target_path
+            ),
             _ => false,
         };
         if bound_to_target {
@@ -249,6 +274,7 @@ fn add_cross_refs_in_file(
                 range: text::span_to_range(&analysis.rope, reference.span),
                 new_text: new_name.into(),
             });
+            edited_starts.insert(reference.span.start);
         }
     }
     if !local_edits.is_empty() {

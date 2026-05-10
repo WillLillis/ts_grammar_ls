@@ -1,7 +1,7 @@
 use tower_lsp::lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location, Range, Url};
 
 use crate::analysis;
-use crate::document::{Analysis, DefKind, RefKind};
+use crate::document::{Analysis, BindingLocation, DefKind, RefKind};
 use crate::server::Backend;
 use crate::text;
 
@@ -23,21 +23,8 @@ pub fn goto_definition(
                 return goto_base_definition(&analysis, name);
             }
             RefKind::Rule(name) | RefKind::Variable(name) => {
-                let ref_scope = reference.scope;
-                // Try scoped definitions first (parameters), then top-level, then base.
-                if let Some(def) = analysis
-                    .definitions
-                    .iter()
-                    .flatten()
-                    .find(|d| d.name == *name && d.kind.visible_from(ref_scope))
-                {
-                    let range = text::span_to_range(&analysis.rope, def.name_span);
-                    return Some(GotoDefinitionResponse::Scalar(Location {
-                        uri: uri.clone(),
-                        range,
-                    }));
-                }
-                return goto_base_definition(&analysis, name);
+                return resolve_bare_name_to_location(&analysis, name, reference.scope, uri)
+                    .map(GotoDefinitionResponse::Scalar);
             }
             RefKind::ObjectField { field, object } => {
                 return goto_object_field(uri, &analysis.source, object, field);
@@ -86,6 +73,27 @@ fn goto_base_definition(analysis: &Analysis, name: &str) -> Option<GotoDefinitio
         uri: base_uri,
         range,
     }))
+}
+
+/// Resolve a bare `name` (rule or variable) at `scope` to a `Location`
+/// regardless of whether it binds locally or in an external module.
+/// Helper rules and externals are reachable from the importer by bare name.
+fn resolve_bare_name_to_location(
+    analysis: &Analysis,
+    name: &str,
+    scope: Option<tree_sitter_generate::nativedsl::ast::Span>,
+    current_uri: &Url,
+) -> Option<Location> {
+    match analysis.resolve_bare_name(name, scope)? {
+        BindingLocation::Local(def) => Some(Location {
+            uri: current_uri.clone(),
+            range: text::span_to_range(&analysis.rope, def.name_span),
+        }),
+        BindingLocation::External { module, def } => Some(Location {
+            uri: Url::from_file_path(&module.path).ok()?,
+            range: text::span_to_range(&module.rope, def.name_span),
+        }),
+    }
 }
 
 /// Find the definition of an object field (e.g. `CALL` in `PREC.CALL`).
