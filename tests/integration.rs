@@ -3931,6 +3931,135 @@ async fn dependent_diagnostics_republish_on_helper_change() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn rename_imported_member_edits_all_open_dependents() {
+    // Two grammars (grammar_a, grammar_b) both import the same helpers file
+    // and both call helpers::foo. Renaming foo from grammar_a should produce
+    // edits in helpers, grammar_a, AND grammar_b in a single WorkspaceEdit.
+    let dir = tempfile::tempdir().unwrap();
+
+    let helpers_text = "macro foo(x: rule_t) rule_t { x }\n";
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, helpers_text).unwrap();
+
+    let grammar_a_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"a\" }}\nrule program {{ h::foo(\"x\") }}\n",
+        helpers_path.display()
+    );
+    let grammar_a_path = dir.path().join("grammar_a.tsg");
+    std::fs::write(&grammar_a_path, &grammar_a_text).unwrap();
+
+    let grammar_b_text = format!(
+        "let other = import(\"{}\")\ngrammar {{ language: \"b\" }}\nrule program {{ other::foo(\"y\") }}\n",
+        helpers_path.display()
+    );
+    let grammar_b_path = dir.path().join("grammar_b.tsg");
+    std::fs::write(&grammar_b_path, &grammar_b_text).unwrap();
+
+    let helpers_uri = Url::from_file_path(&helpers_path).unwrap();
+    let grammar_a_uri = Url::from_file_path(&grammar_a_path).unwrap();
+    let grammar_b_uri = Url::from_file_path(&grammar_b_path).unwrap();
+
+    let mut service = init(&[
+        (grammar_a_uri.clone(), &grammar_a_text),
+        (grammar_b_uri.clone(), &grammar_b_text),
+    ])
+    .await;
+
+    // Force analysis on both so the dependents index has both URIs.
+    let _ = hover_at(&mut service, grammar_a_uri.clone(), Position::new(2, 17)).await;
+    let _ = hover_at(&mut service, grammar_b_uri.clone(), Position::new(2, 21)).await;
+
+    // Cursor on `foo` in grammar_a's `h::foo("x")`.
+    let offset = grammar_a_text.find("h::foo").unwrap() + "h::".len();
+    let rope = ropey::Rope::from_str(&grammar_a_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    let edit = rename_at(&mut service, grammar_a_uri.clone(), pos, "bar")
+        .await
+        .expect("rename should succeed");
+    let changes = edit.changes.expect("changes present");
+
+    // Three files edited: helpers (def site), grammar_a (h::foo call),
+    // grammar_b (other::foo call).
+    let mut keys: Vec<&Url> = changes.keys().collect();
+    keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    assert_eq!(
+        keys,
+        vec![&grammar_a_uri, &grammar_b_uri, &helpers_uri],
+        "expected edits in all three files; got {:?}",
+        changes.keys().collect::<Vec<_>>()
+    );
+
+    // Each file should have exactly one edit (one def or one call site),
+    // all renaming to "bar".
+    for (uri, edits) in &changes {
+        assert_eq!(edits.len(), 1, "file {uri} should have one edit");
+        assert_eq!(edits[0].new_text, "bar");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rename_does_not_touch_unrelated_imports_with_same_name() {
+    // grammar_a imports helpers (with foo). grammar_b imports a DIFFERENT
+    // module that also happens to expose a `foo`. Renaming helpers::foo from
+    // grammar_a must not touch grammar_b's other_foo::foo at all (they are
+    // different bindings even though the names match).
+    let dir = tempfile::tempdir().unwrap();
+
+    let helpers_text = "macro foo(x: rule_t) rule_t { x }\n";
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, helpers_text).unwrap();
+
+    let other_text = "macro foo(x: rule_t) rule_t { x }\n";
+    let other_path = dir.path().join("other.tsg");
+    std::fs::write(&other_path, other_text).unwrap();
+
+    let grammar_a_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"a\" }}\nrule program {{ h::foo(\"x\") }}\n",
+        helpers_path.display()
+    );
+    let grammar_a_path = dir.path().join("grammar_a.tsg");
+    std::fs::write(&grammar_a_path, &grammar_a_text).unwrap();
+
+    let grammar_b_text = format!(
+        "let o = import(\"{}\")\ngrammar {{ language: \"b\" }}\nrule program {{ o::foo(\"y\") }}\n",
+        other_path.display()
+    );
+    let grammar_b_path = dir.path().join("grammar_b.tsg");
+    std::fs::write(&grammar_b_path, &grammar_b_text).unwrap();
+
+    let helpers_uri = Url::from_file_path(&helpers_path).unwrap();
+    let grammar_a_uri = Url::from_file_path(&grammar_a_path).unwrap();
+    let grammar_b_uri = Url::from_file_path(&grammar_b_path).unwrap();
+
+    let mut service = init(&[
+        (grammar_a_uri.clone(), &grammar_a_text),
+        (grammar_b_uri.clone(), &grammar_b_text),
+    ])
+    .await;
+
+    let _ = hover_at(&mut service, grammar_a_uri.clone(), Position::new(2, 17)).await;
+    let _ = hover_at(&mut service, grammar_b_uri.clone(), Position::new(2, 17)).await;
+
+    let offset = grammar_a_text.find("h::foo").unwrap() + "h::".len();
+    let rope = ropey::Rope::from_str(&grammar_a_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    let edit = rename_at(&mut service, grammar_a_uri.clone(), pos, "bar")
+        .await
+        .expect("rename should succeed");
+    let changes = edit.changes.expect("changes present");
+
+    let mut keys: Vec<&Url> = changes.keys().collect();
+    keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    assert_eq!(
+        keys,
+        vec![&grammar_a_uri, &helpers_uri],
+        "grammar_b uses a different module's foo and must not be edited"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Cross-file rename tests
 // ---------------------------------------------------------------------------
