@@ -505,11 +505,9 @@ async fn document_symbols_lists_all_definitions() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn document_symbols_exclude_object_keys() {
-    // Object literal keys are kept as internal definitions (for field-access
-    // completion, goto-def) but are not surfaced as outline symbols: they are
-    // value literal members, not schema definitions. Matches how mainstream
-    // code LSPs (tsserver, rust-analyzer, gopls, pylsp) treat object literals.
+async fn document_symbols_nest_object_keys_under_let() {
+    // Object literal keys are surfaced as `Field` children of their owning
+    // `Let` binding, so the outline view lets users navigate to e.g. PREC.ADD.
     let grammar = r#"
 grammar { language: "test" }
 let PREC = { ADD: 1, MUL: 2 }
@@ -540,7 +538,28 @@ rule program { "x" }
             selection_range: Range::new(Position::new(2, 4), Position::new(2, 8)),
             tags: None,
             deprecated: None,
-            children: None,
+            children: Some(vec![
+                DocumentSymbol {
+                    name: "ADD".into(),
+                    kind: SymbolKind::FIELD,
+                    detail: None,
+                    range: Range::new(Position::new(2, 13), Position::new(2, 16)),
+                    selection_range: Range::new(Position::new(2, 13), Position::new(2, 16)),
+                    tags: None,
+                    deprecated: None,
+                    children: None,
+                },
+                DocumentSymbol {
+                    name: "MUL".into(),
+                    kind: SymbolKind::FIELD,
+                    detail: None,
+                    range: Range::new(Position::new(2, 21), Position::new(2, 24)),
+                    selection_range: Range::new(Position::new(2, 21), Position::new(2, 24)),
+                    tags: None,
+                    deprecated: None,
+                    children: None,
+                },
+            ]),
         },
         DocumentSymbol {
             name: "program".into(),

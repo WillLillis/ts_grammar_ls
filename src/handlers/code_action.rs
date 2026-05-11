@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
     TextEdit, WorkspaceEdit,
 };
-use tree_sitter_generate::nativedsl::lexer::{Lexer, TokenKind};
+use tree_sitter_generate::nativedsl::lexer::TokenKind;
 
 use crate::server::Backend;
 use crate::text;
@@ -16,7 +16,6 @@ use crate::text;
 #[must_use]
 pub fn code_action(backend: &Backend, params: &CodeActionParams) -> Option<CodeActionResponse> {
     let uri = &params.text_document.uri;
-    let doc = backend.document_map.get(uri)?;
 
     // If the client filtered by `only`, skip if it didn't ask for refactors.
     if let Some(kinds) = &params.context.only
@@ -25,11 +24,11 @@ pub fn code_action(backend: &Backend, params: &CodeActionParams) -> Option<CodeA
         return Some(Vec::new());
     }
 
-    let start_offset = text::position_to_offset(&doc.rope, params.range.start)?;
+    let (analysis, start_offset) = backend.resolve_position(uri, params.range.start)?;
 
-    // Re-lex to find a StringLit token covering the cursor. Cheap enough for
-    // code-action invocations (not on every keystroke).
-    let tokens = Lexer::new(&doc.text).tokenize().ok()?;
+    // Find a StringLit token covering the cursor in the cached tokens. If lex
+    // never produced tokens (very early state), bail.
+    let tokens = analysis.tokens.as_deref()?;
     let tok = tokens
         .iter()
         .find(|t| t.span.start <= start_offset && start_offset < t.span.end)?;
@@ -43,8 +42,8 @@ pub fn code_action(backend: &Backend, params: &CodeActionParams) -> Option<CodeA
     // that's `\\` and `\"`. Semantic escapes (`\n`, `\t`, `\r`, `\0`) change
     // meaning in a raw string (they'd become literal two-char sequences), so
     // we skip those to avoid silent semantic changes.
-    let raw_body = doc
-        .text
+    let raw_body = analysis
+        .source
         .get((span.start + 1) as usize..(span.end - 1) as usize)?;
     if !has_only_raw_safe_escapes(raw_body) {
         return None;
@@ -63,8 +62,7 @@ pub fn code_action(backend: &Backend, params: &CodeActionParams) -> Option<CodeA
         new_text.push('#');
     }
 
-    let edit_range = text::span_to_range(&doc.rope, span);
-    drop(doc);
+    let edit_range = text::span_to_range(&analysis.rope, span);
 
     let edits = std::collections::HashMap::from([(
         uri.clone(),
