@@ -19,8 +19,7 @@ pub fn prepare_rename(
     let uri = &params.text_document.uri;
     let pos = params.position;
 
-    let analysis = backend.get_analysis(uri)?;
-    let offset = text::position_to_offset(&analysis.rope, pos)?;
+    let (analysis, offset) = backend.resolve_position(uri, pos)?;
     let word = text::word_at_offset(&analysis.source, offset)?;
 
     match analysis.cursor_context(offset, &analysis.source)? {
@@ -75,8 +74,7 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
     // emission time).
     let new_name = parse_rename_target(&params.new_name)?;
 
-    let analysis = backend.get_analysis(uri)?;
-    let offset = text::position_to_offset(&analysis.rope, pos)?;
+    let (analysis, offset) = backend.resolve_position(uri, pos)?;
     let word = text::word_at_offset(&analysis.source, offset)?;
 
     match analysis.cursor_context(offset, &analysis.source)? {

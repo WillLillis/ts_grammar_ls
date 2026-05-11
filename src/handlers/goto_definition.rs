@@ -13,8 +13,7 @@ pub fn goto_definition(
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
 
-    let analysis = backend.get_analysis(uri)?;
-    let offset = text::position_to_offset(&analysis.rope, pos)?;
+    let (analysis, offset) = backend.resolve_position(uri, pos)?;
 
     // Check if cursor is on a known reference from the resolved AST.
     if let Some(reference) = analysis.reference_at(offset) {

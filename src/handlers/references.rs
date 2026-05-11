@@ -10,8 +10,7 @@ pub fn references(backend: &Backend, params: &ReferenceParams) -> Option<Vec<Loc
     let pos = params.text_document_position.position;
     let include_declaration = params.context.include_declaration;
 
-    let analysis = backend.get_analysis(uri)?;
-    let offset = text::position_to_offset(&analysis.rope, pos)?;
+    let (analysis, offset) = backend.resolve_position(uri, pos)?;
     let word = text::word_at_offset(&analysis.source, offset)?.to_owned();
 
     match analysis.cursor_context(offset, &analysis.source)? {

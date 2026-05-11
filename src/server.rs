@@ -160,6 +160,21 @@ impl Backend {
         }
     }
 
+    /// Get the analysis for `uri` and convert `pos` to a byte offset within
+    /// it, in one go. Both must succeed; if either fails, this returns
+    /// `None`. Saves repeating the `get_analysis` + `position_to_offset`
+    /// preamble in every position-based handler.
+    #[must_use]
+    pub fn resolve_position(
+        &self,
+        uri: &tower_lsp::lsp_types::Url,
+        pos: tower_lsp::lsp_types::Position,
+    ) -> Option<(std::sync::Arc<crate::document::Analysis>, u32)> {
+        let analysis = self.get_analysis(uri)?;
+        let offset = crate::text::position_to_offset(&analysis.rope, pos)?;
+        Some((analysis, offset))
+    }
+
     /// Resolve `uri` to an analysis regardless of open/closed status. For
     /// open files this is `get_analysis` (with all its caching/fallback
     /// behavior); for closed files we read from disk and run the pipeline

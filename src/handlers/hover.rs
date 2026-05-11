@@ -11,8 +11,7 @@ pub fn hover(backend: &Backend, params: &HoverParams) -> Option<Hover> {
     let uri = &params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
 
-    let analysis = backend.get_analysis(uri)?;
-    let offset = text::position_to_offset(&analysis.rope, pos)?;
+    let (analysis, offset) = backend.resolve_position(uri, pos)?;
     let word = text::word_at_offset(&analysis.source, offset)?.to_owned();
 
     match analysis.cursor_context(offset, &analysis.source)? {
