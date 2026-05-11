@@ -349,7 +349,8 @@ fn extract_references(
 /// since externals only exist after their own loader succeeded).
 enum ExtractKind<'a> {
     Root {
-        tokens: &'a [nativedsl::lexer::Token],
+        /// Tokens are stored on the resulting `Module` (moved, not copied).
+        tokens: Vec<nativedsl::lexer::Token>,
         loader_succeeded: bool,
         /// Resolved type environment, when the loader pipeline succeeded.
         /// `None` on the manual-parse fallback path - hover will then show
@@ -406,8 +407,8 @@ fn extract_module(
             loader_succeeded,
             ..
         } => {
-            extract_builtin_references(tokens, grammar_span, &mut references);
-            (Some(tokens.to_vec()), loader_succeeded)
+            extract_builtin_references(&tokens, grammar_span, &mut references);
+            (Some(tokens), loader_succeeded)
         }
         ExtractKind::External { .. } => (None, true),
     };
@@ -586,15 +587,14 @@ pub fn extract_deps(text: &str, file_path: &std::path::Path) -> Vec<PathBuf> {
 /// mid-keystroke features.
 #[must_use]
 #[expect(clippy::missing_panics_doc, reason = "loader.last() unreachable on success")]
-pub fn analyze(text: &str, uri: &Url) -> Option<Module> {
-    let source = text.to_owned();
-    let rope = Rope::from_str(text);
+pub fn analyze(text: String, uri: &Url) -> Option<Module> {
     let grammar_path = uri_to_grammar_path(uri)?;
 
     // Stage 1: Lex
-    let Ok(tokens) = nativedsl::lexer::Lexer::new(text).tokenize() else {
+    let Ok(tokens) = nativedsl::lexer::Lexer::new(&text).tokenize() else {
         tracing::warn!("analyze: lex failed for {uri}");
-        return Some(Module::empty(grammar_path, source, rope));
+        let rope = Rope::from_str(&text);
+        return Some(Module::empty(grammar_path, text, rope));
     };
 
     // Try the full Loader-based pipeline. This loads inherits/imports
@@ -614,7 +614,7 @@ pub fn analyze(text: &str, uri: &Url) -> Option<Module> {
             loaded: Vec::new(),
         };
         let load_ok = loader
-            .load_module(text, &canonical, nativedsl::loader::ModuleKind::Grammar)
+            .load_module(&text, &canonical, nativedsl::loader::ModuleKind::Grammar)
             .is_ok();
         drop(loader);
         if load_ok {
@@ -624,7 +624,7 @@ pub fn analyze(text: &str, uri: &Url) -> Option<Module> {
                 &modules,
                 root.ctx(),
                 ExtractKind::Root {
-                    tokens: &tokens,
+                    tokens,
                     loader_succeeded: true,
                     env: Some(&env),
                 },
@@ -633,14 +633,17 @@ pub fn analyze(text: &str, uri: &Url) -> Option<Module> {
     }
 
     // Loader failed (parse error, missing file, validation error, type error).
-    // Fall back to manual lex+parse so we still get partial analysis.
+    // Fall back to manual lex+parse so we still get partial analysis. Parser
+    // takes the source by value, so clone in case parse fails and we need
+    // text for the empty-module fallback.
     let mut shared = ast::SharedAst::new(text.len() / 30);
     let Ok(module_ctx) =
-        nativedsl::parser::Parser::new(&tokens, text.to_owned(), grammar_path.clone(), &mut shared)
+        nativedsl::parser::Parser::new(&tokens, text.clone(), grammar_path.clone(), &mut shared)
             .parse()
     else {
         tracing::warn!("analyze: parse failed for {uri}");
-        let mut module = Module::empty(grammar_path, source, rope);
+        let rope = Rope::from_str(&text);
+        let mut module = Module::empty(grammar_path, text, rope);
         module.tokens = Some(tokens);
         return Some(module);
     };
@@ -656,7 +659,7 @@ pub fn analyze(text: &str, uri: &Url) -> Option<Module> {
         &modules,
         &module_ctx,
         ExtractKind::Root {
-            tokens: &tokens,
+            tokens,
             loader_succeeded: false,
             env: None,
         },
@@ -691,7 +694,7 @@ mod bench {
         // Full analyze
         let start = std::time::Instant::now();
         for _ in 0..n {
-            std::hint::black_box(analyze(&source, &uri));
+            std::hint::black_box(analyze(source.clone(), &uri));
         }
         let total_time = start.elapsed() / n;
 

@@ -138,7 +138,7 @@ impl Backend {
         // Snapshot the source text under the read guard, then drop it before
         // calling analyze (which re-enters document_map for inherits/imports).
         let text = self.document_map.get(uri)?.text.clone();
-        let fresh = crate::analysis::analyze(&text, uri)?;
+        let fresh = crate::analysis::analyze(text, uri)?;
 
         if fresh.loader_succeeded {
             let new_deps = collect_deps(&fresh);
@@ -190,7 +190,7 @@ impl Backend {
         }
         let path = uri.to_file_path().ok()?;
         let text = std::fs::read_to_string(&path).ok()?;
-        let module = crate::analysis::analyze(&text, uri)?;
+        let module = crate::analysis::analyze(text, uri)?;
         module
             .definitions
             .is_some()
