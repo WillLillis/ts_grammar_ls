@@ -12,11 +12,13 @@ use crate::document::{DefKind, Definition, Module, RefKind, Reference};
 // Analysis extraction - walk the AST to collect definitions and references
 // ---------------------------------------------------------------------------
 
-/// Extract definitions from an AST's root items.
+/// Extract definitions from an AST's root items. `env` (when present) is used
+/// to attach inferred types to `Let` definitions.
 fn extract_definitions(
     shared: &ast::SharedAst,
     ctx: &ast::ModuleContext,
     scopes: &ScopeIndex,
+    env: Option<&nativedsl::typecheck::TypeEnv>,
 ) -> Vec<Definition> {
     let mut definitions = Vec::new();
     for &item_id in &ctx.root_items {
@@ -61,7 +63,10 @@ fn extract_definitions(
                 let kind = match shared.arena.get(*value) {
                     ast::Node::ModuleRef { import: true, .. } => DefKind::Import,
                     ast::Node::ModuleRef { import: false, .. } => DefKind::Inherit,
-                    _ => DefKind::Let { scope: None },
+                    _ => DefKind::Let {
+                        scope: None,
+                        ty: env.and_then(|e| e.vars.get(&item_id).copied()),
+                    },
                 };
                 definitions.push(Definition {
                     name: ctx.text(*name).to_owned(),
@@ -345,8 +350,15 @@ enum ExtractKind<'a> {
     Root {
         tokens: &'a [nativedsl::lexer::Token],
         loader_succeeded: bool,
+        /// Resolved type environment, when the loader pipeline succeeded.
+        /// `None` on the manual-parse fallback path - hover will then show
+        /// `let foo` without a type.
+        env: Option<&'a nativedsl::typecheck::TypeEnv>,
     },
-    External,
+    External {
+        /// Shared type environment from the (successful) loader pass.
+        env: Option<&'a nativedsl::typecheck::TypeEnv>,
+    },
 }
 
 /// Extract a `Module` from a resolved AST. `modules` contains all loaded
@@ -365,8 +377,12 @@ fn extract_module(
         .find(|&&id| matches!(shared.arena.get(id), ast::Node::Grammar))
         .map(|&id| shared.arena.span(id));
 
+    let env = match kind {
+        ExtractKind::Root { env, .. } => env,
+        ExtractKind::External { env } => env,
+    };
     let scopes = ScopeIndex::build(shared, ctx);
-    let definitions = extract_definitions(shared, ctx, &scopes);
+    let definitions = extract_definitions(shared, ctx, &scopes, env);
     let import_names = collect_import_names(shared, ctx);
     let mut references = extract_references(shared, ctx, &import_names, &scopes);
 
@@ -378,20 +394,21 @@ fn extract_module(
         else {
             return None;
         };
-        extract_external_at(shared, modules, *idx).map(Box::new)
+        extract_external_at(shared, modules, *idx, env).map(Box::new)
     });
 
-    let import_modules = collect_import_modules(shared, modules, ctx);
+    let import_modules = collect_import_modules(shared, modules, ctx, env);
 
     let (tokens_field, loader_succeeded) = match kind {
         ExtractKind::Root {
             tokens,
             loader_succeeded,
+            ..
         } => {
             extract_builtin_references(tokens, grammar_span, &mut references);
             (Some(tokens.to_vec()), loader_succeeded)
         }
-        ExtractKind::External => (None, true),
+        ExtractKind::External { .. } => (None, true),
     };
 
     Module {
@@ -413,9 +430,15 @@ fn extract_external_at(
     shared: &ast::SharedAst,
     modules: &[nativedsl::Module],
     idx: u8,
+    env: Option<&nativedsl::typecheck::TypeEnv>,
 ) -> Option<Module> {
     let module = modules.get(idx as usize)?;
-    Some(extract_module(shared, modules, module.ctx(), ExtractKind::External))
+    Some(extract_module(
+        shared,
+        modules,
+        module.ctx(),
+        ExtractKind::External { env },
+    ))
 }
 
 /// Collect `(binding_name, Module)` for each `let x = import(...)` at the top
@@ -425,6 +448,7 @@ fn collect_import_modules(
     shared: &ast::SharedAst,
     modules: &[nativedsl::Module],
     ctx: &ast::ModuleContext,
+    env: Option<&nativedsl::typecheck::TypeEnv>,
 ) -> Vec<(String, Module)> {
     let mut out = Vec::new();
     for &item_id in &ctx.root_items {
@@ -439,7 +463,7 @@ fn collect_import_modules(
         else {
             continue;
         };
-        if let Some(info) = extract_external_at(shared, modules, *idx) {
+        if let Some(info) = extract_external_at(shared, modules, *idx, env) {
             out.push((ctx.text(*name).to_owned(), info));
         }
     }
@@ -588,10 +612,11 @@ pub fn analyze(text: &str, uri: &Url) -> Option<Module> {
             ancestor_paths: vec![canonical.clone()],
             loaded: Vec::new(),
         };
-        if loader
+        let load_ok = loader
             .load_module(text, &canonical, nativedsl::loader::ModuleKind::Grammar)
-            .is_ok()
-        {
+            .is_ok();
+        drop(loader);
+        if load_ok {
             let root = modules.last().expect("root module pushed on success");
             return Some(extract_module(
                 &shared,
@@ -600,6 +625,7 @@ pub fn analyze(text: &str, uri: &Url) -> Option<Module> {
                 ExtractKind::Root {
                     tokens: &tokens,
                     loader_succeeded: true,
+                    env: Some(&env),
                 },
             ));
         }
@@ -631,6 +657,7 @@ pub fn analyze(text: &str, uri: &Url) -> Option<Module> {
         ExtractKind::Root {
             tokens: &tokens,
             loader_succeeded: false,
+            env: None,
         },
     ))
 }
@@ -675,39 +702,6 @@ pub fn find_object_field(
         }
     }
     None
-}
-
-/// Run the pipeline through typecheck on the given source text.
-///
-/// Calls `f` with the resolved SharedAst, ModuleContext, and type environment.
-/// Uses the core's `load_module` for proper module loading, index tagging,
-/// and recursive typecheck.
-pub fn with_type_env<T>(
-    text: &str,
-    uri: &Url,
-    f: impl FnOnce(&ast::SharedAst, &ast::ModuleContext, &nativedsl::typecheck::TypeEnv) -> T,
-) -> Option<T> {
-    let grammar_path = uri_to_grammar_path(uri)?;
-    let canonical = dunce::canonicalize(&grammar_path).ok()?;
-    let cap = text.len() / 30;
-    let mut shared = ast::SharedAst::new(cap);
-    let mut modules: Vec<nativedsl::Module> = Vec::new();
-    let mut env = nativedsl::typecheck::TypeEnv::default();
-    let mut state = nativedsl::LoweringState::default();
-    let mut loader = nativedsl::loader::Loader {
-        shared: &mut shared,
-        modules: &mut modules,
-        env: &mut env,
-        state: &mut state,
-        ancestor_paths: vec![canonical.clone()],
-        loaded: Vec::new(),
-    };
-    loader
-        .load_module(text, &canonical, nativedsl::loader::ModuleKind::Grammar)
-        .ok()?;
-    drop(loader);
-    let root = modules.last()?;
-    Some(f(&shared, root.ctx(), &env))
 }
 
 #[cfg(test)]

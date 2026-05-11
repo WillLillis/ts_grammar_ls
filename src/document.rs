@@ -5,6 +5,7 @@ use tower_lsp::lsp_types::Diagnostic;
 
 use tree_sitter_generate::nativedsl::ast::Span;
 use tree_sitter_generate::nativedsl::lexer::Token;
+use tree_sitter_generate::nativedsl::typecheck::Ty;
 
 /// A definition extracted from the AST.
 #[derive(Clone, Debug)]
@@ -22,10 +23,13 @@ pub enum DefKind {
     Function {
         signature: String,
     },
-    /// The span of the enclosing function, if this is a parameter or local.
-    /// `None` for top-level definitions.
+    /// A `let` binding. `scope` is the span of the enclosing function for
+    /// scoped lets, `None` for top-level. `ty` is the inferred type when the
+    /// loader pipeline succeeded, `None` otherwise (e.g. mid-keystroke
+    /// states where typecheck failed).
     Let {
         scope: Option<Span>,
+        ty: Option<Ty>,
     },
     /// An import binding (e.g. `helpers` in `let helpers = import("helpers.tsg")`).
     Import,
@@ -62,7 +66,7 @@ impl DefKind {
     #[must_use]
     pub const fn scope(&self) -> Option<Span> {
         match self {
-            Self::Let { scope } => *scope,
+            Self::Let { scope, .. } => *scope,
             Self::Parameter { scope } => Some(*scope),
             Self::Rule
             | Self::OverrideRule
@@ -206,12 +210,9 @@ fn find_in_module<'a>(module: &'a Module, name: &str) -> Option<(&'a Module, &'a
 /// distinctly from "did it produce an empty result?" - critical for
 /// `cursor_context` and similar to be honest about not knowing.
 ///
-/// Type information (variable types, object fields) is NOT included here. The
-/// `Ast` and `TypeEnv` borrow the source text (`&'src str`), making them
-/// impossible to store alongside an owned `source: String` without
-/// self-referential structs. Features that need type info (e.g. hover on let
-/// bindings) re-run the pipeline on demand via `with_type_env` - this is
-/// <1ms even for large grammars.
+/// Inferred types for `let` bindings are stored on `DefKind::Let.ty` rather
+/// than via a separate borrow into `source`, since `TypeEnv` borrows the
+/// source text and can't be co-stored with an owned `source: String`.
 #[derive(Clone)]
 pub struct Module {
     /// Canonical on-disk path. Always set: a `Module` represents an analyzed

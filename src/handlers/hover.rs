@@ -64,26 +64,10 @@ fn identifier_hover(
         let content = match binding {
             BindingLocation::Local(def) => match &def.kind {
                 DefKind::Function { signature } => format!("```\n{signature}\n```"),
-                DefKind::Let { .. } => {
-                    // Run the pipeline to get the type from the type environment.
-                    let ty = analysis::with_type_env(text, uri, |shared, ctx, env| {
-                        ctx.root_items.iter().find_map(|&item_id| {
-                            if let tree_sitter_generate::nativedsl::ast::Node::Let { name, .. } =
-                                shared.arena.get(item_id)
-                                && ctx.text(*name) == word
-                            {
-                                env.vars.get(&item_id).copied()
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .flatten();
-                    ty.map_or_else(
-                        || format!("```\nlet {}\n```", def.name),
-                        |ty| format!("```\nlet {}: {ty}\n```", def.name),
-                    )
-                }
+                DefKind::Let { ty, .. } => ty.map_or_else(
+                    || format!("```\nlet {}\n```", def.name),
+                    |ty| format!("```\nlet {}: {ty}\n```", def.name),
+                ),
                 _ => format!("```\n{} {}\n```", def.kind.label(), def.name),
             },
             BindingLocation::External { def, .. } => match &def.kind {
