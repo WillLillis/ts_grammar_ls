@@ -6,7 +6,7 @@ use tower_lsp::lsp_types::Url;
 
 use tree_sitter_generate::nativedsl::{self, ast};
 
-use crate::document::{Analysis, DefKind, Definition, RefKind, Reference};
+use crate::document::{DefKind, Definition, Module, RefKind, Reference};
 
 // ---------------------------------------------------------------------------
 // Analysis extraction - walk the AST to collect definitions and references
@@ -337,19 +337,28 @@ fn extract_references(
     references
 }
 
-/// Extract LSP analysis data from a module's resolved AST.
-///
-/// `modules` contains all loaded modules (root + inherits + imports), produced
-/// by the core's `Loader`. The root module is identified by `ctx`. Cross-module
-/// info (`base_module`, `import_modules`) is extracted from `modules` rather
-/// than re-parsing external files.
-fn extract_analysis(
-    tokens: &[nativedsl::lexer::Token],
+/// How a `Module` is being extracted - root document vs. an inherited /
+/// imported external. The root carries lex tokens and a loader-status flag;
+/// externals get neither (no tokens stored, `loader_succeeded` forced true
+/// since externals only exist after their own loader succeeded).
+enum ExtractKind<'a> {
+    Root {
+        tokens: &'a [nativedsl::lexer::Token],
+        loader_succeeded: bool,
+    },
+    External,
+}
+
+/// Extract a `Module` from a resolved AST. `modules` contains all loaded
+/// modules (root + inherits + imports), produced by the core's `Loader`;
+/// cross-module info (`base_module`, `import_modules`) is extracted from
+/// `modules` rather than re-parsing external files.
+fn extract_module(
     shared: &ast::SharedAst,
     modules: &[nativedsl::Module],
     ctx: &ast::ModuleContext,
-    loader_succeeded: bool,
-) -> Analysis {
+    kind: ExtractKind<'_>,
+) -> Module {
     let grammar_span = ctx
         .root_items
         .iter()
@@ -360,7 +369,6 @@ fn extract_analysis(
     let definitions = extract_definitions(shared, ctx, &scopes);
     let import_names = collect_import_names(shared, ctx);
     let mut references = extract_references(shared, ctx, &import_names, &scopes);
-    extract_builtin_references(tokens, grammar_span, &mut references);
 
     // Find the inherited grammar module (if any) and extract its info.
     let base_module = ctx.inherit_ref.and_then(|inherit_id| {
@@ -370,15 +378,27 @@ fn extract_analysis(
         else {
             return None;
         };
-        extract_external_module(shared, modules, *idx)
+        extract_external_at(shared, modules, *idx).map(Box::new)
     });
 
     let import_modules = collect_import_modules(shared, modules, ctx);
 
-    Analysis {
+    let (tokens_field, loader_succeeded) = match kind {
+        ExtractKind::Root {
+            tokens,
+            loader_succeeded,
+        } => {
+            extract_builtin_references(tokens, grammar_span, &mut references);
+            (Some(tokens.to_vec()), loader_succeeded)
+        }
+        ExtractKind::External => (None, true),
+    };
+
+    Module {
+        path: ctx.path.clone(),
         source: ctx.source.clone(),
         rope: Rope::from_str(&ctx.source),
-        tokens: Some(tokens.to_vec()),
+        tokens: tokens_field,
         grammar_span,
         definitions: Some(definitions),
         references: Some(references),
@@ -388,38 +408,24 @@ fn extract_analysis(
     }
 }
 
-/// Extract `ExternalModuleInfo` for a module loaded into `modules`. Recurses
-/// through the module's own `let x = import(...)` bindings so nested chains
-/// like `a::b::c` resolve.
-fn extract_external_module(
+/// Extract an external (inherit/import) `Module` at index `idx` in `modules`.
+fn extract_external_at(
     shared: &ast::SharedAst,
     modules: &[nativedsl::Module],
     idx: u8,
-) -> Option<crate::document::ExternalModuleInfo> {
+) -> Option<Module> {
     let module = modules.get(idx as usize)?;
-    let m_ctx = module.ctx();
-    let scopes = ScopeIndex::build(shared, m_ctx);
-    let defs = extract_definitions(shared, m_ctx, &scopes);
-    let import_names = collect_import_names(shared, m_ctx);
-    let refs = extract_references(shared, m_ctx, &import_names, &scopes);
-    let import_modules = collect_import_modules(shared, modules, m_ctx);
-    Some(crate::document::ExternalModuleInfo {
-        path: m_ctx.path.clone(),
-        definitions: defs,
-        references: refs,
-        rope: Rope::from_str(&m_ctx.source),
-        import_modules,
-    })
+    Some(extract_module(shared, modules, module.ctx(), ExtractKind::External))
 }
 
-/// Collect `(binding_name, ExternalModuleInfo)` for each `let x = import(...)`
-/// at the top level of `ctx`. Cycles are impossible here because the core
-/// `Loader` rejects them before we get a successful module list.
+/// Collect `(binding_name, Module)` for each `let x = import(...)` at the top
+/// level of `ctx`. Cycles are impossible here because the core `Loader`
+/// rejects them before we get a successful module list.
 fn collect_import_modules(
     shared: &ast::SharedAst,
     modules: &[nativedsl::Module],
     ctx: &ast::ModuleContext,
-) -> Vec<(String, crate::document::ExternalModuleInfo)> {
+) -> Vec<(String, Module)> {
     let mut out = Vec::new();
     for &item_id in &ctx.root_items {
         let ast::Node::Let { name, value, .. } = shared.arena.get(item_id) else {
@@ -433,7 +439,7 @@ fn collect_import_modules(
         else {
             continue;
         };
-        if let Some(info) = extract_external_module(shared, modules, *idx) {
+        if let Some(info) = extract_external_at(shared, modules, *idx) {
             out.push((ctx.text(*name).to_owned(), info));
         }
     }
@@ -547,40 +553,29 @@ pub fn extract_deps(text: &str, file_path: &std::path::Path) -> Vec<PathBuf> {
 /// Uses the core's `Loader` to load all imports/inherits and run the full
 /// resolve + typecheck pipeline on a single shared AST.
 ///
-/// On any pipeline failure (parse, validate, resolve, typecheck), falls back
-/// to manual lex+parse so partial analysis (definitions/references from the
-/// root module) is still available for mid-keystroke features.
+/// Returns `None` for URIs that aren't backed by a real file (e.g.
+/// `untitled:`) - those can't anchor relative paths so there's nothing
+/// meaningful to analyze. On pipeline failure (parse, validate, resolve,
+/// typecheck) we fall back to manual lex+parse so partial analysis
+/// (definitions/references from the root module) is still available for
+/// mid-keystroke features.
 #[must_use]
-#[expect(clippy::missing_panics_doc, reason = "file always has a parent")]
-pub fn analyze(text: &str, uri: &Url) -> Analysis {
+#[expect(clippy::missing_panics_doc, reason = "loader.last() unreachable on success")]
+pub fn analyze(text: &str, uri: &Url) -> Option<Module> {
     let source = text.to_owned();
     let rope = Rope::from_str(text);
-
-    // Non-file URIs (e.g. `untitled:`) can't anchor a real path - the loader
-    // would canonicalize relative paths against cwd and produce garbage.
-    // Bail with the default analysis.
-    let Some(grammar_path) = uri_to_grammar_path(uri) else {
-        return Analysis {
-            source,
-            rope,
-            ..Analysis::default()
-        };
-    };
+    let grammar_path = uri_to_grammar_path(uri)?;
 
     // Stage 1: Lex
     let Ok(tokens) = nativedsl::lexer::Lexer::new(text).tokenize() else {
         tracing::warn!("analyze: lex failed for {uri}");
-        return Analysis {
-            source,
-            rope,
-            ..Analysis::default()
-        };
+        return Some(Module::empty(grammar_path, source, rope));
     };
 
     // Try the full Loader-based pipeline. This loads inherits/imports
     // recursively into one shared AST + TypeEnv, then resolves and
     // typechecks. On success we have fully resolved cross-module references.
-    if let Some(canonical) = dunce::canonicalize(&grammar_path).ok() {
+    if let Ok(canonical) = dunce::canonicalize(&grammar_path) {
         let mut shared = ast::SharedAst::new(text.len() / 30);
         let mut modules: Vec<nativedsl::Module> = Vec::new();
         let mut env = nativedsl::typecheck::TypeEnv::default();
@@ -598,7 +593,15 @@ pub fn analyze(text: &str, uri: &Url) -> Analysis {
             .is_ok()
         {
             let root = modules.last().expect("root module pushed on success");
-            return extract_analysis(&tokens, &shared, &modules, root.ctx(), true);
+            return Some(extract_module(
+                &shared,
+                &modules,
+                root.ctx(),
+                ExtractKind::Root {
+                    tokens: &tokens,
+                    loader_succeeded: true,
+                },
+            ));
         }
     }
 
@@ -610,12 +613,9 @@ pub fn analyze(text: &str, uri: &Url) -> Analysis {
             .parse()
     else {
         tracing::warn!("analyze: parse failed for {uri}");
-        return Analysis {
-            source,
-            rope,
-            tokens: Some(tokens),
-            ..Analysis::default()
-        };
+        let mut module = Module::empty(grammar_path, source, rope);
+        module.tokens = Some(tokens);
+        return Some(module);
     };
 
     // Resolve what we can without loaded children. Imports/inherits won't
@@ -624,7 +624,15 @@ pub fn analyze(text: &str, uri: &Url) -> Analysis {
 
     // Extract analysis from this single module (no loaded children).
     let modules: Vec<nativedsl::Module> = Vec::new();
-    extract_analysis(&tokens, &shared, &modules, &module_ctx, false)
+    Some(extract_module(
+        &shared,
+        &modules,
+        &module_ctx,
+        ExtractKind::Root {
+            tokens: &tokens,
+            loader_succeeded: false,
+        },
+    ))
 }
 
 /// Run lex+parse and invoke `f` with the parsed AST. Returns `None` if either stage fails.

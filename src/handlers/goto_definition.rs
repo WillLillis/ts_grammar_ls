@@ -1,7 +1,7 @@
 use tower_lsp::lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location, Range, Url};
 
 use crate::analysis;
-use crate::document::{Analysis, BindingLocation, DefKind, RefKind};
+use crate::document::{BindingLocation, DefKind, Module, RefKind};
 use crate::server::Backend;
 use crate::text;
 
@@ -29,7 +29,7 @@ pub fn goto_definition(
                 return goto_object_field(uri, &analysis.source, object, field);
             }
             RefKind::InheritPath => {
-                let base = analysis.base_module.as_ref()?;
+                let base = analysis.base_module.as_deref()?;
                 let base_uri = Url::from_file_path(&base.path).ok()?;
                 return Some(GotoDefinitionResponse::Scalar(Location {
                     uri: base_uri,
@@ -63,9 +63,13 @@ pub fn goto_definition(
 }
 
 /// Jump to a definition in the base grammar file.
-fn goto_base_definition(analysis: &Analysis, name: &str) -> Option<GotoDefinitionResponse> {
-    let base = analysis.base_module.as_ref()?;
-    let def = base.definitions.iter().find(|d| d.name == *name)?;
+fn goto_base_definition(analysis: &Module, name: &str) -> Option<GotoDefinitionResponse> {
+    let base = analysis.base_module.as_deref()?;
+    let def = base
+        .definitions
+        .iter()
+        .flatten()
+        .find(|d| d.name == *name)?;
     let range = text::span_to_range(&base.rope, def.name_span);
     let base_uri = Url::from_file_path(&base.path).ok()?;
     Some(GotoDefinitionResponse::Scalar(Location {
@@ -78,7 +82,7 @@ fn goto_base_definition(analysis: &Analysis, name: &str) -> Option<GotoDefinitio
 /// regardless of whether it binds locally or in an external module.
 /// Helper rules and externals are reachable from the importer by bare name.
 fn resolve_bare_name_to_location(
-    analysis: &Analysis,
+    analysis: &Module,
     name: &str,
     scope: Option<tree_sitter_generate::nativedsl::ast::Span>,
     current_uri: &Url,
@@ -113,7 +117,7 @@ fn goto_object_field(
 }
 
 /// Jump to the file referenced by an `import("path")` call.
-fn goto_import_file(analysis: &Analysis, offset: u32) -> Option<GotoDefinitionResponse> {
+fn goto_import_file(analysis: &Module, offset: u32) -> Option<GotoDefinitionResponse> {
     // Find which import definition contains this offset, then use its module info.
     let reference = analysis.references.iter().flatten().find(|r| {
         offset >= r.span.start && offset < r.span.end && matches!(r.kind, RefKind::ImportPath)
@@ -138,12 +142,16 @@ fn goto_import_file(analysis: &Analysis, offset: u32) -> Option<GotoDefinitionRe
 /// For `a::b::c`, path is `["a", "b"]` and member is `"c"`. Walks the
 /// chain through nested sub-modules to find the target.
 fn goto_imported_member(
-    analysis: &Analysis,
+    analysis: &Module,
     path: &[String],
     member: &str,
 ) -> Option<GotoDefinitionResponse> {
     let module_info = analysis.resolve_import_chain(path)?;
-    let def = module_info.definitions.iter().find(|d| d.name == member)?;
+    let def = module_info
+        .definitions
+        .iter()
+        .flatten()
+        .find(|d| d.name == member)?;
     let uri = Url::from_file_path(&module_info.path).ok()?;
     let range = text::span_to_range(&module_info.rope, def.name_span);
     Some(GotoDefinitionResponse::Scalar(Location { uri, range }))

@@ -61,20 +61,20 @@ pub fn cancel_pending_diagnostics(handles: &DashMap<Url, JoinHandle<()>>, uri: &
     }
 }
 
-/// Walk an analysis's external modules (inherit + transitive imports) and
+/// Walk a module's external dependencies (inherit + transitive imports) and
 /// collect their canonical paths.
-fn collect_deps(analysis: &crate::document::Analysis) -> Vec<PathBuf> {
-    fn walk(out: &mut Vec<PathBuf>, info: &crate::document::ExternalModuleInfo) {
+fn collect_deps(module: &crate::document::Module) -> Vec<PathBuf> {
+    fn walk(out: &mut Vec<PathBuf>, info: &crate::document::Module) {
         out.push(info.path.clone());
         for (_, sub) in &info.import_modules {
             walk(out, sub);
         }
     }
     let mut deps = Vec::new();
-    if let Some(base) = &analysis.base_module {
+    if let Some(base) = module.base_module.as_deref() {
         walk(&mut deps, base);
     }
-    for (_, info) in &analysis.import_modules {
+    for (_, info) in &module.import_modules {
         walk(&mut deps, info);
     }
     deps
@@ -134,11 +134,11 @@ impl Backend {
     pub fn get_analysis(
         &self,
         uri: &tower_lsp::lsp_types::Url,
-    ) -> Option<std::sync::Arc<crate::document::Analysis>> {
+    ) -> Option<std::sync::Arc<crate::document::Module>> {
         // Snapshot the source text under the read guard, then drop it before
         // calling analyze (which re-enters document_map for inherits/imports).
         let text = self.document_map.get(uri)?.text.clone();
-        let fresh = crate::analysis::analyze(&text, uri);
+        let fresh = crate::analysis::analyze(&text, uri)?;
 
         if fresh.loader_succeeded {
             let new_deps = collect_deps(&fresh);
@@ -169,7 +169,7 @@ impl Backend {
         &self,
         uri: &tower_lsp::lsp_types::Url,
         pos: tower_lsp::lsp_types::Position,
-    ) -> Option<(std::sync::Arc<crate::document::Analysis>, u32)> {
+    ) -> Option<(std::sync::Arc<crate::document::Module>, u32)> {
         let analysis = self.get_analysis(uri)?;
         let offset = crate::text::position_to_offset(&analysis.rope, pos)?;
         Some((analysis, offset))
@@ -184,17 +184,17 @@ impl Backend {
     pub fn analysis_for_uri(
         &self,
         uri: &tower_lsp::lsp_types::Url,
-    ) -> Option<std::sync::Arc<crate::document::Analysis>> {
+    ) -> Option<std::sync::Arc<crate::document::Module>> {
         if self.document_map.contains_key(uri) {
             return self.get_analysis(uri);
         }
         let path = uri.to_file_path().ok()?;
         let text = std::fs::read_to_string(&path).ok()?;
-        let analysis = crate::analysis::analyze(&text, uri);
-        analysis
+        let module = crate::analysis::analyze(&text, uri)?;
+        module
             .definitions
             .is_some()
-            .then(|| std::sync::Arc::new(analysis))
+            .then(|| std::sync::Arc::new(module))
     }
 }
 

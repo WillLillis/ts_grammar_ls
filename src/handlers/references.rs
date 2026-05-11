@@ -1,6 +1,6 @@
 use tower_lsp::lsp_types::{Location, ReferenceParams, Url};
 
-use crate::document::{BindingLocation, CursorContext, RefKind};
+use crate::document::{BindingLocation, CursorContext, Module, RefKind};
 use crate::server::Backend;
 use crate::text;
 
@@ -63,7 +63,7 @@ pub fn references(backend: &Backend, params: &ReferenceParams) -> Option<Vec<Loc
 /// refs and every open dependent's bare-name uses that bind to this target.
 fn bare_name_external_references(
     backend: &Backend,
-    cursor_analysis: &crate::document::Analysis,
+    cursor_analysis: &Module,
     cursor_uri: &Url,
     target_path: &std::path::Path,
     word: &str,
@@ -74,7 +74,7 @@ fn bare_name_external_references(
     // Helper file: declaration + internal references.
     let target_module = cursor_analysis
         .base_module
-        .as_ref()
+        .as_deref()
         .filter(|m| m.path == target_path)
         .or_else(|| {
             cursor_analysis
@@ -88,6 +88,7 @@ fn bare_name_external_references(
             && let Some(def) = target_module
                 .definitions
                 .iter()
+                .flatten()
                 .find(|d| d.name == word)
         {
             locations.push(Location {
@@ -95,7 +96,7 @@ fn bare_name_external_references(
                 range: text::span_to_range(&target_module.rope, def.name_span),
             });
         }
-        for reference in &target_module.references {
+        for reference in target_module.references.iter().flatten() {
             if matches!(
                 &reference.kind,
                 RefKind::Rule(name) | RefKind::Variable(name) if name == word
@@ -137,7 +138,7 @@ fn bare_name_external_references(
 fn add_bare_name_refs_in_file(
     out: &mut Vec<Location>,
     uri: &Url,
-    analysis: &crate::document::Analysis,
+    analysis: &Module,
     target_path: &std::path::Path,
     word: &str,
 ) {
@@ -164,7 +165,7 @@ fn add_bare_name_refs_in_file(
 /// References for `base::rule_name`: base grammar definition + base grammar
 /// usages + derived file `BaseRule` refs.
 fn base_rule_references(
-    analysis: &crate::document::Analysis,
+    analysis: &Module,
     uri: &Url,
     rope: &ropey::Rope,
     word: &str,
@@ -172,16 +173,22 @@ fn base_rule_references(
 ) -> Option<Vec<Location>> {
     let mut locations = Vec::new();
 
-    if let Some(base) = &analysis.base_module
+    if let Some(base) = analysis.base_module.as_deref()
         && let Ok(base_uri) = Url::from_file_path(&base.path)
     {
-        if include_declaration && let Some(def) = base.definitions.iter().find(|d| d.name == word) {
+        if include_declaration
+            && let Some(def) = base
+                .definitions
+                .iter()
+                .flatten()
+                .find(|d| d.name == word)
+        {
             locations.push(Location {
                 uri: base_uri.clone(),
                 range: text::span_to_range(&base.rope, def.name_span),
             });
         }
-        for reference in &base.references {
+        for reference in base.references.iter().flatten() {
             // Match both rule references and macro/variable references by
             // name - inherited names can be either rules or macros.
             if matches!(
@@ -210,7 +217,7 @@ fn base_rule_references(
 
 /// References for a regular identifier in the current file.
 fn local_references(
-    analysis: &crate::document::Analysis,
+    analysis: &Module,
     uri: &Url,
     source: &str,
     rope: &ropey::Rope,
@@ -252,7 +259,7 @@ fn local_references(
 /// (`a::b::member`). Filters by full qualified path so `a::foo` and `b::foo`
 /// don't collide.
 fn import_member_references(
-    analysis: &crate::document::Analysis,
+    analysis: &Module,
     uri: &Url,
     rope: &ropey::Rope,
     path: &[String],
@@ -263,7 +270,11 @@ fn import_member_references(
 
     if include_declaration
         && let Some(module_info) = analysis.resolve_import_chain(path)
-        && let Some(def) = module_info.definitions.iter().find(|d| d.name == member)
+        && let Some(def) = module_info
+            .definitions
+            .iter()
+            .flatten()
+            .find(|d| d.name == member)
         && let Ok(module_uri) = Url::from_file_path(&module_info.path)
     {
         locations.push(Location {

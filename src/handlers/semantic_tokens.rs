@@ -7,7 +7,7 @@ use tower_lsp::lsp_types::{
 
 use tree_sitter_generate::nativedsl::lexer::TokenKind;
 
-use crate::document::{Analysis, DefKind, RefKind};
+use crate::document::{DefKind, Module, RefKind};
 use crate::server::Backend;
 use crate::text;
 
@@ -52,7 +52,7 @@ pub fn semantic_tokens_full(
     }))
 }
 
-fn compute_semantic_tokens(text: &str, rope: &Rope, analysis: &Analysis) -> Vec<SemanticToken> {
+fn compute_semantic_tokens(text: &str, rope: &Rope, analysis: &Module) -> Vec<SemanticToken> {
     let Some(lex_tokens) = analysis.tokens.as_deref() else {
         return Vec::new();
     };

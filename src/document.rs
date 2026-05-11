@@ -150,7 +150,7 @@ impl RefKind {
     /// True if this reference carries an explicit `a::b`-style qualifier in
     /// source (`BaseRule` or `ImportedMember`). Bare-name references to a
     /// helper rule / external also resolve cross-module - via
-    /// `Analysis::resolve_bare_name` - but their `RefKind` is the unqualified
+    /// `Module::resolve_bare_name` - but their `RefKind` is the unqualified
     /// `Rule` / `Variable`, so they return `false` here.
     #[must_use]
     pub const fn is_qualified(&self) -> bool {
@@ -188,29 +188,28 @@ impl Reference {
 }
 
 /// Where a bare-name lookup landed. Distinguishes "in this file" (so the
-/// caller can use `analysis.rope` and the current URI) from "in some external
-/// module" (where the caller needs the module's path + rope).
+/// caller can use `module.rope` and the current URI) from "in some external
+/// module" (where the caller needs the external module's path + rope).
 #[derive(Clone, Copy)]
 pub enum BindingLocation<'a> {
     Local(&'a Definition),
     External {
-        module: &'a ExternalModuleInfo,
+        module: &'a Module,
         def: &'a Definition,
     },
 }
 
 /// Walk an external module recursively for a top-level definition with
 /// `name`, returning the owning module and the def. Used by
-/// `Analysis::resolve_bare_name`.
+/// `Module::resolve_bare_name`.
 #[must_use]
-fn find_in_module<'a>(
-    info: &'a ExternalModuleInfo,
-    name: &str,
-) -> Option<(&'a ExternalModuleInfo, &'a Definition)> {
-    if let Some(def) = info.definitions.iter().find(|d| d.name == name) {
-        return Some((info, def));
+fn find_in_module<'a>(module: &'a Module, name: &str) -> Option<(&'a Module, &'a Definition)> {
+    if let Some(defs) = module.definitions.as_ref()
+        && let Some(def) = defs.iter().find(|d| d.name == name)
+    {
+        return Some((module, def));
     }
-    for (_, sub) in &info.import_modules {
+    for (_, sub) in &module.import_modules {
         if let Some(found) = find_in_module(sub, name) {
             return Some(found);
         }
@@ -218,19 +217,72 @@ fn find_in_module<'a>(
     None
 }
 
-/// Cached info about an external module (inherited or imported), for IDE features.
+/// A single analyzed grammar file. Used both for the root document the user
+/// is editing and (recursively) for each inherited / imported file reachable
+/// from it.
+///
+/// Each `Option<Vec<_>>` field tracks "did the pipeline reach this stage?"
+/// distinctly from "did it produce an empty result?" - critical for
+/// `cursor_context` and similar to be honest about not knowing.
+///
+/// Type information (variable types, object fields) is NOT included here. The
+/// `Ast` and `TypeEnv` borrow the source text (`&'src str`), making them
+/// impossible to store alongside an owned `source: String` without
+/// self-referential structs. Features that need type info (e.g. hover on let
+/// bindings) re-run the pipeline on demand via `with_type_env` - this is
+/// <1ms even for large grammars.
 #[derive(Clone)]
-pub struct ExternalModuleInfo {
+pub struct Module {
+    /// Canonical on-disk path. Always set: a `Module` represents an analyzed
+    /// file. Non-file URIs short-circuit before construction.
     pub path: PathBuf,
-    pub definitions: Vec<Definition>,
-    pub references: Vec<Reference>,
+    pub source: String,
     pub rope: Rope,
-    /// Sub-imports within this module, for resolving nested `a::b::c` access.
+    /// Lexer tokens. Available after a successful lex.
+    pub tokens: Option<Vec<Token>>,
+    /// Definitions extracted from the AST. Available after parse.
+    pub definitions: Option<Vec<Definition>>,
+    /// References extracted from the resolved AST. Available after resolve.
+    pub references: Option<Vec<Reference>>,
+    /// Span of the grammar block (if present). Available after parse.
+    /// Always `None` for helper / inherited modules (they have no grammar block).
+    pub grammar_span: Option<Span>,
+    /// Parsed info from the inherited base grammar (for go-to-def, references,
+    /// and completion on `base::rule_name`). Available after stage 4. Always
+    /// `None` for non-root modules in practice.
+    pub base_module: Option<Box<Self>>,
+    /// Imported modules, paired with their let-binding name (e.g. `"helpers"`
+    /// for `let helpers = import("helpers.tsg")`). Recursive.
     pub import_modules: Vec<(String, Self)>,
+    /// Whether the full Loader pipeline ran successfully (parse + validate +
+    /// resolve + typecheck + lower + load all inherits/imports). When false on
+    /// the root, `base_module` and `import_modules` reflect the manual-parse
+    /// fallback and may be empty even if the file textually has imports.
+    /// Externals are constructed only after their own loader succeeded, so
+    /// this is always `true` for them.
+    pub loader_succeeded: bool,
 }
 
-impl ExternalModuleInfo {
-    /// Look up a nested sub-module by variable name.
+impl Module {
+    /// Construct a shell `Module` with only the source/rope populated. Used
+    /// when lex or parse fails before we can produce any analysis data.
+    #[must_use]
+    pub const fn empty(path: PathBuf, source: String, rope: Rope) -> Self {
+        Self {
+            path,
+            source,
+            rope,
+            tokens: None,
+            definitions: None,
+            references: None,
+            grammar_span: None,
+            base_module: None,
+            import_modules: Vec::new(),
+            loader_succeeded: false,
+        }
+    }
+
+    /// Look up a direct sub-import by binding name.
     #[must_use]
     pub fn get_submodule(&self, name: &str) -> Option<&Self> {
         self.import_modules
@@ -238,52 +290,7 @@ impl ExternalModuleInfo {
             .find(|(n, _)| n == name)
             .map(|(_, info)| info)
     }
-}
 
-/// On-demand analysis results from a pipeline run.
-///
-/// Each field is populated as far as the pipeline gets. If lex fails, all
-/// fields are `None`. If parse succeeds but resolve fails, `tokens`/`grammar_span`/
-/// `definitions` are `Some`, references may be partial, etc.
-///
-/// Type information (variable types, object fields) is NOT included here. The
-/// `Ast` and `TypeEnv` borrow the source text (`&'src str`), making them
-/// impossible to store alongside the owned `Document.text` without
-/// self-referential structs. Instead, features that need type info (e.g. hover
-/// on let bindings) re-run the pipeline on demand via `with_type_env` - this
-/// is <1ms even for large grammars, so the cost is negligible.
-#[derive(Default, Clone)]
-pub struct Analysis {
-    /// The source text this analysis was computed from. Stored here so
-    /// handlers always use text that matches the token/definition spans,
-    /// even when the document has been edited since (stale analysis reuse).
-    pub source: String,
-    /// Rope for the source text, for position/offset conversion.
-    pub rope: Rope,
-    /// Lexer tokens. Available after a successful lex.
-    pub tokens: Option<Vec<Token>>,
-    /// Span of the grammar block (if present). Available after parse.
-    pub grammar_span: Option<Span>,
-    /// Definitions extracted from the AST. Available after parse.
-    pub definitions: Option<Vec<Definition>>,
-    /// References extracted from the resolved AST. Available after resolve.
-    pub references: Option<Vec<Reference>>,
-    /// Parsed info from the inherited base grammar (for go-to-def, references,
-    /// and completion on `base::rule_name`). Available after stage 4.
-    pub base_module: Option<ExternalModuleInfo>,
-    /// Imported modules, paired with their let-binding name (e.g. `"helpers"` for
-    /// `let helpers = import("helpers.tsg")`).
-    pub import_modules: Vec<(String, ExternalModuleInfo)>,
-    /// Whether the full Loader pipeline ran successfully (parse + validate +
-    /// resolve + typecheck + lower + load all inherits/imports). When false,
-    /// `base_module` and `import_modules` reflect the manual-parse fallback
-    /// and may be empty even if the file textually has imports. Callers that
-    /// need cross-file info (rename, references, etc.) should prefer the
-    /// previous full-success snapshot via `Document.last_good_analysis`.
-    pub loader_succeeded: bool,
-}
-
-impl Analysis {
     /// Find the reference at `offset`, preferring more specific kinds when
     /// multiple references share a span (e.g. `helpers::commaSep` produces
     /// both an inner `Variable("commaSep")` and an outer `ImportedMember`).
@@ -339,7 +346,7 @@ impl Analysis {
         if let Some(def) = self.binding_for(name, scope) {
             return Some(BindingLocation::Local(def));
         }
-        if let Some(base) = &self.base_module
+        if let Some(base) = self.base_module.as_deref()
             && let Some((module, def)) = find_in_module(base, name)
         {
             return Some(BindingLocation::External { module, def });
@@ -353,17 +360,17 @@ impl Analysis {
     }
 
     /// Walk a qualified-access chain to the leaf module. For `a::b::c`, given
-    /// `path = ["a", "b"]`, returns the `ExternalModuleInfo` for `b` (a's
-    /// sub-import). The first segment must be a top-level binding (import or
-    /// inherit); subsequent segments walk through nested sub-imports.
+    /// `path = ["a", "b"]`, returns the `Module` for `b` (a's sub-import).
+    /// The first segment must be a top-level binding (import or inherit);
+    /// subsequent segments walk through nested sub-imports.
     #[must_use]
-    pub fn resolve_import_chain(&self, path: &[String]) -> Option<&ExternalModuleInfo> {
+    pub fn resolve_import_chain(&self, path: &[String]) -> Option<&Self> {
         let first = path.first()?;
-        let mut module_info = self.get_module(first.as_str())?;
+        let mut module = self.get_module(first.as_str())?;
         for segment in &path[1..] {
-            module_info = module_info.get_submodule(segment)?;
+            module = module.get_submodule(segment)?;
         }
-        Some(module_info)
+        Some(module)
     }
 
     /// At `offset` on a qualified-member reference (`a::b::foo`), return the
@@ -371,10 +378,10 @@ impl Analysis {
     /// `resolve_import_chain`, so 3-level access like `h::utils::foo` lands
     /// on `utils`'s module, not on `h`'s.
     #[must_use]
-    pub fn qualified_member_module(&self, offset: u32) -> Option<&ExternalModuleInfo> {
+    pub fn qualified_member_module(&self, offset: u32) -> Option<&Self> {
         match &self.reference_at(offset)?.kind {
             RefKind::ImportedMember { path, .. } => self.resolve_import_chain(path),
-            RefKind::BaseRule(_) => self.base_module.as_ref(),
+            RefKind::BaseRule(_) => self.base_module.as_deref(),
             _ => None,
         }
     }
@@ -382,13 +389,11 @@ impl Analysis {
     /// Look up a module by its variable name. Checks both imported modules
     /// and the inherited base grammar.
     #[must_use]
-    pub fn get_module(&self, name: &str) -> Option<&ExternalModuleInfo> {
-        // Check imports.
+    pub fn get_module(&self, name: &str) -> Option<&Self> {
         if let Some((_, info)) = self.import_modules.iter().find(|(n, _)| n == name) {
             return Some(info);
         }
-        // Check if this name is the inherit binding.
-        if let Some(base) = &self.base_module
+        if let Some(base) = self.base_module.as_deref()
             && self.definitions.as_ref().is_some_and(|defs| {
                 defs.iter()
                     .any(|d| d.name == name && d.kind == DefKind::Inherit)
@@ -500,7 +505,7 @@ pub struct Document {
     /// working mid-keystroke. Never consulted on the success path: every
     /// `get_analysis` re-runs analyze and serves the fresh result if it
     /// parsed.
-    pub last_good_analysis: Option<std::sync::Arc<Analysis>>,
+    pub last_good_analysis: Option<std::sync::Arc<Module>>,
     /// Canonical paths of external files (inherits + transitive imports) this
     /// document's last successful analysis loaded. Maintained alongside the
     /// `Backend.dependents` reverse index; on update we diff against the new

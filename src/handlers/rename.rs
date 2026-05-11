@@ -6,7 +6,7 @@ use tower_lsp::lsp_types::{
 };
 use tree_sitter_generate::nativedsl::ast;
 
-use crate::document::{BindingLocation, CursorContext, DefKind, ExternalModuleInfo, RefKind};
+use crate::document::{BindingLocation, CursorContext, DefKind, Module, RefKind};
 use crate::server::Backend;
 use crate::text;
 
@@ -27,15 +27,23 @@ pub fn prepare_rename(
         CursorContext::BaseRuleAccess => {
             // Cursor is on the member part of `base::rule_name`.
             // Find the definition in the base module.
-            let base = analysis.base_module.as_ref()?;
-            let def = base.definitions.iter().find(|d| d.name == word)?;
+            let base = analysis.base_module.as_deref()?;
+            let def = base
+                .definitions
+                .iter()
+                .flatten()
+                .find(|d| d.name == word)?;
             let range = text::span_to_range(&base.rope, def.name_span);
             Some(PrepareRenameResponse::Range(range))
         }
         CursorContext::ImportModuleAccess { .. } => {
             // Cursor is on the member part of `mod::member`.
             let module = analysis.qualified_member_module(offset)?;
-            let def = module.definitions.iter().find(|d| d.name == word)?;
+            let def = module
+                .definitions
+                .iter()
+                .flatten()
+                .find(|d| d.name == word)?;
             let range = text::span_to_range(&module.rope, def.name_span);
             Some(PrepareRenameResponse::Range(range))
         }
@@ -74,7 +82,7 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
 
     match analysis.cursor_context(offset, &analysis.source)? {
         CursorContext::BaseRuleAccess => {
-            let target_path = analysis.base_module.as_ref()?.path.clone();
+            let target_path = analysis.base_module.as_deref()?.path.clone();
             rename_cross_file(backend, uri, &analysis, &target_path, word, &new_name)
         }
         CursorContext::ImportModuleAccess { .. } => {
@@ -109,7 +117,7 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
 fn rename_cross_file(
     backend: &Backend,
     cursor_uri: &Url,
-    cursor_analysis: &crate::document::Analysis,
+    cursor_analysis: &Module,
     target_path: &std::path::Path,
     word: &str,
     new_name: &str,
@@ -119,7 +127,7 @@ fn rename_cross_file(
     // External file: definition site + internal refs (Rule/Variable kinds).
     let target_module = find_external_module(cursor_analysis, target_path)?;
     let mut external_edits = Vec::new();
-    for def in &target_module.definitions {
+    for def in target_module.definitions.iter().flatten() {
         if def.name == word {
             external_edits.push(make_rename_edit(
                 &target_module.rope,
@@ -128,7 +136,7 @@ fn rename_cross_file(
             ));
         }
     }
-    for reference in &target_module.references {
+    for reference in target_module.references.iter().flatten() {
         let name_matches = match &reference.kind {
             RefKind::Rule(name) | RefKind::Variable(name) => name == word,
             _ => false,
@@ -184,18 +192,15 @@ fn rename_cross_file(
     })
 }
 
-/// Find the `ExternalModuleInfo` matching `target_path` reachable from
-/// `analysis` - either the inherited base or any (transitively) imported
-/// module. The same-module check uses canonical paths so different binding
-/// names across files still resolve to the same module.
+/// Find the `Module` matching `target_path` reachable from `analysis` -
+/// either the inherited base or any (transitively) imported module. The
+/// same-module check uses canonical paths so different binding names across
+/// files still resolve to the same module.
 fn find_external_module<'a>(
-    analysis: &'a crate::document::Analysis,
+    analysis: &'a Module,
     target_path: &std::path::Path,
-) -> Option<&'a ExternalModuleInfo> {
-    fn walk<'a>(
-        info: &'a ExternalModuleInfo,
-        target: &std::path::Path,
-    ) -> Option<&'a ExternalModuleInfo> {
+) -> Option<&'a Module> {
+    fn walk<'a>(info: &'a Module, target: &std::path::Path) -> Option<&'a Module> {
         if info.path == target {
             return Some(info);
         }
@@ -206,7 +211,7 @@ fn find_external_module<'a>(
         }
         None
     }
-    if let Some(base) = &analysis.base_module
+    if let Some(base) = analysis.base_module.as_deref()
         && let Some(found) = walk(base, target_path)
     {
         return Some(found);
@@ -227,7 +232,7 @@ fn find_external_module<'a>(
 fn add_cross_refs_in_file(
     changes: &mut HashMap<Url, Vec<TextEdit>>,
     uri: &Url,
-    analysis: &crate::document::Analysis,
+    analysis: &Module,
     target_path: &std::path::Path,
     word: &str,
     new_name: &str,
@@ -245,7 +250,7 @@ fn add_cross_refs_in_file(
         let bound_to_target = match &reference.kind {
             RefKind::BaseRule(name) if name == word => analysis
                 .base_module
-                .as_ref()
+                .as_deref()
                 .is_some_and(|m| m.path == target_path),
             RefKind::ImportedMember { path, member } if member == word => analysis
                 .resolve_import_chain(path)
@@ -277,7 +282,7 @@ fn add_cross_refs_in_file(
 /// occurrences that resolve to the clicked binding are renamed.
 fn rename_local(
     uri: &Url,
-    analysis: &crate::document::Analysis,
+    analysis: &Module,
     word: &str,
     new_name: &str,
     cursor_scope: Option<tree_sitter_generate::nativedsl::ast::Span>,

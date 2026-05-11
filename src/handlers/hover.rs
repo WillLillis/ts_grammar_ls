@@ -22,8 +22,8 @@ pub fn hover(backend: &Backend, params: &HoverParams) -> Option<Hover> {
         // On the rule part of `base::rule_name`, show the base grammar's definition.
         CursorContext::BaseRuleAccess => analysis
             .base_module
-            .as_ref()
-            .and_then(|m| m.definitions.iter().find(|d| d.name == word))
+            .as_deref()
+            .and_then(|m| m.definitions.iter().flatten().find(|d| d.name == word))
             .map(|def| make_hover(format!("```\n{} {}\n```", def.kind.label(), def.name))),
         // On a member accessed through an imported module (`mod::fn_name`).
         CursorContext::ImportModuleAccess { .. } => {
@@ -36,7 +36,7 @@ pub fn hover(backend: &Backend, params: &HoverParams) -> Option<Hover> {
 }
 
 fn identifier_hover(
-    analysis: &crate::document::Analysis,
+    analysis: &crate::document::Module,
     text: &str,
     uri: &tower_lsp::lsp_types::Url,
     word: &str,
@@ -116,12 +116,16 @@ fn field_value_hover(
 
 /// Show hover info for a member accessed through an imported module.
 fn imported_member_hover(
-    analysis: &crate::document::Analysis,
+    analysis: &crate::document::Module,
     word: &str,
     offset: u32,
 ) -> Option<Hover> {
     let module_info = analysis.qualified_member_module(offset)?;
-    let def = module_info.definitions.iter().find(|d| d.name == word)?;
+    let def = module_info
+        .definitions
+        .iter()
+        .flatten()
+        .find(|d| d.name == word)?;
     let content = match &def.kind {
         DefKind::Function { signature } => format!("```\n{signature}\n```"),
         _ => format!("```\n{} {}\n```", def.kind.label(), def.name),

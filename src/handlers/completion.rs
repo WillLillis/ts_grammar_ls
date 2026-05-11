@@ -147,6 +147,7 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
                 module_info
                     .definitions
                     .iter()
+                    .flatten()
                     .filter_map(|d| {
                         let (kind, detail) = match &d.kind {
                             DefKind::Rule | DefKind::OverrideRule => (
@@ -186,8 +187,9 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
         return Some(CompletionResponse::Array(
             analysis
                 .base_module
-                .iter()
-                .flat_map(|m| &m.definitions)
+                .as_deref()
+                .into_iter()
+                .flat_map(|m| m.definitions.iter().flatten())
                 .filter(|d| matches!(d.kind, DefKind::Rule))
                 .map(|d| CompletionItem {
                     label: d.name.clone(),
@@ -230,10 +232,10 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
         emit(def, &mut items);
     }
     fn walk_module(
-        info: &crate::document::ExternalModuleInfo,
+        info: &crate::document::Module,
         emit: &mut impl FnMut(&crate::document::Definition),
     ) {
-        for def in &info.definitions {
+        for def in info.definitions.iter().flatten() {
             emit(def);
         }
         for (_, sub) in &info.import_modules {

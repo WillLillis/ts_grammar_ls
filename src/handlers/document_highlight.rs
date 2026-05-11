@@ -1,6 +1,6 @@
 use tower_lsp::lsp_types::{DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams};
 
-use crate::document::{Analysis, CursorContext, RefKind};
+use crate::document::{CursorContext, Module, RefKind};
 use crate::server::Backend;
 use crate::text;
 
@@ -30,7 +30,7 @@ pub fn document_highlight(
 
 /// Highlight only `base::rule_name` references in the current file.
 fn base_rule_highlights(
-    analysis: &Analysis,
+    analysis: &Module,
     rope: &ropey::Rope,
     word: &str,
 ) -> Option<Vec<DocumentHighlight>> {
@@ -49,7 +49,7 @@ fn base_rule_highlights(
 
 /// Highlight a regular identifier's definition (WRITE) and references (READ).
 fn local_highlights(
-    analysis: &Analysis,
+    analysis: &Module,
     source: &str,
     rope: &ropey::Rope,
     word: &str,
@@ -85,7 +85,7 @@ fn local_highlights(
 
 /// Highlight all `ImportedMember` references with the same member name.
 fn import_member_highlights(
-    analysis: &Analysis,
+    analysis: &Module,
     rope: &ropey::Rope,
     word: &str,
 ) -> Option<Vec<DocumentHighlight>> {
