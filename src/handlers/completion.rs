@@ -3,7 +3,7 @@ use tower_lsp::lsp_types::{
 };
 use tree_sitter_generate::nativedsl::lexer::{Token, TokenKind};
 
-use crate::document::DefKind;
+use crate::document::{DefKind, Definition, Module};
 use crate::server::Backend;
 use crate::text;
 
@@ -43,10 +43,6 @@ const KEYWORDS: &[(&str, &str)] = &[
     ),
     ("for", "Iterate over a list"),
     ("in", "For-loop iterable"),
-    (
-        "print",
-        "Debug-print a value to stderr at grammar evaluation time",
-    ),
 ];
 
 const TYPE_KEYWORDS: &[(&str, &str)] = &[
@@ -69,8 +65,22 @@ const TYPE_KEYWORDS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Grammar config fields with their types, matching the typecheck module's field access.
+const GRAMMAR_CONFIG_FIELDS: &[(&str, &str)] = &[
+    ("language", "str_t"),
+    ("inherits", "grammar"),
+    ("start", "rule_t"),
+    ("extras", "list_rule_t"),
+    ("externals", "list_rule_t"),
+    ("inline", "list_rule_t"),
+    ("supertypes", "list_rule_t"),
+    ("conflicts", "list_list_rule_t"),
+    ("precedences", "list_list_rule_t"),
+    ("word", "rule_t"),
+    ("reserved", "{ [context]: list_rule_t }"),
+];
+
 #[must_use]
-#[expect(clippy::too_many_lines)]
 pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<CompletionResponse> {
     let uri = &params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
@@ -78,17 +88,16 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
     // Use the current buffer text for token scanning (to detect what the
     // user just typed: `::`, `.`, etc.) but the cached analysis for
     // definitions/modules (which may be from a prior successful parse).
-    let (current_source, offset) = {
+    let (source, offset) = {
         let doc = backend.document_map.get(uri)?;
         let offset = text::position_to_offset(&doc.rope, pos)?;
         (doc.text.clone(), offset)
     };
     let analysis = backend.get_analysis(uri)?;
-    let current_tokens = tree_sitter_generate::nativedsl::lexer::Lexer::new(&current_source)
+    let current_tokens = tree_sitter_generate::nativedsl::lexer::Lexer::new(&source)
         .tokenize()
         .ok();
     let tokens = current_tokens.as_deref().unwrap_or_default();
-    let source = &current_source;
 
     // Find the token just before the cursor position.
     let prev_token = tokens.iter().take_while(|t| t.span.end <= offset).last();
@@ -99,7 +108,7 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
         .rposition(|t| t.span.end <= offset)
         .map_or(0, |i| i + 1);
     if text::at_grammar_config_field_arg(tokens, cursor_token_idx) {
-        return Some(CompletionResponse::Array(grammar_config_field_completions()));
+        return Some(CompletionResponse::Array(grammar_config_field_items()));
     }
 
     // `IDENT.` -> complete object fields
@@ -112,148 +121,126 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             .iter()
             .take_while(|t| t.span.end <= dot_span.start)
             .last();
-
-        // `IDENT.` -> complete object fields.
         if let Some(ident) = before_dot.filter(|t| t.kind == TokenKind::Ident) {
             let obj_name = &source[ident.span.start as usize..ident.span.end as usize];
-            if let Some(defs) = &analysis.definitions {
-                return Some(CompletionResponse::Array(object_field_completions(
-                    defs, obj_name,
-                )));
-            }
-            // Definitions unavailable (e.g. parse error). Fall back to
-            // scanning tokens for `let OBJ = { KEY: ... }` patterns.
+            // Prefer cached definitions; on parse failure (no previous good
+            // snapshot either) scan tokens for `let OBJ = { K: V, ... }` so
+            // mid-keystroke `OBJ.|` still surfaces field names.
             return Some(CompletionResponse::Array(
-                object_field_completions_from_tokens(tokens, source, obj_name),
+                analysis
+                    .definitions
+                    .as_deref()
+                    .map(|defs| complete_object_field(defs, obj_name))
+                    .filter(|items| !items.is_empty())
+                    .unwrap_or_else(|| {
+                        complete_object_field_from_tokens(tokens, &source, obj_name)
+                    }),
             ));
         }
     }
 
     // `IDENT::` -> complete module members (import or base grammar rules).
     if let Some(cc_token) = prev_token.filter(|t| t.kind == TokenKind::ColonColon) {
-        // Find the identifier immediately before the `::` token.
         let qualifier = tokens
             .iter()
             .take_while(|t| t.span.end <= cc_token.span.start)
             .last()
-            .filter(|t| t.kind == TokenKind::Ident);
-        let qualifier_name = qualifier.map(|t| &source[t.span.start as usize..t.span.end as usize]);
-
-        // Check if the qualifier is a module variable (import or inherit).
-        if let Some(name) = qualifier_name
-            && let Some(module_info) = analysis.get_module(name)
-        {
-            return Some(CompletionResponse::Array(
-                module_info
-                    .definitions
-                    .iter()
-                    .flatten()
-                    .filter_map(|d| {
-                        let (kind, detail) = match &d.kind {
-                            DefKind::Rule | DefKind::OverrideRule => (
-                                CompletionItemKind::CLASS,
-                                format!("rule {} ({name})", d.name),
-                            ),
-                            DefKind::Function { signature } => (
-                                CompletionItemKind::FUNCTION,
-                                format!("{signature} ({name})"),
-                            ),
-                            DefKind::Let { .. } => (
-                                CompletionItemKind::VARIABLE,
-                                format!("let {} ({name})", d.name),
-                            ),
-                            DefKind::Import | DefKind::Inherit => (
-                                CompletionItemKind::MODULE,
-                                format!("{} {} ({name})", d.kind.label(), d.name),
-                            ),
-                            DefKind::External => (
-                                CompletionItemKind::CLASS,
-                                format!("external {} ({name})", d.name),
-                            ),
-                            DefKind::ObjectKey { .. } | DefKind::Parameter { .. } => return None,
-                        };
-                        Some(CompletionItem {
-                            label: d.name.clone(),
-                            kind: Some(kind),
-                            detail: Some(detail),
-                            ..Default::default()
-                        })
-                    })
-                    .collect(),
-            ));
-        }
-
-        // Fall back to base grammar rules.
-        return Some(CompletionResponse::Array(
-            analysis
-                .base_module
-                .as_deref()
-                .into_iter()
-                .flat_map(|m| m.definitions.iter().flatten())
-                .filter(|d| matches!(d.kind, DefKind::Rule))
-                .map(|d| CompletionItem {
-                    label: d.name.clone(),
-                    kind: Some(CompletionItemKind::CLASS),
-                    detail: Some(format!("rule {} (base)", d.name)),
-                    ..Default::default()
-                })
-                .collect(),
-        ));
+            .filter(|t| t.kind == TokenKind::Ident)
+            .map(|t| &source[t.span.start as usize..t.span.end as usize]);
+        return Some(CompletionResponse::Array(complete_qualified(
+            &analysis, qualifier,
+        )));
     }
 
-    let mut items = Vec::new();
+    Some(CompletionResponse::Array(complete_global(&analysis)))
+}
 
-    // User-defined names from this file + bare-name reachable from inherits
-    // and transitive imports (helper rules / macros / externals materialize
-    // into the importer's namespace).
+/// Completions for `module::` qualified access. When `qualifier` names an
+/// imported/inherited module, list that module's definitions; otherwise fall
+/// back to base grammar rules.
+fn complete_qualified(analysis: &Module, qualifier: Option<&str>) -> Vec<CompletionItem> {
+    if let Some(name) = qualifier
+        && let Some(module_info) = analysis.get_module(name)
+    {
+        return module_info
+            .definitions
+            .iter()
+            .flatten()
+            .filter_map(|d| qualified_member_item(d, name))
+            .collect();
+    }
+    // Fall back to base grammar rules.
+    analysis
+        .base_module
+        .as_deref()
+        .into_iter()
+        .flat_map(|m| m.definitions.iter().flatten())
+        .filter(|d| matches!(d.kind, DefKind::Rule))
+        .map(|d| CompletionItem {
+            label: d.name.clone(),
+            kind: Some(CompletionItemKind::CLASS),
+            detail: Some(format!("rule {} (base)", d.name)),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn qualified_member_item(d: &Definition, module_name: &str) -> Option<CompletionItem> {
+    let (kind, detail) = match &d.kind {
+        DefKind::Rule | DefKind::OverrideRule => (
+            CompletionItemKind::CLASS,
+            format!("rule {} ({module_name})", d.name),
+        ),
+        DefKind::Function { signature } => (
+            CompletionItemKind::FUNCTION,
+            format!("{signature} ({module_name})"),
+        ),
+        DefKind::Let { .. } => (
+            CompletionItemKind::VARIABLE,
+            format!("let {} ({module_name})", d.name),
+        ),
+        DefKind::Import | DefKind::Inherit => (
+            CompletionItemKind::MODULE,
+            format!("{} {} ({module_name})", d.kind.label(), d.name),
+        ),
+        DefKind::External => (
+            CompletionItemKind::CLASS,
+            format!("external {} ({module_name})", d.name),
+        ),
+        DefKind::ObjectKey { .. } | DefKind::Parameter { .. } => return None,
+    };
+    Some(CompletionItem {
+        label: d.name.clone(),
+        kind: Some(kind),
+        detail: Some(detail),
+        ..Default::default()
+    })
+}
+
+/// Global completions: local defs + bare-name reachable from inherits and
+/// transitive imports, plus builtin combinators, keywords, and type names.
+fn complete_global(analysis: &Module) -> Vec<CompletionItem> {
+    let mut items = Vec::new();
     let mut seen_names = rustc_hash::FxHashSet::default();
-    let mut emit = |def: &crate::document::Definition, items: &mut Vec<CompletionItem>| {
-        let (kind, detail) = match &def.kind {
-            DefKind::Rule | DefKind::OverrideRule => {
-                (CompletionItemKind::CLASS, format!("rule {}", def.name))
-            }
-            DefKind::Function { signature } => (CompletionItemKind::FUNCTION, signature.clone()),
-            DefKind::Let { .. } => (CompletionItemKind::VARIABLE, format!("let {}", def.name)),
-            DefKind::External => (CompletionItemKind::CLASS, format!("external {}", def.name)),
-            DefKind::Import
-            | DefKind::Inherit
-            | DefKind::ObjectKey { .. }
-            | DefKind::Parameter { .. } => {
-                return;
-            }
+
+    let mut emit = |def: &Definition| {
+        let Some(item) = global_def_item(def) else {
+            return;
         };
         if seen_names.insert(def.name.clone()) {
-            items.push(CompletionItem {
-                label: def.name.clone(),
-                kind: Some(kind),
-                detail: Some(detail),
-                ..Default::default()
-            });
+            items.push(item);
         }
     };
     for def in analysis.definitions.iter().flatten() {
-        emit(def, &mut items);
+        emit(def);
     }
-    fn walk_module(
-        info: &crate::document::Module,
-        emit: &mut impl FnMut(&crate::document::Definition),
-    ) {
-        for def in info.definitions.iter().flatten() {
-            emit(def);
-        }
-        for (_, sub) in &info.import_modules {
-            walk_module(sub, emit);
-        }
-    }
-    let mut emit_external = |def: &crate::document::Definition| emit(def, &mut items);
-    if let Some(base) = &analysis.base_module {
-        walk_module(base, &mut emit_external);
+    if let Some(base) = analysis.base_module.as_deref() {
+        walk_module(base, &mut emit);
     }
     for (_, info) in &analysis.import_modules {
-        walk_module(info, &mut emit_external);
+        walk_module(info, &mut emit);
     }
 
-    // Builtin combinators.
     for &(name, detail) in BUILTIN_COMBINATORS {
         items.push(CompletionItem {
             label: name.into(),
@@ -262,8 +249,6 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             ..Default::default()
         });
     }
-
-    // Keywords.
     for &(name, detail) in KEYWORDS {
         items.push(CompletionItem {
             label: name.into(),
@@ -272,8 +257,6 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             ..Default::default()
         });
     }
-
-    // Type keywords.
     for &(name, detail) in TYPE_KEYWORDS {
         items.push(CompletionItem {
             label: name.into(),
@@ -282,68 +265,42 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             ..Default::default()
         });
     }
-
-    Some(CompletionResponse::Array(items))
+    items
 }
 
-/// Fallback for dot-completion when cached definitions are unavailable (e.g.
-/// parse error). Scans the token stream for `let OBJ = { KEY: ..., KEY: ... }`
-/// and extracts the KEY identifiers.
-fn object_field_completions_from_tokens(
-    tokens: &[Token],
-    text: &str,
-    obj_name: &str,
-) -> Vec<CompletionItem> {
-    // Find `KwLet Ident(obj_name) Eq LBrace` sequence.
-    let mut i = 0;
-    while i + 3 < tokens.len() {
-        if tokens[i].kind == TokenKind::KwLet
-            && tokens[i + 1].kind == TokenKind::Ident
-            && &text[tokens[i + 1].span.start as usize..tokens[i + 1].span.end as usize] == obj_name
-            && tokens[i + 2].kind == TokenKind::Eq
-            && tokens[i + 3].kind == TokenKind::LBrace
-        {
-            // Scan inside the braces for `Ident Colon` pairs.
-            let mut items = Vec::new();
-            let mut j = i + 4;
-            let mut depth = 1u32;
-            while j < tokens.len() && depth > 0 {
-                match tokens[j].kind {
-                    TokenKind::LBrace => depth += 1,
-                    TokenKind::RBrace => depth -= 1,
-                    TokenKind::Ident if depth == 1 => {
-                        if tokens
-                            .get(j + 1)
-                            .is_some_and(|t| t.kind == TokenKind::Colon)
-                        {
-                            let key =
-                                &text[tokens[j].span.start as usize..tokens[j].span.end as usize];
-                            items.push(CompletionItem {
-                                label: key.into(),
-                                kind: Some(CompletionItemKind::FIELD),
-                                detail: Some(format!("{obj_name}.{key}")),
-                                ..Default::default()
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-            return items;
+fn global_def_item(def: &Definition) -> Option<CompletionItem> {
+    let (kind, detail) = match &def.kind {
+        DefKind::Rule | DefKind::OverrideRule => {
+            (CompletionItemKind::CLASS, format!("rule {}", def.name))
         }
-        i += 1;
-    }
-    Vec::new()
+        DefKind::Function { signature } => (CompletionItemKind::FUNCTION, signature.clone()),
+        DefKind::Let { .. } => (CompletionItemKind::VARIABLE, format!("let {}", def.name)),
+        DefKind::External => (CompletionItemKind::CLASS, format!("external {}", def.name)),
+        DefKind::Import
+        | DefKind::Inherit
+        | DefKind::ObjectKey { .. }
+        | DefKind::Parameter { .. } => return None,
+    };
+    Some(CompletionItem {
+        label: def.name.clone(),
+        kind: Some(kind),
+        detail: Some(detail),
+        ..Default::default()
+    })
 }
 
-/// Find object field completions for `obj_name.` by finding the Let definition
-/// for `obj_name` and returning its `ObjectKey` children.
-fn object_field_completions(
-    definitions: &[crate::document::Definition],
-    obj_name: &str,
-) -> Vec<CompletionItem> {
-    // Find the Let binding's full_span.
+fn walk_module(info: &Module, emit: &mut impl FnMut(&Definition)) {
+    for def in info.definitions.iter().flatten() {
+        emit(def);
+    }
+    for (_, sub) in &info.import_modules {
+        walk_module(sub, emit);
+    }
+}
+
+/// Object field completions for `obj_name.` by finding the Let binding for
+/// `obj_name` and returning its `ObjectKey` children.
+fn complete_object_field(definitions: &[Definition], obj_name: &str) -> Vec<CompletionItem> {
     let Some(let_def) = definitions
         .iter()
         .find(|d| d.name == obj_name && matches!(d.kind, DefKind::Let { .. }))
@@ -351,8 +308,6 @@ fn object_field_completions(
         return Vec::new();
     };
     let let_span = let_def.full_span;
-
-    // Collect ObjectKeys whose span falls within this Let binding.
     definitions
         .iter()
         .filter(|d| {
@@ -369,57 +324,57 @@ fn object_field_completions(
         .collect()
 }
 
-/// Check if the `)` at `rparen_end` closes a `grammar_config(...)` call.
-/// Walks back through the tokens to find the matching `(`, then checks
-/// if the identifier before it is `grammar_config`.
-#[must_use]
-pub fn is_grammar_config_call(tokens: &[Token], rparen_end: u32) -> bool {
-    // Find the RParen token ending at rparen_end.
-    let rp_idx = tokens
-        .iter()
-        .position(|t| t.kind == TokenKind::RParen && t.span.end == rparen_end);
-    let Some(rp_idx) = rp_idx else {
-        return false;
-    };
-    // Walk backwards to find the matching LParen.
-    let mut depth = 1u32;
-    let mut i = rp_idx;
-    while i > 0 {
-        i -= 1;
-        match tokens[i].kind {
-            TokenKind::RParen => depth += 1,
-            TokenKind::LParen => {
-                depth -= 1;
-                if depth == 0 {
-                    break;
+/// Fallback for dot-completion when no parser-derived definitions are
+/// available (parse failed mid-keystroke and no previous good snapshot
+/// exists). Scans the token stream for `let OBJ = { KEY: ..., KEY: ... }`
+/// and extracts the KEY identifiers.
+fn complete_object_field_from_tokens(
+    tokens: &[Token],
+    text: &str,
+    obj_name: &str,
+) -> Vec<CompletionItem> {
+    let mut i = 0;
+    while i + 3 < tokens.len() {
+        if tokens[i].kind == TokenKind::KwLet
+            && tokens[i + 1].kind == TokenKind::Ident
+            && &text[tokens[i + 1].span.start as usize..tokens[i + 1].span.end as usize] == obj_name
+            && tokens[i + 2].kind == TokenKind::Eq
+            && tokens[i + 3].kind == TokenKind::LBrace
+        {
+            let mut items = Vec::new();
+            let mut j = i + 4;
+            let mut depth = 1u32;
+            while j < tokens.len() && depth > 0 {
+                match tokens[j].kind {
+                    TokenKind::LBrace => depth += 1,
+                    TokenKind::RBrace => depth -= 1,
+                    TokenKind::Ident
+                        if depth == 1
+                            && tokens
+                                .get(j + 1)
+                                .is_some_and(|t| t.kind == TokenKind::Colon) =>
+                    {
+                        let key =
+                            &text[tokens[j].span.start as usize..tokens[j].span.end as usize];
+                        items.push(CompletionItem {
+                            label: key.into(),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: Some(format!("{obj_name}.{key}")),
+                            ..Default::default()
+                        });
+                    }
+                    _ => {}
                 }
+                j += 1;
             }
-            _ => {}
+            return items;
         }
+        i += 1;
     }
-    if depth != 0 || i == 0 {
-        return false;
-    }
-    // Check the token before the LParen is the grammar_config keyword.
-    i > 0 && tokens[i - 1].kind == TokenKind::KwGrammarConfig
+    Vec::new()
 }
 
-/// Grammar config fields with their types, matching the typecheck module's field access.
-const GRAMMAR_CONFIG_FIELDS: &[(&str, &str)] = &[
-    ("language", "str_t"),
-    ("inherits", "grammar"),
-    ("start", "rule_t"),
-    ("extras", "list_rule_t"),
-    ("externals", "list_rule_t"),
-    ("inline", "list_rule_t"),
-    ("supertypes", "list_rule_t"),
-    ("conflicts", "list_list_rule_t"),
-    ("precedences", "list_list_rule_t"),
-    ("word", "rule_t"),
-    ("reserved", "{ [context]: list_rule_t }"),
-];
-
-fn grammar_config_field_completions() -> Vec<CompletionItem> {
+fn grammar_config_field_items() -> Vec<CompletionItem> {
     GRAMMAR_CONFIG_FIELDS
         .iter()
         .map(|&(name, ty)| CompletionItem {
