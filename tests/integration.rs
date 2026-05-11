@@ -3079,6 +3079,46 @@ async fn goto_def_through_nested_sub_import() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn hover_through_nested_sub_import() {
+    // Companion to goto_def_through_nested_sub_import. Hover on the tail
+    // member of a 3-level chain must walk the full path - the old
+    // qualifier-by-token-lookback could only see the immediate predecessor
+    // and would silently miss.
+    let dir = tempfile::tempdir().unwrap();
+
+    let utils_text = "macro utils_fn(x: rule_t) rule_t { x }\n";
+    let utils_path = dir.path().join("utils.tsg");
+    std::fs::write(&utils_path, utils_text).unwrap();
+
+    let helpers_text = format!(
+        "let utils = import(\"{}\")\nmacro helper_fn(x: rule_t) rule_t {{ x }}\n",
+        utils_path.display()
+    );
+    let helpers_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helpers_path, &helpers_text).unwrap();
+
+    let grammar_text = format!(
+        "let h = import(\"{}\")\ngrammar {{ language: \"test\" }}\nrule program {{ h::utils::utils_fn(\"x\") }}\n",
+        helpers_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &grammar_text).unwrap();
+
+    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &grammar_text)]).await;
+
+    let offset = grammar_text.find("h::utils::utils_fn").unwrap() + "h::utils::".len();
+    let rope = ropey::Rope::from_str(&grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    assert_eq!(
+        hover_at(&mut service, grammar_uri, pos).await,
+        make_hover("```\nmacro utils_fn(x: rule_t) rule_t\n```"),
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn import_cycle_does_not_hang() {
     // Two files that import each other. The LSP should not hang or crash.
     let dir = tempfile::tempdir().unwrap();

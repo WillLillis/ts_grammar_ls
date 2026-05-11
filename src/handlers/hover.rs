@@ -27,7 +27,7 @@ pub fn hover(backend: &Backend, params: &HoverParams) -> Option<Hover> {
             .map(|def| make_hover(format!("```\n{} {}\n```", def.kind.label(), def.name))),
         // On a member accessed through an imported module (`mod::fn_name`).
         CursorContext::ImportModuleAccess { .. } => {
-            imported_member_hover(&analysis, &analysis.source, &word, offset)
+            imported_member_hover(&analysis, &word, offset)
         }
         CursorContext::Identifier { .. } => {
             identifier_hover(&analysis, &analysis.source, uri, &word, offset)
@@ -117,14 +117,10 @@ fn field_value_hover(
 /// Show hover info for a member accessed through an imported module.
 fn imported_member_hover(
     analysis: &crate::document::Analysis,
-    source: &str,
     word: &str,
     offset: u32,
 ) -> Option<Hover> {
-    // Find which import module this access belongs to.
-    let tokens = analysis.tokens.as_deref()?;
-    let module_name = crate::text::qualified_access_module(tokens, source, offset)?;
-    let module_info = analysis.get_module(module_name)?;
+    let module_info = analysis.qualified_member_module(offset)?;
     let def = module_info.definitions.iter().find(|d| d.name == word)?;
     let content = match &def.kind {
         DefKind::Function { signature } => format!("```\n{signature}\n```"),

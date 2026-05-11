@@ -34,12 +34,7 @@ pub fn prepare_rename(
         }
         CursorContext::ImportModuleAccess { .. } => {
             // Cursor is on the member part of `mod::member`.
-            let qualifier = text::qualified_access_module(
-                analysis.tokens.as_deref()?,
-                &analysis.source,
-                offset,
-            )?;
-            let module = analysis.get_module(qualifier)?;
+            let module = analysis.qualified_member_module(offset)?;
             let def = module.definitions.iter().find(|d| d.name == word)?;
             let range = text::span_to_range(&module.rope, def.name_span);
             Some(PrepareRenameResponse::Range(range))
@@ -83,12 +78,7 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
             rename_cross_file(backend, uri, &analysis, &target_path, word, &new_name)
         }
         CursorContext::ImportModuleAccess { .. } => {
-            let qualifier = text::qualified_access_module(
-                analysis.tokens.as_deref()?,
-                &analysis.source,
-                offset,
-            )?;
-            let target_path = analysis.get_module(qualifier)?.path.clone();
+            let target_path = analysis.qualified_member_module(offset)?.path.clone();
             rename_cross_file(backend, uri, &analysis, &target_path, word, &new_name)
         }
         CursorContext::Identifier { scope } => match analysis.resolve_bare_name(word, scope) {

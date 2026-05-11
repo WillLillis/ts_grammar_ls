@@ -366,6 +366,19 @@ impl Analysis {
         Some(module_info)
     }
 
+    /// At `offset` on a qualified-member reference (`a::b::foo`), return the
+    /// leaf module the qualifier resolves to. Walks the full chain via
+    /// `resolve_import_chain`, so 3-level access like `h::utils::foo` lands
+    /// on `utils`'s module, not on `h`'s.
+    #[must_use]
+    pub fn qualified_member_module(&self, offset: u32) -> Option<&ExternalModuleInfo> {
+        match &self.reference_at(offset)?.kind {
+            RefKind::ImportedMember { path, .. } => self.resolve_import_chain(path),
+            RefKind::BaseRule(_) => self.base_module.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Look up a module by its variable name. Checks both imported modules
     /// and the inherited base grammar.
     #[must_use]
@@ -420,9 +433,25 @@ impl Analysis {
         {
             return Some(CursorContext::GrammarConfigField);
         }
+        // Use the resolved reference at the cursor (when available) to route
+        // qualified access correctly even for multi-level chains like
+        // `h::utils::foo`. The token walkback below can only see the
+        // immediate predecessor, which misclassifies 3-level chains.
+        if let Some(reference) = self.reference_at(offset) {
+            match &reference.kind {
+                RefKind::ImportedMember { .. } => {
+                    return Some(CursorContext::ImportModuleAccess {
+                        scope: self.scope_at(offset),
+                    });
+                }
+                RefKind::BaseRule(_) => return Some(CursorContext::BaseRuleAccess),
+                _ => {}
+            }
+        }
+        // No resolved reference (yet) - fall back to a token-based check so
+        // we can still classify `base::foo` / `h::foo` before the resolver
+        // runs (e.g. mid-keystroke states where the reference list is empty).
         if crate::text::is_base_rule_access(tokens, offset) {
-            // Distinguish base rule access from import module access by checking
-            // whether the qualifier is an import definition.
             if let Some(qualifier) = crate::text::qualified_access_module(tokens, source, offset)
                 && self.definitions.as_ref().is_some_and(|defs| {
                     defs.iter()
