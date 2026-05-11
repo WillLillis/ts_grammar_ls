@@ -59,7 +59,7 @@ pub fn prepare_rename(
                 | DefKind::Let { .. }
                 | DefKind::Parameter { .. }
                 | DefKind::External => {}
-                DefKind::Import | DefKind::Inherit | DefKind::ObjectKey => return None,
+                DefKind::Import | DefKind::Inherit | DefKind::ObjectKey { .. } => return None,
             }
             let range = text::span_to_range(&analysis.rope, def.name_span);
             Some(PrepareRenameResponse::Range(range))

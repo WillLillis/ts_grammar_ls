@@ -76,10 +76,11 @@ fn extract_definitions(
                 });
                 // Extract object field keys as definitions.
                 if let ast::Node::Object(range) = shared.arena.get(*value) {
-                    for &(key_span, _) in shared.pools.get_object(*range) {
+                    for &(key_span, value_id) in shared.pools.get_object(*range) {
+                        let value_span = shared.arena.span(value_id);
                         definitions.push(Definition {
                             name: ctx.text(key_span).to_owned(),
-                            kind: DefKind::ObjectKey,
+                            kind: DefKind::ObjectKey { value_span },
                             name_span: key_span,
                             full_span: key_span,
                         });
@@ -662,47 +663,6 @@ pub fn analyze(text: &str, uri: &Url) -> Option<Module> {
     ))
 }
 
-/// Run lex+parse and invoke `f` with the parsed AST. Returns `None` if either stage fails.
-/// Use this when you need AST access but don't need type information.
-pub fn with_ast<T>(
-    text: &str,
-    uri: &Url,
-    f: impl FnOnce(&ast::SharedAst, &ast::ModuleContext) -> T,
-) -> Option<T> {
-    let grammar_path = uri_to_grammar_path(uri)?;
-    let tokens = nativedsl::lexer::Lexer::new(text).tokenize().ok()?;
-    let mut shared = ast::SharedAst::new(text.len() / 30);
-    let module_ctx =
-        nativedsl::parser::Parser::new(&tokens, text.to_owned(), grammar_path.clone(), &mut shared)
-            .parse()
-            .ok()?;
-    Some(f(&shared, &module_ctx))
-}
-
-/// Find the key span and value node of `<object_name>.<field_name>` by walking
-/// the AST for a top-level `let <object_name> = { ... }` binding with an object
-/// literal value.
-#[must_use]
-pub fn find_object_field(
-    shared: &ast::SharedAst,
-    ctx: &ast::ModuleContext,
-    object_name: &str,
-    field_name: &str,
-) -> Option<(ast::Span, ast::NodeId)> {
-    for &item_id in &ctx.root_items {
-        if let ast::Node::Let { name, value, .. } = shared.arena.get(item_id)
-            && ctx.text(*name) == object_name
-            && let ast::Node::Object(range) = shared.arena.get(*value)
-        {
-            for &(key_span, value_id) in shared.pools.get_object(*range) {
-                if ctx.text(key_span) == field_name {
-                    return Some((key_span, value_id));
-                }
-            }
-        }
-    }
-    None
-}
 
 #[cfg(test)]
 mod bench {

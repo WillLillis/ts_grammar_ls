@@ -39,8 +39,9 @@ pub enum DefKind {
     /// provided symbol (typically scanner-emitted) accessible via qualified
     /// access from importers.
     External,
-    /// A key in an object literal (e.g. `ADD` in `{ ADD: 1 }`).
-    ObjectKey,
+    /// A key in an object literal (e.g. `ADD` in `{ ADD: 1 }`). `value_span`
+    /// covers the right-hand side of the field for source-text display.
+    ObjectKey { value_span: Span },
     /// A function parameter.
     Parameter {
         scope: Span,
@@ -58,7 +59,7 @@ impl DefKind {
             Self::Import => "import",
             Self::Inherit => "inherit",
             Self::External => "external",
-            Self::ObjectKey => "field",
+            Self::ObjectKey { .. } => "field",
             Self::Parameter { .. } => "parameter",
         }
     }
@@ -74,7 +75,7 @@ impl DefKind {
             | Self::Import
             | Self::Inherit
             | Self::External
-            | Self::ObjectKey => None,
+            | Self::ObjectKey { .. } => None,
         }
     }
 

@@ -29,7 +29,7 @@ pub fn document_symbol(
                 DefKind::Let { .. } => SymbolKind::VARIABLE,
                 DefKind::Import | DefKind::Inherit => SymbolKind::MODULE,
                 DefKind::External => SymbolKind::CONSTANT,
-                DefKind::ObjectKey | DefKind::Parameter { .. } => return None,
+                DefKind::ObjectKey { .. } | DefKind::Parameter { .. } => return None,
             };
             let range = text::span_to_range(&analysis.rope, def.full_span);
             let selection_range = text::span_to_range(&analysis.rope, def.name_span);

@@ -1,6 +1,5 @@
 use tower_lsp::lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location, Range, Url};
 
-use crate::analysis;
 use crate::document::{BindingLocation, DefKind, Module, RefKind};
 use crate::server::Backend;
 use crate::text;
@@ -26,7 +25,7 @@ pub fn goto_definition(
                     .map(GotoDefinitionResponse::Scalar);
             }
             RefKind::ObjectField { field, object } => {
-                return goto_object_field(uri, &analysis.source, object, field);
+                return goto_object_field(&analysis, uri, object, field);
             }
             RefKind::InheritPath => {
                 let base = analysis.base_module.as_deref()?;
@@ -101,19 +100,26 @@ fn resolve_bare_name_to_location(
 
 /// Find the definition of an object field (e.g. `CALL` in `PREC.CALL`).
 fn goto_object_field(
+    analysis: &Module,
     uri: &Url,
-    text: &str,
     object_name: &str,
     field_name: &str,
 ) -> Option<GotoDefinitionResponse> {
-    analysis::with_ast(text, uri, |shared, ctx| {
-        let (key_span, _) = analysis::find_object_field(shared, ctx, object_name, field_name)?;
-        let rope = ropey::Rope::from_str(text);
-        Some(GotoDefinitionResponse::Scalar(Location {
-            uri: uri.clone(),
-            range: text::span_to_range(&rope, key_span),
-        }))
-    })?
+    let definitions = analysis.definitions.as_ref()?;
+    let let_def = definitions
+        .iter()
+        .find(|d| d.name == object_name && matches!(d.kind, DefKind::Let { .. }))?;
+    let let_span = let_def.full_span;
+    let key_def = definitions.iter().find(|d| {
+        d.name == field_name
+            && matches!(d.kind, DefKind::ObjectKey { .. })
+            && d.name_span.start >= let_span.start
+            && d.name_span.end <= let_span.end
+    })?;
+    Some(GotoDefinitionResponse::Scalar(Location {
+        uri: uri.clone(),
+        range: text::span_to_range(&analysis.rope, key_def.name_span),
+    }))
 }
 
 /// Jump to the file referenced by an `import("path")` call.

@@ -170,7 +170,7 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
                                 CompletionItemKind::CLASS,
                                 format!("external {} ({name})", d.name),
                             ),
-                            DefKind::ObjectKey | DefKind::Parameter { .. } => return None,
+                            DefKind::ObjectKey { .. } | DefKind::Parameter { .. } => return None,
                         };
                         Some(CompletionItem {
                             label: d.name.clone(),
@@ -215,7 +215,10 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
             DefKind::Function { signature } => (CompletionItemKind::FUNCTION, signature.clone()),
             DefKind::Let { .. } => (CompletionItemKind::VARIABLE, format!("let {}", def.name)),
             DefKind::External => (CompletionItemKind::CLASS, format!("external {}", def.name)),
-            DefKind::Import | DefKind::Inherit | DefKind::ObjectKey | DefKind::Parameter { .. } => {
+            DefKind::Import
+            | DefKind::Inherit
+            | DefKind::ObjectKey { .. }
+            | DefKind::Parameter { .. } => {
                 return;
             }
         };
@@ -353,7 +356,7 @@ fn object_field_completions(
     definitions
         .iter()
         .filter(|d| {
-            d.kind == DefKind::ObjectKey
+            matches!(d.kind, DefKind::ObjectKey { .. })
                 && d.name_span.start >= let_span.start
                 && d.name_span.end <= let_span.end
         })

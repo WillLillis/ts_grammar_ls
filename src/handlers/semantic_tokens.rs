@@ -81,7 +81,7 @@ fn compute_semantic_tokens(text: &str, rope: &Rope, analysis: &Module) -> Vec<Se
             | DefKind::Inherit
             | DefKind::External
             | DefKind::Parameter { .. } => (TYPE_VARIABLE, MOD_DECLARATION),
-            DefKind::ObjectKey => continue,
+            DefKind::ObjectKey { .. } => continue,
         };
         index.insert(def.name_span.start, value);
     }

@@ -1,6 +1,5 @@
 use tower_lsp::lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 
-use crate::analysis;
 use crate::document::{BindingLocation, CursorContext, DefKind, RefKind};
 use crate::hover_docs;
 use crate::server::Backend;
@@ -30,7 +29,7 @@ pub fn hover(backend: &Backend, params: &HoverParams) -> Option<Hover> {
             imported_member_hover(&analysis, &word, offset)
         }
         CursorContext::Identifier { .. } => {
-            identifier_hover(&analysis, &analysis.source, uri, &word, offset)
+            identifier_hover(&analysis, &analysis.source, &word, offset)
         }
     }
 }
@@ -38,7 +37,6 @@ pub fn hover(backend: &Backend, params: &HoverParams) -> Option<Hover> {
 fn identifier_hover(
     analysis: &crate::document::Module,
     text: &str,
-    uri: &tower_lsp::lsp_types::Url,
     word: &str,
     offset: u32,
 ) -> Option<Hover> {
@@ -52,9 +50,13 @@ fn identifier_hover(
     // Object field access (e.g. `CALL` in `PREC.CALL`) - show the field's value.
     if let Some(RefKind::ObjectField { field, object }) =
         analysis.reference_at(offset).map(|r| r.kind.clone())
-        && let Some(content) = field_value_hover(text, uri, &object, &field)
+        && let Some(def) = find_object_field(analysis, &object, &field)
+        && let DefKind::ObjectKey { value_span } = def.kind
     {
-        return Some(make_hover(content));
+        let value_text = &text[value_span.start as usize..value_span.end as usize];
+        return Some(make_hover(format!(
+            "```\n{object}.{field} = {value_text}\n```"
+        )));
     }
 
     // User-defined names: local bindings first, then helper-rule and external
@@ -82,20 +84,24 @@ fn identifier_hover(
     hover_docs::builtin_hover(word).map(|info| make_hover(info.to_string()))
 }
 
-/// Find the value of `object.field` and render it as a hover string.
-fn field_value_hover(
-    text: &str,
-    uri: &tower_lsp::lsp_types::Url,
-    object_name: &str,
+/// Find the `DefKind::ObjectKey` definition matching `obj_name.field_name`,
+/// resolved via the existing top-level `Let` binding for `obj_name`.
+fn find_object_field<'a>(
+    analysis: &'a crate::document::Module,
+    obj_name: &str,
     field_name: &str,
-) -> Option<String> {
-    analysis::with_ast(text, uri, |shared, ctx| {
-        let (_, value_id) = analysis::find_object_field(shared, ctx, object_name, field_name)?;
-        let value_text = ctx.text(shared.arena.span(value_id));
-        Some(format!(
-            "```\n{object_name}.{field_name} = {value_text}\n```"
-        ))
-    })?
+) -> Option<&'a crate::document::Definition> {
+    let definitions = analysis.definitions.as_ref()?;
+    let let_def = definitions
+        .iter()
+        .find(|d| d.name == obj_name && matches!(d.kind, DefKind::Let { .. }))?;
+    let let_span = let_def.full_span;
+    definitions.iter().find(|d| {
+        d.name == field_name
+            && matches!(d.kind, DefKind::ObjectKey { .. })
+            && d.name_span.start >= let_span.start
+            && d.name_span.end <= let_span.end
+    })
 }
 
 /// Show hover info for a member accessed through an imported module.
