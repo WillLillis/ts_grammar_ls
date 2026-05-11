@@ -52,7 +52,10 @@ fn extract_definitions(
                 for param in &config.params {
                     definitions.push(Definition {
                         name: ctx.text(param.name).to_owned(),
-                        kind: DefKind::Parameter { scope: fn_span },
+                        kind: DefKind::Parameter {
+                            scope: fn_span,
+                            ty: param.ty,
+                        },
                         name_span: param.name,
                         full_span: param.name,
                     });
@@ -108,7 +111,10 @@ fn extract_definitions(
             for binding in &config.bindings {
                 definitions.push(Definition {
                     name: ctx.text(binding.name).to_owned(),
-                    kind: DefKind::Parameter { scope },
+                    kind: DefKind::Parameter {
+                        scope,
+                        ty: binding.ty,
+                    },
                     name_span: binding.name,
                     full_span: binding.name,
                 });

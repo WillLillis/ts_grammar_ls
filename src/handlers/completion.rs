@@ -49,20 +49,9 @@ const TYPE_KEYWORDS: &[(&str, &str)] = &[
     ("rule_t", "Rule expression type"),
     ("str_t", "String type"),
     ("int_t", "Integer type"),
-    ("list_rule_t", "List of rules type"),
-    ("list_str_t", "List of strings type"),
-    ("list_int_t", "List of integers type"),
-    ("list_list_rule_t", "List of lists of rules type"),
-    ("list_list_str_t", "List of lists of strings type"),
-    ("list_list_int_t", "List of lists of integers type"),
-    (
-        "void_t",
-        "Internal type returned by print; not a user-writable annotation",
-    ),
-    (
-        "spread_t",
-        "Internal type produced by for-loop expansions; not a user-writable annotation",
-    ),
+    ("module_t", "Any module reference (import or inherit result)"),
+    ("list_t", "Generic list type, e.g. list_t<rule_t>"),
+    ("obj_t", "Generic object type, e.g. obj_t<list_t<rule_t>>"),
 ];
 
 /// Grammar config fields with their types, matching the typecheck module's field access.

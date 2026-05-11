@@ -47,6 +47,11 @@ fn identifier_hover(
         return Some(make_hover(content));
     }
 
+    // inherit("path") / import("path") - show the resolved canonical path.
+    if let Some(content) = path_string_hover(analysis, offset) {
+        return Some(make_hover(content));
+    }
+
     // Object field access (e.g. `CALL` in `PREC.CALL`) - show the field's value.
     if let Some(RefKind::ObjectField { field, object }) =
         analysis.reference_at(offset).map(|r| r.kind.clone())
@@ -70,6 +75,9 @@ fn identifier_hover(
                     || format!("```\nlet {}\n```", def.name),
                     |ty| format!("```\nlet {}: {ty}\n```", def.name),
                 ),
+                DefKind::Parameter { ty, .. } => {
+                    format!("```\nparameter {}: {ty}\n```", def.name)
+                }
                 _ => format!("```\n{} {}\n```", def.kind.label(), def.name),
             },
             BindingLocation::External { def, .. } => match &def.kind {
@@ -82,6 +90,30 @@ fn identifier_hover(
 
     // Builtins and keywords.
     hover_docs::builtin_hover(word).map(|info| make_hover(info.to_string()))
+}
+
+/// Hover for the path string inside `inherit("...")` / `import("...")`:
+/// show the resolved canonical path.
+fn path_string_hover(analysis: &crate::document::Module, offset: u32) -> Option<String> {
+    let reference = analysis.reference_at(offset)?;
+    match &reference.kind {
+        RefKind::InheritPath => {
+            let base = analysis.base_module.as_deref()?;
+            Some(format!("```\ninherit: {}\n```", base.path.display()))
+        }
+        RefKind::ImportPath => {
+            // Find which `let X = import(...)` binding owns this path span.
+            let defs = analysis.definitions.as_ref()?;
+            let import_def = defs.iter().find(|d| {
+                matches!(d.kind, DefKind::Import)
+                    && reference.span.start >= d.full_span.start
+                    && reference.span.end <= d.full_span.end
+            })?;
+            let module = analysis.get_module(&import_def.name)?;
+            Some(format!("```\nimport: {}\n```", module.path.display()))
+        }
+        _ => None,
+    }
 }
 
 /// Find the `DefKind::ObjectKey` definition matching `obj_name.field_name`,

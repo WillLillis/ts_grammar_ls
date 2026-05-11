@@ -893,43 +893,6 @@ async fn hover_type_keyword() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn hover_print_keyword() {
-    // `print` is a new top-level debug-print keyword. Hovering it should
-    // surface KW_PRINT docs instead of e.g. treating it as an identifier.
-    let grammar = r#"
-grammar { language: "test" }
-print("hello")
-rule program { "x" }
-"#;
-    let mut service = init(&[(test_uri(), grammar)]).await;
-
-    // line 2: `print("hello")` - 'p' of print is at col 0
-    let result = hover_at(&mut service, test_uri(), Position::new(2, 2)).await;
-
-    assert_eq!(result, make_hover(hover_docs::KW_PRINT));
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn hover_list_list_rule_type_keyword() {
-    // `list_list_rule_t` is one of the types added when conflicts/precedences
-    // were de-special-cased. Hovering on it should surface the new docs.
-    let grammar = r#"
-grammar { language: "test" }
-let groups: list_list_rule_t = [[a], [b]]
-rule program { "x" }
-rule a { "a" }
-rule b { "b" }
-"#;
-    let mut service = init(&[(test_uri(), grammar)]).await;
-
-    // line 2: `let groups: list_list_rule_t = [[a], [b]]`
-    //                     ^ col 12
-    let result = hover_at(&mut service, test_uri(), Position::new(2, 13)).await;
-
-    assert_eq!(result, make_hover(hover_docs::TYPE_LIST_LIST_RULE_T));
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn hover_variable_reference() {
     let grammar = r#"
 grammar { language: "test" }

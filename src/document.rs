@@ -42,9 +42,13 @@ pub enum DefKind {
     /// A key in an object literal (e.g. `ADD` in `{ ADD: 1 }`). `value_span`
     /// covers the right-hand side of the field for source-text display.
     ObjectKey { value_span: Span },
-    /// A function parameter.
+    /// A function parameter or for-loop binding. `scope` is the span of the
+    /// owning macro / for-loop. `ty` is the declared type (parameters always
+    /// have an explicit annotation; for-loop bindings inherit from the
+    /// iterable's element type).
     Parameter {
         scope: Span,
+        ty: Ty,
     },
 }
 
@@ -68,7 +72,7 @@ impl DefKind {
     pub const fn scope(&self) -> Option<Span> {
         match self {
             Self::Let { scope, .. } => *scope,
-            Self::Parameter { scope } => Some(*scope),
+            Self::Parameter { scope, .. } => Some(*scope),
             Self::Rule
             | Self::OverrideRule
             | Self::Function { .. }
@@ -424,7 +428,7 @@ impl Module {
             let scope_span = match def.kind {
                 DefKind::Function { .. } => def.full_span,
                 // The scope field of a parameter points to its enclosing scope.
-                DefKind::Parameter { scope } => scope,
+                DefKind::Parameter { scope, .. } => scope,
                 _ => continue,
             };
             if offset >= scope_span.start && offset < scope_span.end {
@@ -543,6 +547,7 @@ mod tests {
     fn visible_from_scoped_not_visible_at_top_level() {
         let param = DefKind::Parameter {
             scope: Span::new(10, 50),
+            ty: Ty::RULE,
         };
         assert!(!param.visible_from(None));
     }
@@ -551,6 +556,7 @@ mod tests {
     fn visible_from_same_scope() {
         let param = DefKind::Parameter {
             scope: Span::new(10, 50),
+            ty: Ty::RULE,
         };
         assert!(param.visible_from(Some(Span::new(10, 50))));
     }
@@ -560,6 +566,7 @@ mod tests {
         // Param defined in outer scope [10, 100], cursor in inner scope [20, 50].
         let param = DefKind::Parameter {
             scope: Span::new(10, 100),
+            ty: Ty::RULE,
         };
         assert!(param.visible_from(Some(Span::new(20, 50))));
     }
@@ -569,6 +576,7 @@ mod tests {
         // Param defined in inner scope [20, 50], cursor in outer scope [10, 100].
         let param = DefKind::Parameter {
             scope: Span::new(20, 50),
+            ty: Ty::RULE,
         };
         assert!(!param.visible_from(Some(Span::new(10, 100))));
     }
@@ -577,6 +585,7 @@ mod tests {
     fn visible_from_disjoint_scope() {
         let param = DefKind::Parameter {
             scope: Span::new(10, 50),
+            ty: Ty::RULE,
         };
         assert!(!param.visible_from(Some(Span::new(60, 100))));
     }

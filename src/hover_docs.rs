@@ -324,24 +324,6 @@ rule binary_expr {
 }
 ```";
 
-pub const KW_PRINT: &str = "\
-```
-print(<expr>)
-```
-Debug-print a value to stderr at grammar evaluation time. The argument can \
-be any concrete value (a rule, string, int, list, object, etc.). Output is \
-prefixed with `path:line:`. Passing a bare rule reference expands the rule \
-body. Only valid as a top-level item. Does not produce a value - cannot be \
-bound, spread, or composed.
-```
-let PREC = { ADD: 1, MUL: 2 }
-print(PREC)
-// grammar.tsg:3: {
-//   ADD: 1,
-//   MUL: 2
-// }
-```";
-
 // ---------------------------------------------------------------------------
 // Grammar config fields
 // ---------------------------------------------------------------------------
@@ -469,34 +451,26 @@ pub const TYPE_STR_T: &str = "\
 pub const TYPE_INT_T: &str = "\
 `int_t` - An integer value.";
 
-pub const TYPE_LIST_RULE_T: &str = "\
-`list_rule_t` - A list of rule expressions.";
+pub const TYPE_MODULE_T: &str = "\
+`module_t` - Any imported or inherited module reference. Matches the concrete \
+module returned by `import(...)` / `inherit(...)`; used for macro parameters \
+that need to accept any module.";
 
-pub const TYPE_LIST_STR_T: &str = "\
-`list_str_t` - A list of strings. Subtypes `list_rule_t`.";
+pub const TYPE_LIST_T: &str = "\
+```
+list_t<T>
+```
+A list with elements of type `T`. The element type is required: `list_t<rule_t>`, \
+`list_t<str_t>`, `list_t<int_t>`, or `list_t<list_t<X>>` (triple nesting is \
+rejected at parse time).";
 
-pub const TYPE_LIST_INT_T: &str = "\
-`list_int_t` - A list of integers.";
-
-pub const TYPE_LIST_LIST_RULE_T: &str = "\
-`list_list_rule_t` - A list of lists of rule expressions. Used by `conflicts` and `precedences`.";
-
-pub const TYPE_LIST_LIST_STR_T: &str = "\
-`list_list_str_t` - A list of lists of strings. Subtypes `list_list_rule_t`.";
-
-pub const TYPE_LIST_LIST_INT_T: &str = "\
-`list_list_int_t` - A list of lists of integers.";
-
-pub const TYPE_VOID_T: &str = "\
-`void_t` - Internal type returned by `print`. Not usable as a type annotation; \
-appears in error messages when a `print` call or for-loop expansion is used \
-where a real value is expected.";
-
-pub const TYPE_SPREAD_T: &str = "\
-`spread_t` - Internal type produced by for-loop expressions. A for-loop \
-doesn't produce a standalone value; it splices its iterations inline into the \
-enclosing `seq`/`choice`/list. Not usable as a type annotation; appears in \
-error messages when a for-loop is used where a concrete value is expected.";
+pub const TYPE_OBJ_T: &str = "\
+```
+obj_t<T>
+```
+An object literal with values of type `T`. The element type is required and \
+must be non-Object (`obj_t<obj_t<X>>` is structurally impossible). Typically \
+indexed via `obj.field` access.";
 
 // ---------------------------------------------------------------------------
 // Lookup
@@ -550,18 +524,12 @@ pub fn builtin_hover(name: &str) -> Option<&'static str> {
         "let" => KW_LET,
         "macro" | "in" => KW_FN,
         "for" => KW_FOR,
-        "print" => KW_PRINT,
         "rule_t" => TYPE_RULE_T,
         "str_t" => TYPE_STR_T,
         "int_t" => TYPE_INT_T,
-        "list_rule_t" => TYPE_LIST_RULE_T,
-        "list_str_t" => TYPE_LIST_STR_T,
-        "list_int_t" => TYPE_LIST_INT_T,
-        "list_list_rule_t" => TYPE_LIST_LIST_RULE_T,
-        "list_list_str_t" => TYPE_LIST_LIST_STR_T,
-        "list_list_int_t" => TYPE_LIST_LIST_INT_T,
-        "void_t" => TYPE_VOID_T,
-        "spread_t" => TYPE_SPREAD_T,
+        "module_t" => TYPE_MODULE_T,
+        "list_t" => TYPE_LIST_T,
+        "obj_t" => TYPE_OBJ_T,
         _ => return None,
     })
 }
