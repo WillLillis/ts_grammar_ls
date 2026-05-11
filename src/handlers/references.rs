@@ -84,28 +84,14 @@ fn bare_name_external_references(
                 .find(|m| m.path == target_path)
         })?;
     if let Ok(module_uri) = Url::from_file_path(&target_module.path) {
-        if include_declaration
-            && let Some(def) = target_module
-                .definitions
-                .iter()
-                .flatten()
-                .find(|d| d.name == word)
-        {
+        for (span, is_decl) in target_module.bare_name_occurrences(word) {
+            if !include_declaration && is_decl {
+                continue;
+            }
             locations.push(Location {
                 uri: module_uri.clone(),
-                range: text::span_to_range(&target_module.rope, def.name_span),
+                range: text::span_to_range(&target_module.rope, span),
             });
-        }
-        for reference in target_module.references.iter().flatten() {
-            if matches!(
-                &reference.kind,
-                RefKind::Rule(name) | RefKind::Variable(name) if name == word
-            ) {
-                locations.push(Location {
-                    uri: module_uri.clone(),
-                    range: text::span_to_range(&target_module.rope, reference.span),
-                });
-            }
         }
     }
 
@@ -176,30 +162,16 @@ fn base_rule_references(
     if let Some(base) = analysis.base_module.as_deref()
         && let Ok(base_uri) = Url::from_file_path(&base.path)
     {
-        if include_declaration
-            && let Some(def) = base
-                .definitions
-                .iter()
-                .flatten()
-                .find(|d| d.name == word)
-        {
+        // Includes inherited rules and macros - both can be referenced
+        // unqualified from a derived grammar.
+        for (span, is_decl) in base.bare_name_occurrences(word) {
+            if !include_declaration && is_decl {
+                continue;
+            }
             locations.push(Location {
                 uri: base_uri.clone(),
-                range: text::span_to_range(&base.rope, def.name_span),
+                range: text::span_to_range(&base.rope, span),
             });
-        }
-        for reference in base.references.iter().flatten() {
-            // Match both rule references and macro/variable references by
-            // name - inherited names can be either rules or macros.
-            if matches!(
-                &reference.kind,
-                RefKind::Rule(name) | RefKind::Variable(name) if name == word,
-            ) {
-                locations.push(Location {
-                    uri: base_uri.clone(),
-                    range: text::span_to_range(&base.rope, reference.span),
-                });
-            }
         }
     }
 

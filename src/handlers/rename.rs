@@ -126,29 +126,10 @@ fn rename_cross_file(
 
     // External file: definition site + internal refs (Rule/Variable kinds).
     let target_module = find_external_module(cursor_analysis, target_path)?;
-    let mut external_edits = Vec::new();
-    for def in target_module.definitions.iter().flatten() {
-        if def.name == word {
-            external_edits.push(make_rename_edit(
-                &target_module.rope,
-                def.name_span,
-                new_name,
-            ));
-        }
-    }
-    for reference in target_module.references.iter().flatten() {
-        let name_matches = match &reference.kind {
-            RefKind::Rule(name) | RefKind::Variable(name) => name == word,
-            _ => false,
-        };
-        if name_matches {
-            external_edits.push(make_rename_edit(
-                &target_module.rope,
-                reference.span,
-                new_name,
-            ));
-        }
-    }
+    let external_edits: Vec<TextEdit> = target_module
+        .bare_name_occurrences(word)
+        .map(|(span, _)| make_rename_edit(&target_module.rope, span, new_name))
+        .collect();
     if !external_edits.is_empty() {
         let external_uri = Url::from_file_path(target_path).ok()?;
         changes.insert(external_uri, external_edits);

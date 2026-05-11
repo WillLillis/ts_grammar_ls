@@ -274,6 +274,33 @@ impl Module {
             .map(|(_, info)| info)
     }
 
+    /// Iterate the spans of bare-name occurrences of `word` in this module:
+    /// definition sites whose name matches, plus `Rule`/`Variable` references
+    /// (the kinds that bind without an explicit `::` qualifier). Yields
+    /// `(span, is_decl)` so callers can filter on the LSP `includeDeclaration`
+    /// flag. Used by cross-file rename and find-references when walking the
+    /// owning module of an inherited/imported binding.
+    pub fn bare_name_occurrences<'a>(
+        &'a self,
+        word: &'a str,
+    ) -> impl Iterator<Item = (Span, bool)> + 'a {
+        let defs = self
+            .definitions
+            .iter()
+            .flatten()
+            .filter(move |d| d.name == word)
+            .map(|d| (d.name_span, true));
+        let refs = self
+            .references
+            .iter()
+            .flatten()
+            .filter(move |r| {
+                matches!(&r.kind, RefKind::Rule(n) | RefKind::Variable(n) if n == word)
+            })
+            .map(|r| (r.span, false));
+        defs.chain(refs)
+    }
+
     /// Find the reference at `offset`, preferring more specific kinds when
     /// multiple references share a span (e.g. `helpers::commaSep` produces
     /// both an inner `Variable("commaSep")` and an outer `ImportedMember`).
