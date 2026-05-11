@@ -3352,9 +3352,12 @@ async fn completion_grammar_config_dot_fields() {
             ci("conflicts", "list_list_rule_t"),
             ci("externals", "list_rule_t"),
             ci("extras", "list_rule_t"),
+            ci("inherits", "grammar"),
             ci("inline", "list_rule_t"),
+            ci("language", "str_t"),
             ci("precedences", "list_list_rule_t"),
             ci("reserved", "{ [context]: list_rule_t }"),
+            ci("start", "rule_t"),
             ci("supertypes", "list_rule_t"),
             ci("word", "rule_t"),
         ]
@@ -4221,6 +4224,40 @@ async fn rename_includes_closed_workspace_dependents() {
         assert_eq!(edits.len(), 1, "{uri} should have one edit");
         assert_eq!(edits[0].new_text, "bar");
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn for_loop_spread_into_list_extracts_binding() {
+    // Core supports spreading a for-loop into list literals (extras, etc.).
+    // Verify the LSP picks up the for-loop binding so goto-def on a use
+    // inside the spread body lands on the binding.
+    let grammar = r#"
+let kws: list_t<str_t> = [for (kw: str_t) in ["if", "else"] { kw }]
+grammar {
+    language: "test",
+    reserved: { global: kws },
+}
+rule program { "x" }
+"#;
+    let uri = test_uri();
+    let mut service = init(&[(uri.clone(), grammar)]).await;
+
+    // Cursor on the body `kw` (the use inside the for body).
+    let body_offset = grammar.find("{ kw }").unwrap() + "{ ".len();
+    let rope = ropey::Rope::from_str(grammar);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, body_offset as u32);
+
+    let resp = goto_def_at(&mut service, uri.clone(), pos)
+        .await
+        .expect("goto-def should resolve for-loop binding");
+    let GotoDefinitionResponse::Scalar(loc) = resp else {
+        panic!("expected scalar location");
+    };
+    // Should land on the binding (`(kw: str_t)`).
+    let binding_offset = grammar.find("(kw: str_t)").unwrap() + 1; // start of `kw`
+    let expected_start = ts_grammar_ls::text::offset_to_position(&rope, binding_offset as u32);
+    assert_eq!(loc.uri, uri);
+    assert_eq!(loc.range.start, expected_start);
 }
 
 // ---------------------------------------------------------------------------

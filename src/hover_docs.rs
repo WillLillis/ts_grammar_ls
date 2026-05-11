@@ -444,6 +444,18 @@ let base = inherit(\"../tree-sitter-c/grammar.tsg\")
 grammar { inherits: base }
 ```";
 
+pub const CFG_START: &str = "\
+```
+start: rule
+```
+The grammar's start symbol. Must reference a declared rule. By default \
+the first rule in source order is the start; `start:` lets a derived \
+grammar pick a non-default start rule from its inherited base without \
+re-declaring everything.
+```
+grammar { inherits: base, start: type }
+```";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -503,6 +515,7 @@ pub fn grammar_field_hover(name: &str) -> Option<&'static str> {
         "precedences" => CFG_PRECEDENCES,
         "reserved" => CFG_RESERVED,
         "inherits" => CFG_INHERITS,
+        "start" => CFG_START,
         _ => return None,
     })
 }

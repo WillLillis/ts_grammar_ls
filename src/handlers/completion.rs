@@ -401,6 +401,9 @@ pub fn is_grammar_config_call(tokens: &[Token], rparen_end: u32) -> bool {
 
 /// Grammar config fields with their types, matching the typecheck module's field access.
 const GRAMMAR_CONFIG_FIELDS: &[(&str, &str)] = &[
+    ("language", "str_t"),
+    ("inherits", "grammar"),
+    ("start", "rule_t"),
     ("extras", "list_rule_t"),
     ("externals", "list_rule_t"),
     ("inline", "list_rule_t"),
