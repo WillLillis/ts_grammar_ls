@@ -6,25 +6,6 @@ use tower_lsp::lsp_types::Diagnostic;
 use tree_sitter_generate::nativedsl::ast::Span;
 use tree_sitter_generate::nativedsl::lexer::Token;
 
-/// Cached results from the two diagnostic phases.
-#[derive(Default, Clone)]
-pub struct DiagnosticCache {
-    /// Diagnostics from the DSL evaluation pipeline
-    pub dsl: Vec<Diagnostic>,
-    /// Diagnostics from the full generate pipeline
-    pub generate: Vec<Diagnostic>,
-}
-
-impl DiagnosticCache {
-    /// All diagnostics merged for publishing.
-    #[must_use]
-    pub fn all(&self) -> Vec<Diagnostic> {
-        let mut out = self.dsl.clone();
-        out.extend(self.generate.iter().cloned());
-        out
-    }
-}
-
 /// A definition extracted from the AST.
 #[derive(Clone, Debug)]
 pub struct Definition {
@@ -498,8 +479,13 @@ pub struct Document {
     pub rope: Rope,
     /// LSP document version.
     pub version: i32,
-    /// Cached diagnostics, split by phase.
-    pub diagnostics: DiagnosticCache,
+    /// Diagnostics from the DSL pipeline (lex/parse/resolve/typecheck).
+    /// Re-run and replaced on every `did_change`.
+    pub dsl_diagnostics: Vec<Diagnostic>,
+    /// Diagnostics from the full generate pipeline (subprocess). Preserved
+    /// across `did_change` so they keep showing between saves; replaced when
+    /// a new generate-check completes.
+    pub generate_diagnostics: Vec<Diagnostic>,
     /// Last analysis where parse succeeded. Used as a fallback when the
     /// current text fails to parse, so handlers (hover, completion, ...) keep
     /// working mid-keystroke. Never consulted on the success path: every

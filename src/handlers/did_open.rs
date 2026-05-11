@@ -3,7 +3,7 @@ use tower_lsp::lsp_types::DidOpenTextDocumentParams;
 use tracing::info;
 
 use crate::diagnostics;
-use crate::document::{DiagnosticCache, Document};
+use crate::document::Document;
 use crate::server::{Backend, cancel_pending_diagnostics, drop_dependents};
 
 pub async fn did_open(backend: &Backend, params: DidOpenTextDocumentParams) {
@@ -32,7 +32,8 @@ pub async fn did_open(backend: &Backend, params: DidOpenTextDocumentParams) {
             rope: Rope::from_str(&text),
             text: text.clone(),
             version,
-            diagnostics: DiagnosticCache::default(),
+            dsl_diagnostics: Vec::new(),
+            generate_diagnostics: Vec::new(),
             last_good_analysis: None,
             deps: Vec::new(),
         },

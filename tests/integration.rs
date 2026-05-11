@@ -567,7 +567,7 @@ async fn diagnostics_clean_grammar_no_errors() {
     let service = init(&[(test_uri(), SIMPLE_GRAMMAR)]).await;
 
     let doc = service.inner().document_map.get(&test_uri()).unwrap();
-    assert_eq!(doc.diagnostics.dsl, vec![]);
+    assert_eq!(doc.dsl_diagnostics, vec![]);
 }
 
 #[expect(clippy::significant_drop_tightening)]
@@ -578,7 +578,7 @@ async fn diagnostics_syntax_error() {
 
     let doc = service.inner().document_map.get(&test_uri()).unwrap();
     assert_eq!(
-        doc.diagnostics.dsl,
+        doc.dsl_diagnostics,
         vec![Diagnostic {
             range: Range::new(Position::new(0, 43), Position::new(0, 43)),
             severity: Some(DiagnosticSeverity::ERROR),
@@ -601,7 +601,7 @@ async fn diagnostics_type_error() {
 
     let doc = service.inner().document_map.get(&test_uri()).unwrap();
     assert_eq!(
-        doc.diagnostics.dsl,
+        doc.dsl_diagnostics,
         vec![Diagnostic {
             range: Range::new(Position::new(2, 37), Position::new(2, 38)),
             severity: Some(DiagnosticSeverity::ERROR),
@@ -1150,7 +1150,7 @@ async fn diagnostics_resolve_error() {
 
     let doc = service.inner().document_map.get(&test_uri()).unwrap();
     assert_eq!(
-        doc.diagnostics.dsl,
+        doc.dsl_diagnostics,
         vec![Diagnostic {
             severity: Some(DiagnosticSeverity::ERROR),
             source: Some("ts_grammar_ls".into()),
@@ -1169,7 +1169,7 @@ async fn diagnostics_lex_error() {
 
     let doc = service.inner().document_map.get(&test_uri()).unwrap();
     assert_eq!(
-        doc.diagnostics.dsl,
+        doc.dsl_diagnostics,
         vec![Diagnostic {
             range: Range::new(Position::new(0, 45), Position::new(0, 48)),
             severity: Some(DiagnosticSeverity::ERROR),
@@ -1998,7 +1998,7 @@ async fn diagnostics_lower_error() {
 
     let doc = service.inner().document_map.get(&test_uri()).unwrap();
     assert_eq!(
-        doc.diagnostics.dsl,
+        doc.dsl_diagnostics,
         vec![Diagnostic {
             range: Range::new(Position::new(3, 23), Position::new(3, 31)),
             severity: Some(DiagnosticSeverity::ERROR),
@@ -2469,8 +2469,7 @@ async fn did_save_refreshes_cached_diagnostics() {
         .document_map
         .get_mut(&test_uri())
         .unwrap()
-        .diagnostics
-        .dsl = vec![sentinel.clone()];
+        .dsl_diagnostics = vec![sentinel.clone()];
 
     lsp_notify::<DidSaveTextDocument>(
         &mut service,
@@ -2483,7 +2482,7 @@ async fn did_save_refreshes_cached_diagnostics() {
 
     // Pipeline ran: cached diagnostics reflect the clean grammar, not the sentinel.
     let doc = service.inner().document_map.get(&test_uri()).unwrap();
-    assert_eq!(doc.diagnostics.dsl, vec![]);
+    assert_eq!(doc.dsl_diagnostics, vec![]);
 }
 
 #[tokio::test(flavor = "current_thread")]

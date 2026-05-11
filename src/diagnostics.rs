@@ -23,6 +23,13 @@ use crate::text;
 use tree_sitter_generate::nativedsl::serialize::grammar_to_json;
 use tree_sitter_generate::parse_grammar::normalize_grammar;
 
+/// Merge DSL-phase and generate-phase diagnostics for publishing.
+fn merge_diagnostics(doc: &Document) -> Vec<Diagnostic> {
+    let mut out = doc.dsl_diagnostics.clone();
+    out.extend(doc.generate_diagnostics.iter().cloned());
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Error conversion
 // ---------------------------------------------------------------------------
@@ -169,8 +176,8 @@ async fn publish_dsl_diagnostics(
         let Some(mut doc) = document_map.get_mut(uri) else {
             return dsl_ok;
         };
-        doc.diagnostics.dsl = dsl_diagnostics;
-        doc.diagnostics.all()
+        doc.dsl_diagnostics = dsl_diagnostics;
+        merge_diagnostics(&doc)
     };
     client
         .publish_diagnostics(uri.clone(), all, Some(version))
@@ -344,8 +351,8 @@ fn spawn_generate_check(
         }
 
         let all = document_map.get_mut(&uri).map(|mut doc| {
-            doc.diagnostics.generate = generate_diagnostics;
-            doc.diagnostics.all()
+            doc.generate_diagnostics = generate_diagnostics;
+            merge_diagnostics(&doc)
         });
         if let Some(all) = all {
             client
