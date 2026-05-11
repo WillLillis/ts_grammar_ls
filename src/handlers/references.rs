@@ -232,12 +232,9 @@ fn local_references(
     }
 
     for reference in analysis.references.iter().flatten() {
-        // Exclude BaseRule and ImportedMember references - they refer to
-        // external modules, not local definitions.
-        if matches!(
-            reference.kind,
-            RefKind::BaseRule(_) | RefKind::ImportedMember { .. }
-        ) {
+        // Exclude qualified (`base::foo`, `mod::foo`) refs - those are
+        // handled by the cross-module reference routes.
+        if reference.kind.is_qualified() {
             continue;
         }
         if reference.matches_word(word, source, cursor_scope) {

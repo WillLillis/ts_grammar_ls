@@ -310,10 +310,7 @@ fn rename_local(
     // Reference sites: re-resolve each candidate at its own enclosing scope
     // and include only if it binds to the target.
     for reference in analysis.references.iter().flatten() {
-        if matches!(
-            reference.kind,
-            RefKind::BaseRule(_) | RefKind::ImportedMember { .. }
-        ) {
+        if reference.kind.is_qualified() {
             continue;
         }
         let ref_name = match &reference.kind {

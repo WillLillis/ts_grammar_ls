@@ -146,6 +146,18 @@ pub enum RefKind {
     Builtin,
 }
 
+impl RefKind {
+    /// True if this reference carries an explicit `a::b`-style qualifier in
+    /// source (`BaseRule` or `ImportedMember`). Bare-name references to a
+    /// helper rule / external also resolve cross-module - via
+    /// `Analysis::resolve_bare_name` - but their `RefKind` is the unqualified
+    /// `Rule` / `Variable`, so they return `false` here.
+    #[must_use]
+    pub const fn is_qualified(&self) -> bool {
+        matches!(self, Self::BaseRule(_) | Self::ImportedMember { .. })
+    }
+}
+
 impl Reference {
     /// Check if this reference matches a given word, using the source text
     /// to resolve builtin names from spans. If `cursor_scope` is provided,
