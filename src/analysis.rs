@@ -499,10 +499,10 @@ fn build_fn_signature(
     sig
 }
 
+/// On-disk path for a `file://` URI. `None` for non-file URIs (e.g. `untitled:`).
 #[must_use]
-pub fn uri_to_grammar_path(uri: &Url) -> PathBuf {
-    uri.to_file_path()
-        .unwrap_or_else(|()| PathBuf::from("grammar.tsg"))
+pub fn uri_to_grammar_path(uri: &Url) -> Option<PathBuf> {
+    uri.to_file_path().ok()
 }
 
 /// Cheap lex+parse to extract the canonical paths of every file the grammar
@@ -553,10 +553,19 @@ pub fn extract_deps(text: &str, file_path: &std::path::Path) -> Vec<PathBuf> {
 #[must_use]
 #[expect(clippy::missing_panics_doc, reason = "file always has a parent")]
 pub fn analyze(text: &str, uri: &Url) -> Analysis {
-    let grammar_path = uri_to_grammar_path(uri);
-
     let source = text.to_owned();
     let rope = Rope::from_str(text);
+
+    // Non-file URIs (e.g. `untitled:`) can't anchor a real path - the loader
+    // would canonicalize relative paths against cwd and produce garbage.
+    // Bail with the default analysis.
+    let Some(grammar_path) = uri_to_grammar_path(uri) else {
+        return Analysis {
+            source,
+            rope,
+            ..Analysis::default()
+        };
+    };
 
     // Stage 1: Lex
     let Ok(tokens) = nativedsl::lexer::Lexer::new(text).tokenize() else {
@@ -625,7 +634,7 @@ pub fn with_ast<T>(
     uri: &Url,
     f: impl FnOnce(&ast::SharedAst, &ast::ModuleContext) -> T,
 ) -> Option<T> {
-    let grammar_path = uri_to_grammar_path(uri);
+    let grammar_path = uri_to_grammar_path(uri)?;
     let tokens = nativedsl::lexer::Lexer::new(text).tokenize().ok()?;
     let mut shared = ast::SharedAst::new(text.len() / 30);
     let module_ctx =
@@ -670,7 +679,7 @@ pub fn with_type_env<T>(
     uri: &Url,
     f: impl FnOnce(&ast::SharedAst, &ast::ModuleContext, &nativedsl::typecheck::TypeEnv) -> T,
 ) -> Option<T> {
-    let grammar_path = uri_to_grammar_path(uri);
+    let grammar_path = uri_to_grammar_path(uri)?;
     let canonical = dunce::canonicalize(&grammar_path).ok()?;
     let cap = text.len() / 30;
     let mut shared = ast::SharedAst::new(cap);

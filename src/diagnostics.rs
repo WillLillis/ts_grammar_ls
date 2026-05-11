@@ -98,8 +98,15 @@ pub async fn run_and_publish(
     text: String,
     version: i32,
 ) {
-    let grammar_path = uri_to_grammar_path(&uri);
-    let dsl_ok = publish_dsl_diagnostics(client, document_map, &uri, &text, &grammar_path, version).await;
+    // No on-disk path means we can't run the loader (no anchor for resolving
+    // inherits/imports); publish whatever DSL diagnostics we can extract
+    // from the text alone, but skip dependent republishing + generate-check.
+    let Some(grammar_path) = uri_to_grammar_path(&uri) else {
+        // We can't even reliably canonicalize, so synthesize nothing for now.
+        return;
+    };
+    let dsl_ok =
+        publish_dsl_diagnostics(client, document_map, &uri, &text, &grammar_path, version).await;
 
     // Republish DSL diagnostics for any open file that depends on this one.
     // Snapshot the set under the dashmap guard then drop it before awaiting.
@@ -115,8 +122,9 @@ pub async fn run_and_publish(
         let snapshot = document_map
             .get(&dep_uri)
             .map(|d| (d.text.clone(), d.version));
-        if let Some((dep_text, dep_version)) = snapshot {
-            let dep_path = uri_to_grammar_path(&dep_uri);
+        if let (Some((dep_text, dep_version)), Some(dep_path)) =
+            (snapshot, uri_to_grammar_path(&dep_uri))
+        {
             publish_dsl_diagnostics(
                 client,
                 document_map,

@@ -18,7 +18,7 @@ pub async fn formatting(
     params: &DocumentFormattingParams,
 ) -> Option<Vec<TextEdit>> {
     let uri = &params.text_document.uri;
-    let path = uri_to_grammar_path(uri);
+    let path = uri_to_grammar_path(uri)?;
 
     // Acquire the config read guard first - it's the only awaiting call. With
     // that held, the rest of the work is synchronous, so it's safe to grab a
