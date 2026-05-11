@@ -398,19 +398,15 @@ impl Analysis {
         best
     }
 
-    /// Classify what kind of identifier the cursor is on, based on token context.
-    /// Use this to route handler logic uniformly across hover/references/highlight.
+    /// Classify what kind of identifier the cursor is on. Returns `None` when
+    /// lex never produced tokens (we can't honestly answer).
     #[must_use]
-    pub fn cursor_context(&self, offset: u32, source: &str) -> CursorContext {
-        let Some(tokens) = self.tokens.as_deref() else {
-            return CursorContext::Identifier {
-                scope: self.scope_at(offset),
-            };
-        };
+    pub fn cursor_context(&self, offset: u32, source: &str) -> Option<CursorContext> {
+        let tokens = self.tokens.as_deref()?;
         if let Some(gs) = self.grammar_span
             && crate::text::is_grammar_config_field(tokens, gs, offset)
         {
-            return CursorContext::GrammarConfigField;
+            return Some(CursorContext::GrammarConfigField);
         }
         if crate::text::is_base_rule_access(tokens, offset) {
             // Distinguish base rule access from import module access by checking
@@ -421,15 +417,15 @@ impl Analysis {
                         .any(|d| d.name == qualifier && d.kind == DefKind::Import)
                 })
             {
-                return CursorContext::ImportModuleAccess {
+                return Some(CursorContext::ImportModuleAccess {
                     scope: self.scope_at(offset),
-                };
+                });
             }
-            return CursorContext::BaseRuleAccess;
+            return Some(CursorContext::BaseRuleAccess);
         }
-        CursorContext::Identifier {
+        Some(CursorContext::Identifier {
             scope: self.scope_at(offset),
-        }
+        })
     }
 }
 

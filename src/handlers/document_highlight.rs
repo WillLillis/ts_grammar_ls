@@ -16,7 +16,7 @@ pub fn document_highlight(
     let offset = text::position_to_offset(&analysis.rope, pos)?;
     let word = text::word_at_offset(&analysis.source, offset)?.to_owned();
 
-    match analysis.cursor_context(offset, &analysis.source) {
+    match analysis.cursor_context(offset, &analysis.source)? {
         // Grammar config fields aren't highlightable.
         CursorContext::GrammarConfigField => None,
         CursorContext::BaseRuleAccess => base_rule_highlights(&analysis, &analysis.rope, &word),

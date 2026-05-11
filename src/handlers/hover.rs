@@ -15,7 +15,7 @@ pub fn hover(backend: &Backend, params: &HoverParams) -> Option<Hover> {
     let offset = text::position_to_offset(&analysis.rope, pos)?;
     let word = text::word_at_offset(&analysis.source, offset)?.to_owned();
 
-    match analysis.cursor_context(offset, &analysis.source) {
+    match analysis.cursor_context(offset, &analysis.source)? {
         // On `reserved:`, show the config field docs, not the builtin combinator docs.
         CursorContext::GrammarConfigField => {
             hover_docs::grammar_field_hover(&word).map(|info| make_hover(info.to_string()))

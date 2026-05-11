@@ -14,7 +14,7 @@ pub fn references(backend: &Backend, params: &ReferenceParams) -> Option<Vec<Loc
     let offset = text::position_to_offset(&analysis.rope, pos)?;
     let word = text::word_at_offset(&analysis.source, offset)?.to_owned();
 
-    match analysis.cursor_context(offset, &analysis.source) {
+    match analysis.cursor_context(offset, &analysis.source)? {
         // Grammar config fields aren't referenceable.
         CursorContext::GrammarConfigField => None,
         CursorContext::BaseRuleAccess => {

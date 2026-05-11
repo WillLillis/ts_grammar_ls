@@ -23,7 +23,7 @@ pub fn prepare_rename(
     let offset = text::position_to_offset(&analysis.rope, pos)?;
     let word = text::word_at_offset(&analysis.source, offset)?;
 
-    match analysis.cursor_context(offset, &analysis.source) {
+    match analysis.cursor_context(offset, &analysis.source)? {
         CursorContext::GrammarConfigField => None,
         CursorContext::BaseRuleAccess => {
             // Cursor is on the member part of `base::rule_name`.
@@ -79,7 +79,7 @@ pub fn rename(backend: &Backend, params: &RenameParams) -> Option<WorkspaceEdit>
     let offset = text::position_to_offset(&analysis.rope, pos)?;
     let word = text::word_at_offset(&analysis.source, offset)?;
 
-    match analysis.cursor_context(offset, &analysis.source) {
+    match analysis.cursor_context(offset, &analysis.source)? {
         CursorContext::BaseRuleAccess => {
             let target_path = analysis.base_module.as_ref()?.path.clone();
             rename_cross_file(backend, uri, &analysis, &target_path, word, &new_name)
