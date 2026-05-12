@@ -97,19 +97,12 @@ fn identifier_hover(
 fn path_string_hover(analysis: &crate::document::Module, offset: u32) -> Option<String> {
     let reference = analysis.reference_at(offset)?;
     match &reference.kind {
-        RefKind::InheritPath => {
+        RefKind::InheritPath(_) => {
             let base = analysis.base_module.as_deref()?;
             Some(format!("```\ninherit: {}\n```", base.path.display()))
         }
-        RefKind::ImportPath => {
-            // Find which `let X = import(...)` binding owns this path span.
-            let defs = analysis.definitions.as_ref()?;
-            let import_def = defs.iter().find(|d| {
-                matches!(d.kind, DefKind::Import)
-                    && reference.span.start >= d.full_span.start
-                    && reference.span.end <= d.full_span.end
-            })?;
-            let module = analysis.get_module(&import_def.name)?;
+        RefKind::ImportPath(binding) => {
+            let module = analysis.get_module(binding)?;
             Some(format!("```\nimport: {}\n```", module.path.display()))
         }
         _ => None,

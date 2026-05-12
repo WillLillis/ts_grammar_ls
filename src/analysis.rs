@@ -235,6 +235,19 @@ fn extract_references(
 ) -> Vec<Reference> {
     let mut references = Vec::new();
 
+    // Map each `import(...)` / `inherit(...)` node to its owning `let X = ...`
+    // binding name, so the `ImportPath` / `InheritPath` reference can carry
+    // it directly (avoids a span-containment reverse lookup at use sites).
+    let mut module_ref_binding: rustc_hash::FxHashMap<ast::NodeId, String> =
+        rustc_hash::FxHashMap::default();
+    for &item_id in &ctx.root_items {
+        if let ast::Node::Let { name, value, .. } = shared.arena.get(item_id)
+            && matches!(shared.arena.get(*value), ast::Node::ModuleRef { .. })
+        {
+            module_ref_binding.insert(*value, ctx.text(*name).to_owned());
+        }
+    }
+
     for (node_id, node) in ctx.iter_own_nodes(&shared.arena) {
         let span = shared.arena.span(node_id);
         match node {
@@ -307,12 +320,16 @@ fn extract_references(
             }
             // inherit("path") or import("path") - the path string literal.
             ast::Node::ModuleRef { import, path, .. } => {
+                let binding = module_ref_binding
+                    .get(&node_id)
+                    .cloned()
+                    .unwrap_or_default();
                 references.push(Reference {
                     span: *path,
                     kind: if *import {
-                        RefKind::ImportPath
+                        RefKind::ImportPath(binding)
                     } else {
-                        RefKind::InheritPath
+                        RefKind::InheritPath(binding)
                     },
                     scope: None,
                 });

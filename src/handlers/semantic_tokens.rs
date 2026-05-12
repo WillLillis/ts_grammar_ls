@@ -64,10 +64,30 @@ fn compute_semantic_tokens(text: &str, rope: &Rope, analysis: &Module) -> Vec<Se
         let value = match &reference.kind {
             RefKind::Rule(_) | RefKind::BaseRule(_) => (TYPE_CLASS, 0),
             RefKind::Variable(_) => (TYPE_VARIABLE, 0),
+            // For `mod::foo`, resolve through the import chain to the target
+            // def and pick the color from its kind, so qualified access reads
+            // the same way as bare-name access does.
+            RefKind::ImportedMember { path, member } => {
+                let Some(module) = analysis.resolve_import_chain(path) else {
+                    continue;
+                };
+                let Some(def) = module
+                    .definitions
+                    .iter()
+                    .flatten()
+                    .find(|d| &d.name == member)
+                else {
+                    continue;
+                };
+                match def.kind {
+                    DefKind::Rule | DefKind::OverrideRule => (TYPE_CLASS, 0),
+                    DefKind::Function { .. } => (TYPE_FUNCTION, 0),
+                    _ => (TYPE_VARIABLE, 0),
+                }
+            }
             RefKind::ObjectField { .. }
-            | RefKind::InheritPath
-            | RefKind::ImportPath
-            | RefKind::ImportedMember { .. }
+            | RefKind::InheritPath(_)
+            | RefKind::ImportPath(_)
             | RefKind::Builtin => continue,
         };
         index.insert(reference.span.start, value);
@@ -96,11 +116,10 @@ fn compute_semantic_tokens(text: &str, rope: &Rope, analysis: &Module) -> Vec<Se
         }
 
         let name = &text[token.span.start as usize..token.span.end as usize];
-        let classification = match name {
-            "rule_t" | "str_t" | "int_t" | "list_rule_t" | "list_str_t" | "list_int_t"
-            | "list_list_rule_t" | "list_list_str_t" | "list_list_int_t" | "void_t"
-            | "spread_t" => Some((TYPE_TYPE, 0)),
-            _ => index.get(&token.span.start).copied(),
+        let classification = if text::DSL_TYPE_NAMES.contains(&name) {
+            Some((TYPE_TYPE, 0))
+        } else {
+            index.get(&token.span.start).copied()
         };
         let Some((token_type, modifiers)) = classification else {
             continue;

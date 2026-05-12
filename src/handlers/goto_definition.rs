@@ -27,7 +27,7 @@ pub fn goto_definition(
             RefKind::ObjectField { field, object } => {
                 return goto_object_field(&analysis, uri, object, field);
             }
-            RefKind::InheritPath => {
+            RefKind::InheritPath(_) => {
                 let base = analysis.base_module.as_deref()?;
                 let base_uri = Url::from_file_path(&base.path).ok()?;
                 return Some(GotoDefinitionResponse::Scalar(Location {
@@ -35,9 +35,15 @@ pub fn goto_definition(
                     range: Range::default(),
                 }));
             }
-            RefKind::ImportPath => {
-                // Jump to the imported file.
-                return goto_import_file(&analysis, offset);
+            RefKind::ImportPath(binding) => {
+                // Jump to the imported file. The binding name was stored on
+                // the reference at extraction time.
+                let module_info = analysis.get_module(binding)?;
+                let target = Url::from_file_path(&module_info.path).ok()?;
+                return Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: target,
+                    range: Range::default(),
+                }));
             }
             RefKind::ImportedMember { path, member } => {
                 // Jump to the member definition in the imported module.
@@ -119,28 +125,6 @@ fn goto_object_field(
     Some(GotoDefinitionResponse::Scalar(Location {
         uri: uri.clone(),
         range: text::span_to_range(&analysis.rope, key_def.name_span),
-    }))
-}
-
-/// Jump to the file referenced by an `import("path")` call.
-fn goto_import_file(analysis: &Module, offset: u32) -> Option<GotoDefinitionResponse> {
-    // Find which import definition contains this offset, then use its module info.
-    let reference = analysis.references.iter().flatten().find(|r| {
-        offset >= r.span.start && offset < r.span.end && matches!(r.kind, RefKind::ImportPath)
-    })?;
-
-    // Find the let binding that owns this import by matching spans.
-    let defs = analysis.definitions.as_ref()?;
-    let import_def = defs.iter().find(|d| {
-        matches!(d.kind, DefKind::Import)
-            && reference.span.start >= d.full_span.start
-            && reference.span.end <= d.full_span.end
-    })?;
-    let module_info = analysis.get_module(&import_def.name)?;
-    let uri = Url::from_file_path(&module_info.path).ok()?;
-    Some(GotoDefinitionResponse::Scalar(Location {
-        uri,
-        range: Range::default(),
     }))
 }
 

@@ -78,19 +78,28 @@ pub async fn initialized(backend: &Backend) {
     // `initialized` work) waiting on that round-trip.
     let client = backend.client.clone();
     tokio::spawn(async move {
-        let registration = Registration {
-            id: "ts-grammar-ls/watch-tsg".into(),
-            method: "workspace/didChangeWatchedFiles".into(),
-            register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
-                watchers: vec![FileSystemWatcher {
-                    glob_pattern: GlobPattern::String("**/*.tsg".into()),
-                    kind: None,
-                }],
-            })
-            .ok(),
-        };
-        if let Err(e) = client.register_capability(vec![registration]).await {
-            warn!("client did not accept watcher registration: {e}");
+        let registrations = vec![
+            Registration {
+                id: "ts-grammar-ls/watch-tsg".into(),
+                method: "workspace/didChangeWatchedFiles".into(),
+                register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                    watchers: vec![FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/*.tsg".into()),
+                        kind: None,
+                    }],
+                })
+                .ok(),
+            },
+            // The `did_change_configuration` handler is wired but won't be
+            // invoked unless the client knows we want notifications.
+            Registration {
+                id: "ts-grammar-ls/did-change-configuration".into(),
+                method: "workspace/didChangeConfiguration".into(),
+                register_options: None,
+            },
+        ];
+        if let Err(e) = client.register_capability(registrations).await {
+            warn!("client did not accept dynamic registrations: {e}");
         }
     });
 

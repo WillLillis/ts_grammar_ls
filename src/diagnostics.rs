@@ -70,13 +70,15 @@ fn dsl_error_to_diagnostics(error: &DslError, rope: &Rope) -> Vec<Diagnostic> {
 // Pipeline runner
 // ---------------------------------------------------------------------------
 
-/// Run the full DSL pipeline and return diagnostics only.
-/// Analysis data is computed on demand by handlers via `analysis::analyze()`.
-fn run_dsl_pipeline(text: &str, rope: &Rope, grammar_path: &Path) -> Vec<Diagnostic> {
-    match nativedsl::parse_native_dsl(text, grammar_path) {
-        Ok(_) => vec![],
-        Err(e) => dsl_error_to_diagnostics(&e, rope),
-    }
+/// Run the full DSL pipeline. Returns the parsed grammar on success so
+/// callers can hand it off to generate-check without reparsing; returns
+/// converted diagnostics on failure. The two outcomes are mutually exclusive.
+fn run_dsl_pipeline(
+    text: &str,
+    rope: &Rope,
+    grammar_path: &Path,
+) -> Result<nativedsl::InputGrammar, Vec<Diagnostic>> {
+    nativedsl::parse_native_dsl(text, grammar_path).map_err(|e| dsl_error_to_diagnostics(&e, rope))
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +114,7 @@ pub async fn run_and_publish(
         // We can't even reliably canonicalize, so synthesize nothing for now.
         return;
     };
-    let dsl_ok =
+    let grammar =
         publish_dsl_diagnostics(client, document_map, &uri, &text, &grammar_path, version).await;
 
     // Republish DSL diagnostics for any open file that depends on this one.
@@ -132,7 +134,10 @@ pub async fn run_and_publish(
         if let (Some((dep_text, dep_version)), Some(dep_path)) =
             (snapshot, uri_to_grammar_path(&dep_uri))
         {
-            publish_dsl_diagnostics(
+            // Dependent files: republish their diagnostics; the parsed
+            // grammar isn't needed (generate-check fires only for the
+            // originating URI).
+            let _ = publish_dsl_diagnostics(
                 client,
                 document_map,
                 &dep_uri,
@@ -144,14 +149,15 @@ pub async fn run_and_publish(
         }
     }
 
-    if dsl_ok && include_generate_check {
+    if let Ok(grammar) = grammar
+        && include_generate_check
+    {
         spawn_generate_check(
             client.clone(),
             Arc::clone(document_map),
             Arc::clone(generate_child),
             uri,
-            text,
-            grammar_path,
+            grammar,
             version,
         );
     }
@@ -167,22 +173,25 @@ async fn publish_dsl_diagnostics(
     text: &str,
     grammar_path: &Path,
     version: i32,
-) -> bool {
+) -> Result<nativedsl::InputGrammar, ()> {
     let rope = Rope::from_str(text);
-    let dsl_diagnostics = run_dsl_pipeline(text, &rope, grammar_path);
-    let dsl_ok = dsl_diagnostics.is_empty();
+    let result = run_dsl_pipeline(text, &rope, grammar_path);
+    let new_diagnostics = match &result {
+        Ok(_) => vec![],
+        Err(diags) => diags.clone(),
+    };
 
     let all = {
         let Some(mut doc) = document_map.get_mut(uri) else {
-            return dsl_ok;
+            return result.map_err(drop);
         };
-        doc.dsl_diagnostics = dsl_diagnostics;
+        doc.dsl_diagnostics = new_diagnostics;
         merge_diagnostics(&doc)
     };
     client
         .publish_diagnostics(uri.clone(), all, Some(version))
         .await;
-    dsl_ok
+    result.map_err(drop)
 }
 
 // ---------------------------------------------------------------------------
@@ -207,12 +216,11 @@ fn spawn_generate_check(
     document_map: Arc<DashMap<Url, Document>>,
     generate_child: Arc<GenerateChildSlot>,
     uri: Url,
-    text: String,
-    grammar_path: PathBuf,
+    grammar: nativedsl::InputGrammar,
     version: i32,
 ) {
     tokio::spawn(async move {
-        let Some(json) = prepare_grammar_json(&text, &grammar_path) else {
+        let Some(json) = prepare_grammar_json(grammar) else {
             return;
         };
 
@@ -365,9 +373,10 @@ fn spawn_generate_check(
     });
 }
 
-/// Run the DSL pipeline and serialize the result to grammar JSON.
-fn prepare_grammar_json(text: &str, grammar_path: &Path) -> Option<String> {
-    let mut grammar = nativedsl::parse_native_dsl(text, grammar_path).ok()?;
+/// Normalize the parsed grammar and serialize it to JSON for the generate
+/// subprocess. Takes the grammar by value: the DSL pipeline has already run
+/// on this snapshot in `run_dsl_pipeline`, so no reparsing here.
+fn prepare_grammar_json(mut grammar: nativedsl::InputGrammar) -> Option<String> {
     normalize_grammar(&mut grammar);
     let json_value = grammar_to_json(&grammar);
     serde_json::to_string(&json_value).ok()
@@ -386,6 +395,13 @@ mod tests {
         (dir, path)
     }
 
+    /// Parse + serialize - the test-only equivalent of the production
+    /// `run_dsl_pipeline` -> `prepare_grammar_json` path.
+    fn parse_and_serialize(text: &str, path: &std::path::Path) -> Option<String> {
+        let grammar = nativedsl::parse_native_dsl(text, path).ok()?;
+        prepare_grammar_json(grammar)
+    }
+
     #[test]
     fn prepare_grammar_json_valid() {
         let text = r#"
@@ -393,7 +409,7 @@ mod tests {
             rule program { repeat("x") }
         "#;
         let (_dir, path) = temp_grammar(text);
-        let json = prepare_grammar_json(text, &path);
+        let json = parse_and_serialize(text, &path);
         assert!(json.is_some());
         let json = json.unwrap();
         assert!(json.contains("\"name\":\"test\""));
@@ -403,7 +419,7 @@ mod tests {
     fn prepare_grammar_json_invalid() {
         let text = r#"grammar { language: "test" } rule program {"#;
         let (_dir, path) = temp_grammar(text);
-        assert_eq!(prepare_grammar_json(text, &path), None);
+        assert_eq!(parse_and_serialize(text, &path), None);
     }
 
     #[test]
@@ -413,7 +429,7 @@ mod tests {
             rule program { repeat("x") }
         "#;
         let (_dir, path) = temp_grammar(text);
-        let json = prepare_grammar_json(text, &path).unwrap();
+        let json = parse_and_serialize(text, &path).unwrap();
         let result = tree_sitter_generate::generate_parser_for_grammar(&json, None);
         assert!(
             result.is_ok(),
@@ -431,7 +447,7 @@ mod tests {
             rule b { seq("x", "z") }
         "#;
         let (_dir, path) = temp_grammar(text);
-        let json = prepare_grammar_json(text, &path);
+        let json = parse_and_serialize(text, &path);
         // This grammar is valid at the DSL level.
         assert!(json.is_some());
         // It should also be valid at the generate level (no actual conflict).

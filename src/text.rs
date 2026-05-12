@@ -2,6 +2,12 @@ use ropey::Rope;
 use tower_lsp::lsp_types::{Position, Range};
 use tree_sitter_generate::nativedsl::ast::Span;
 
+/// User-writable DSL type names. Mirrors the set the core parser accepts in
+/// `parse_type` (`rule_t`, `str_t`, `int_t`, `module_t`, plus the generic
+/// `list_t<...>` and `obj_t<...>`). Used by semantic-token classification and
+/// completion to flag identifiers that name a DSL type.
+pub const DSL_TYPE_NAMES: &[&str] = &["rule_t", "str_t", "int_t", "module_t", "list_t", "obj_t"];
+
 /// Convert a byte offset to an LSP `Position`.
 #[must_use]
 pub fn offset_to_position(rope: &Rope, offset: u32) -> Position {

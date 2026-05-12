@@ -122,10 +122,12 @@ pub enum RefKind {
         field: String,
         object: String,
     },
-    /// The path argument to `inherit("path")`.
-    InheritPath,
-    /// The path argument to `import("path")`.
-    ImportPath,
+    /// The path argument to `inherit("path")`. The `String` is the owning
+    /// `let` binding's name (e.g. `"base"` for `let base = inherit(...)`).
+    InheritPath(String),
+    /// The path argument to `import("path")`. The `String` is the owning
+    /// `let` binding's name (e.g. `"helpers"` for `let helpers = import(...)`).
+    ImportPath(String),
     /// A member accessed through an imported module (e.g. `fn_name` in `mod::fn_name(args)`).
     /// For nested access like `a::b::c`, path is `["a", "b"]` and member is `"c"`.
     ImportedMember {
@@ -163,7 +165,7 @@ impl Reference {
                 let s = self.span;
                 &source[s.start as usize..s.end as usize] == word
             }
-            RefKind::InheritPath | RefKind::ImportPath => false,
+            RefKind::InheritPath(_) | RefKind::ImportPath(_) => false,
         };
         if !name_matches {
             return false;
@@ -316,8 +318,8 @@ impl Module {
             match kind {
                 RefKind::BaseRule(_)
                 | RefKind::ImportedMember { .. }
-                | RefKind::ImportPath
-                | RefKind::InheritPath
+                | RefKind::ImportPath(_)
+                | RefKind::InheritPath(_)
                 | RefKind::ObjectField { .. } => 0,
                 _ => 1,
             }

@@ -240,22 +240,22 @@ fn import_member_references(
 ) -> Option<Vec<Location>> {
     let mut locations = Vec::new();
 
-    if include_declaration
-        && let Some(module_info) = analysis.resolve_import_chain(path)
-        && let Some(def) = module_info
-            .definitions
-            .iter()
-            .flatten()
-            .find(|d| d.name == member)
+    // Owning module: definition site + internal bare-name uses of `member`.
+    if let Some(module_info) = analysis.resolve_import_chain(path)
         && let Ok(module_uri) = Url::from_file_path(&module_info.path)
     {
-        locations.push(Location {
-            uri: module_uri,
-            range: text::span_to_range(&module_info.rope, def.name_span),
-        });
+        for (span, is_decl) in module_info.bare_name_occurrences(member) {
+            if !include_declaration && is_decl {
+                continue;
+            }
+            locations.push(Location {
+                uri: module_uri.clone(),
+                range: text::span_to_range(&module_info.rope, span),
+            });
+        }
     }
 
-    // Match call/access sites by exact qualified path AND member name.
+    // Cursor file: call/access sites matched by exact qualified path + member.
     for reference in analysis.references.iter().flatten() {
         if let RefKind::ImportedMember {
             path: ref_path,

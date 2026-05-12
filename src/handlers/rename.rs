@@ -295,7 +295,7 @@ fn rename_local(
             RefKind::Builtin => {
                 &analysis.source[reference.span.start as usize..reference.span.end as usize]
             }
-            RefKind::InheritPath | RefKind::ImportPath => continue,
+            RefKind::InheritPath(_) | RefKind::ImportPath(_) => continue,
             RefKind::BaseRule(_) | RefKind::ImportedMember { .. } => unreachable!(),
         };
         if ref_name != word {
