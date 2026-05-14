@@ -48,18 +48,24 @@ fn dsl_error_to_diagnostics(error: &DslError, rope: &Rope) -> Vec<Diagnostic> {
         ..Default::default()
     }];
 
-    if let Some(note) = error.note()
-        && let Ok(note_uri) = Url::from_file_path(&note.path)
-    {
-        let note_rope = Rope::from_str(&note.source);
-        let note_range = text::span_to_range(&note_rope, note.span);
-        diagnostics[0].related_information = Some(vec![DiagnosticRelatedInformation {
-            location: Location {
-                uri: note_uri,
-                range: note_range,
-            },
-            message: note.message.to_string(),
-        }]);
+    let related: Vec<DiagnosticRelatedInformation> = error
+        .notes()
+        .iter()
+        .filter_map(|note| {
+            let note_uri = Url::from_file_path(&note.path).ok()?;
+            let note_rope = Rope::from_str(&note.source);
+            let note_range = text::span_to_range(&note_rope, note.span);
+            Some(DiagnosticRelatedInformation {
+                location: Location {
+                    uri: note_uri,
+                    range: note_range,
+                },
+                message: note.message.to_string(),
+            })
+        })
+        .collect();
+    if !related.is_empty() {
+        diagnostics[0].related_information = Some(related);
     }
 
     diagnostics
