@@ -6,7 +6,7 @@ use tower_lsp::lsp_types::Url;
 
 use tree_sitter_generate::nativedsl::{self, ast};
 
-use crate::document::{DefKind, Definition, Module, RefKind, Reference};
+use crate::document::{CfgFlag, DefKind, Definition, DisabledRegion, Module, RefKind, Reference};
 
 // ---------------------------------------------------------------------------
 // Analysis extraction - walk the AST to collect definitions and references
@@ -379,6 +379,9 @@ enum ExtractKind<'a> {
         /// `None` on the manual-parse fallback path - hover will then show
         /// `let foo` without a type.
         env: Option<&'a nativedsl::typecheck::TypeEnv>,
+        /// Cfg state from the loader pass: declared flag names + active set.
+        /// `None` on the manual-parse fallback (apply_cfg never ran).
+        cfg: Option<&'a nativedsl::apply_cfg::CfgState>,
     },
     External {
         /// Shared type environment from the (successful) loader pass.
@@ -424,16 +427,26 @@ fn extract_module(
 
     let import_modules = collect_import_modules(shared, modules, ctx, env);
 
-    let (tokens_field, loader_succeeded) = match kind {
+    let (tokens_field, loader_succeeded, disabled_regions, declared_cfg_flags) = match kind {
         ExtractKind::Root {
             tokens,
             loader_succeeded,
+            cfg,
             ..
         } => {
             extract_builtin_references(&tokens, grammar_span, &mut references);
-            (Some(tokens), loader_succeeded)
+            let declared = cfg.map(cfg_flag_list).unwrap_or_default();
+            // Disabled cfg sites are recoverable from the post-apply arena
+            // even when `cfg` itself isn't available, but we gate on it to
+            // ensure we're only doing this when the loader actually ran.
+            let regions = if cfg.is_some() {
+                scan_disabled_cfg_regions(shared, ctx)
+            } else {
+                Vec::new()
+            };
+            (Some(tokens), loader_succeeded, regions, declared)
         }
-        ExtractKind::External { .. } => (None, true),
+        ExtractKind::External { .. } => (None, true, Vec::new(), Vec::new()),
     };
 
     Module {
@@ -447,6 +460,8 @@ fn extract_module(
         base_module,
         import_modules,
         loader_succeeded,
+        disabled_regions,
+        declared_cfg_flags,
     }
 }
 
@@ -538,6 +553,47 @@ fn extract_builtin_references(
     }
 }
 
+/// Flatten the cfg state's declared-flag set into a stable-sorted vector of
+/// `CfgFlag` records (name + enabled state). Used by hover and completion on
+/// `#[cfg(...)]` flag names.
+fn cfg_flag_list(cfg: &nativedsl::apply_cfg::CfgState) -> Vec<CfgFlag> {
+    let mut flags: Vec<CfgFlag> = cfg
+        .declared
+        .iter()
+        .map(|name| CfgFlag {
+            name: name.clone(),
+            enabled: cfg.active.get(name).copied().unwrap_or(false),
+        })
+        .collect();
+    flags.sort_by(|a, b| a.name.cmp(&b.name));
+    flags
+}
+
+/// Walk the post-apply-cfg AST for `Node::Cfg` nodes. After `apply_cfg`,
+/// active cfg sites get overwritten in place with their child's data, while
+/// disabled cfg sites are simply skipped (filtered from list ranges, etc.) -
+/// the arena node itself is left intact at its original NodeId with its full
+/// `#[cfg(NAME)] ITEM` source span. So every surviving `Node::Cfg` in the
+/// arena is exactly one disabled cfg site, covering both top-level and inline
+/// uses uniformly.
+fn scan_disabled_cfg_regions(
+    shared: &ast::SharedAst,
+    ctx: &ast::ModuleContext,
+) -> Vec<DisabledRegion> {
+    let mut out = Vec::new();
+    for (node_id, node) in ctx.iter_own_nodes(&shared.arena) {
+        if let ast::Node::Cfg { name, .. } = node {
+            let full_span = shared.arena.span(node_id);
+            out.push(DisabledRegion {
+                name: ctx.text(*name).to_owned(),
+                name_span: *name,
+                full_span,
+            });
+        }
+    }
+    out
+}
+
 fn build_fn_signature(
     ctx: &ast::ModuleContext,
     config: &ast::MacroConfig,
@@ -598,86 +654,168 @@ pub fn extract_deps(text: &str, file_path: &std::path::Path) -> Vec<PathBuf> {
     deps
 }
 
-/// Run the DSL pipeline on the given source text and return analysis data.
-/// Uses the core's `Loader` to load all imports/inherits and run the full
-/// resolve + typecheck pipeline on a single shared AST.
+/// One end-to-end analyze pass yields both the LSP-side `Module` (used by
+/// every handler) and the pipeline `Result` (used by `publish_dsl_diagnostics`
+/// for error reporting and by `spawn_generate_check` for the parsed grammar).
+/// Bundling them lets us run the loader once per `did_change` instead of
+/// twice (one in diagnostics, one in handlers).
+pub struct AnalyzeOutcome {
+    pub module: Module,
+    /// `Some(Ok(grammar))` on full loader success.
+    /// `Some(Err(error))` when the loader ran and produced a pipeline error.
+    /// `None` when the loader didn't run (e.g. path couldn't be canonicalized)
+    /// - the Module is still populated from the manual-parse fallback, but
+    /// there's no pipeline error to surface as a diagnostic.
+    pub pipeline: Option<Result<nativedsl::InputGrammar, nativedsl::DslError>>,
+}
+
+/// Run the DSL pipeline on the given source text and return analysis data
+/// plus the pipeline outcome.
 ///
 /// Returns `None` for URIs that aren't backed by a real file (e.g.
 /// `untitled:`) - those can't anchor relative paths so there's nothing
 /// meaningful to analyze. On pipeline failure (parse, validate, resolve,
 /// typecheck) we fall back to manual lex+parse so partial analysis
 /// (definitions/references from the root module) is still available for
-/// mid-keystroke features.
+/// mid-keystroke features; the `pipeline` field carries the original error.
 #[must_use]
-#[expect(clippy::missing_panics_doc, reason = "loader.last() unreachable on success")]
-pub fn analyze(text: String, uri: &Url) -> Option<Module> {
+pub fn analyze(text: String, uri: &Url) -> Option<AnalyzeOutcome> {
     let grammar_path = uri_to_grammar_path(uri)?;
 
     // Stage 1: Lex
-    let Ok(tokens) = nativedsl::lexer::Lexer::new(&text).tokenize() else {
-        tracing::warn!("analyze: lex failed for {uri}");
-        let rope = Rope::from_str(&text);
-        return Some(Module::empty(grammar_path, text, rope));
+    let tokens = match nativedsl::lexer::Lexer::new(&text).tokenize() {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("analyze: lex failed for {uri}");
+            let rope = Rope::from_str(&text);
+            return Some(AnalyzeOutcome {
+                module: Module::empty(grammar_path, text, rope),
+                pipeline: Some(Err(e.into())),
+            });
+        }
     };
 
-    // Try the full Loader-based pipeline. This loads inherits/imports
-    // recursively into one shared AST + TypeEnv, then resolves and
-    // typechecks. On success we have fully resolved cross-module references.
-    if let Ok(canonical) = dunce::canonicalize(&grammar_path) {
-        let mut shared = ast::SharedAst::new(text.len() / 30);
-        let mut modules: Vec<nativedsl::Module> = Vec::new();
-        let mut env = nativedsl::typecheck::TypeEnv::default();
-        let mut state = nativedsl::LoweringState::default();
-        let mut loader = nativedsl::loader::Loader {
-            shared: &mut shared,
-            modules: &mut modules,
-            env: &mut env,
-            state: &mut state,
-            ancestor_paths: vec![canonical.clone()],
-            loaded: Vec::new(),
-        };
-        let load_ok = loader
-            .load_module(&text, &canonical, nativedsl::loader::ModuleKind::Grammar)
-            .is_ok();
-        drop(loader);
-        if load_ok {
-            let root = modules.last().expect("root module pushed on success");
-            return Some(extract_module(
-                &shared,
-                &modules,
-                root.ctx(),
-                ExtractKind::Root {
-                    tokens,
-                    loader_succeeded: true,
-                    env: Some(&env),
-                },
-            ));
-        }
+    // Try the full Loader-based pipeline. On success we have fully resolved
+    // cross-module references and a lowered grammar. On failure we capture
+    // the error and fall through to a manual-parse fallback that produces
+    // a partial Module so handlers keep working mid-keystroke.
+    let loader_result = run_loader_pipeline(&text, &grammar_path, &tokens);
+    if let Some(outcome) = loader_result {
+        return Some(outcome);
     }
 
-    // Loader failed (parse error, missing file, validation error, type error).
-    // Fall back to manual lex+parse so we still get partial analysis. Parser
-    // takes the source by value, so clone in case parse fails and we need
-    // text for the empty-module fallback.
+    // No file path / canonicalize failure - drop straight to manual parse.
+    manual_parse_fallback(text, tokens, grammar_path, uri, None)
+}
+
+/// Run the loader (full pipeline) and produce an `AnalyzeOutcome` if the
+/// loader was invocable. Returns `None` only when the path can't be
+/// canonicalized; otherwise always returns Some - either with the
+/// fully-resolved Module + grammar on success, or with the manual-parse
+/// fallback Module carrying the pipeline error.
+fn run_loader_pipeline(
+    text: &str,
+    grammar_path: &std::path::Path,
+    tokens: &[nativedsl::lexer::Token],
+) -> Option<AnalyzeOutcome> {
+    let canonical = dunce::canonicalize(grammar_path).ok()?;
     let mut shared = ast::SharedAst::new(text.len() / 30);
-    let Ok(module_ctx) =
-        nativedsl::parser::Parser::new(&tokens, text.clone(), grammar_path.clone(), &mut shared)
-            .parse()
-    else {
-        tracing::warn!("analyze: parse failed for {uri}");
-        let rope = Rope::from_str(&text);
-        let mut module = Module::empty(grammar_path, text, rope);
-        module.tokens = Some(tokens);
-        return Some(module);
+    let mut modules: Vec<nativedsl::Module> = Vec::new();
+    let mut env = nativedsl::typecheck::TypeEnv::default();
+    let mut state = nativedsl::LoweringState::default();
+    let mut cfg = nativedsl::apply_cfg::CfgState::default();
+    let mut loader = nativedsl::loader::Loader {
+        shared: &mut shared,
+        modules: &mut modules,
+        env: &mut env,
+        state: &mut state,
+        cfg: &mut cfg,
+        ancestor_paths: vec![canonical.clone()],
+        loaded: Vec::new(),
+    };
+    let load_result = loader.load_module(text, &canonical, nativedsl::loader::ModuleKind::Grammar);
+    drop(loader);
+
+    if load_result.is_ok() {
+        // Pop the root grammar so we can take its lowered InputGrammar by
+        // value while keeping the rest of `modules` for cross-module
+        // resolution (child indices are unchanged).
+        let root = modules.pop().expect("root module pushed on success");
+        let (ctx, lowered) = match root {
+            nativedsl::Module::Grammar { ctx, lowered } => (ctx, *lowered),
+            nativedsl::Module::Helper { .. } => {
+                unreachable!("root module must be Grammar")
+            }
+        };
+        let module = extract_module(
+            &shared,
+            &modules,
+            &ctx,
+            ExtractKind::Root {
+                tokens: tokens.to_vec(),
+                loader_succeeded: true,
+                env: Some(&env),
+                cfg: Some(&cfg),
+            },
+        );
+        return Some(AnalyzeOutcome {
+            module,
+            pipeline: Some(Ok(lowered)),
+        });
+    }
+
+    // Loader failed - fall back to manual parse and surface the error.
+    let pipeline_err = load_result.expect_err("checked above");
+    let uri = Url::from_file_path(grammar_path).ok()?;
+    Some(manual_parse_fallback(
+        text.to_owned(),
+        tokens.to_vec(),
+        grammar_path.to_path_buf(),
+        &uri,
+        Some(pipeline_err),
+    )?)
+}
+
+/// Manual lex+parse fallback for when the full loader pipeline fails. Returns
+/// an `AnalyzeOutcome` with the partial Module and the supplied pipeline
+/// error (or a synthesized one if the manual parse also fails).
+fn manual_parse_fallback(
+    text: String,
+    tokens: Vec<nativedsl::lexer::Token>,
+    grammar_path: PathBuf,
+    uri: &Url,
+    pipeline_err: Option<nativedsl::DslError>,
+) -> Option<AnalyzeOutcome> {
+    let mut shared = ast::SharedAst::new(text.len() / 30);
+    let module_ctx = match nativedsl::parser::Parser::new(
+        &tokens,
+        text.clone(),
+        grammar_path.clone(),
+        &mut shared,
+    )
+    .parse()
+    {
+        Ok(ctx) => ctx,
+        Err(parse_err) => {
+            tracing::warn!("analyze: parse failed for {uri}");
+            let rope = Rope::from_str(&text);
+            let mut module = Module::empty(grammar_path, text, rope);
+            module.tokens = Some(tokens);
+            return Some(AnalyzeOutcome {
+                module,
+                // Prefer the original pipeline error if we have one;
+                // otherwise surface the parse failure.
+                pipeline: Some(Err(pipeline_err.unwrap_or_else(|| parse_err.into()))),
+            });
+        }
     };
 
     // Resolve what we can without loaded children. Imports/inherits won't
     // resolve, but local Ident -> RuleRef/VarRef rewrites will happen.
     let _ = nativedsl::resolve::resolve(&mut shared, &module_ctx, &[], None);
 
-    // Extract analysis from this single module (no loaded children).
     let modules: Vec<nativedsl::Module> = Vec::new();
-    Some(extract_module(
+    let module = extract_module(
         &shared,
         &modules,
         &module_ctx,
@@ -685,8 +823,15 @@ pub fn analyze(text: String, uri: &Url) -> Option<Module> {
             tokens,
             loader_succeeded: false,
             env: None,
+            cfg: None,
         },
-    ))
+    );
+    Some(AnalyzeOutcome {
+        module,
+        // `None` reflects "the loader never ran" (canonicalize failed).
+        // The manual-parse fallback still produced a partial Module.
+        pipeline: pipeline_err.map(Err),
+    })
 }
 
 

@@ -250,6 +250,34 @@ pub struct Module {
     /// Externals are constructed only after their own loader succeeded, so
     /// this is always `true` for them.
     pub loader_succeeded: bool,
+    /// Top-level declarations gated off by a disabled `#[cfg(...)]` attribute.
+    /// Used to dim the disabled source range and surface a HINT diagnostic.
+    /// NOTE: inline disabled items (e.g. `seq(a, #[cfg(x)] b, c)` where `x`
+    /// is off) are NOT recorded here yet - they vanish from list nodes during
+    /// `apply_cfg` and would need an upstream side table to recover.
+    pub disabled_regions: Vec<DisabledRegion>,
+    /// Cfg flags declared anywhere in this file's load chain, with their
+    /// resolved enabled/disabled state. Used for hover and completion inside
+    /// `#[cfg(...)]` attributes.
+    pub declared_cfg_flags: Vec<CfgFlag>,
+}
+
+/// A top-level declaration disabled by `#[cfg(NAME)]`. `full_span` covers the
+/// attribute + the gated declaration; `name_span` covers just `NAME` inside
+/// the attribute.
+#[derive(Clone, Debug)]
+pub struct DisabledRegion {
+    pub name: String,
+    pub name_span: Span,
+    pub full_span: Span,
+}
+
+/// A cfg flag declared in some module's `flags: { enabled: [...], disabled: [...] }`
+/// block, with its resolved active state.
+#[derive(Clone, Debug)]
+pub struct CfgFlag {
+    pub name: String,
+    pub enabled: bool,
 }
 
 impl Module {
@@ -268,7 +296,29 @@ impl Module {
             base_module: None,
             import_modules: Vec::new(),
             loader_succeeded: false,
+            disabled_regions: Vec::new(),
+            declared_cfg_flags: Vec::new(),
         }
+    }
+
+    /// Convert this module's `disabled_regions` into LSP HINT diagnostics
+    /// tagged `UNNECESSARY`. Most editors render that as faded/dimmed text
+    /// with the message available on hover - the rust-analyzer treatment for
+    /// cfg-disabled code.
+    #[must_use]
+    pub fn cfg_hint_diagnostics(&self) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+        use tower_lsp::lsp_types::{DiagnosticSeverity, DiagnosticTag};
+        self.disabled_regions
+            .iter()
+            .map(|r| tower_lsp::lsp_types::Diagnostic {
+                range: crate::text::span_to_range(&self.rope, r.full_span),
+                severity: Some(DiagnosticSeverity::HINT),
+                source: Some("ts_grammar_ls".into()),
+                message: format!("disabled by cfg flag `{}` (currently off)", r.name),
+                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+                ..Default::default()
+            })
+            .collect()
     }
 
     /// Look up a direct sub-import by binding name.

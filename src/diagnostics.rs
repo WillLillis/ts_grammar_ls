@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -70,16 +69,6 @@ fn dsl_error_to_diagnostics(error: &DslError, rope: &Rope) -> Vec<Diagnostic> {
 // Pipeline runner
 // ---------------------------------------------------------------------------
 
-/// Run the full DSL pipeline. Returns the parsed grammar on success so
-/// callers can hand it off to generate-check without reparsing; returns
-/// converted diagnostics on failure. The two outcomes are mutually exclusive.
-fn run_dsl_pipeline(
-    text: &str,
-    rope: &Rope,
-    grammar_path: &Path,
-) -> Result<nativedsl::InputGrammar, Vec<Diagnostic>> {
-    nativedsl::parse_native_dsl(text, grammar_path).map_err(|e| dsl_error_to_diagnostics(&e, rope))
-}
 
 // ---------------------------------------------------------------------------
 // Publishing
@@ -114,8 +103,7 @@ pub async fn run_and_publish(
         // We can't even reliably canonicalize, so synthesize nothing for now.
         return;
     };
-    let grammar =
-        publish_dsl_diagnostics(client, document_map, &uri, &text, &grammar_path, version).await;
+    let grammar = publish_dsl_diagnostics(client, document_map, &uri, &text, version).await;
 
     // Republish DSL diagnostics for any open file that depends on this one.
     // Snapshot the set under the dashmap guard then drop it before awaiting.
@@ -131,9 +119,7 @@ pub async fn run_and_publish(
         let snapshot = document_map
             .get(&dep_uri)
             .map(|d| (d.text.clone(), d.version));
-        if let (Some((dep_text, dep_version)), Some(dep_path)) =
-            (snapshot, uri_to_grammar_path(&dep_uri))
-        {
+        if let Some((dep_text, dep_version)) = snapshot {
             // Dependent files: republish their diagnostics; the parsed
             // grammar isn't needed (generate-check fires only for the
             // originating URI).
@@ -142,7 +128,6 @@ pub async fn run_and_publish(
                 document_map,
                 &dep_uri,
                 &dep_text,
-                &dep_path,
                 dep_version,
             )
             .await;
@@ -171,27 +156,32 @@ async fn publish_dsl_diagnostics(
     document_map: &Arc<DashMap<Url, Document>>,
     uri: &Url,
     text: &str,
-    grammar_path: &Path,
     version: i32,
 ) -> Result<nativedsl::InputGrammar, ()> {
-    let rope = Rope::from_str(text);
-    let result = run_dsl_pipeline(text, &rope, grammar_path);
-    let new_diagnostics = match &result {
-        Ok(_) => vec![],
-        Err(diags) => diags.clone(),
+    // One loader pass yields the Module (for cfg hints) and the pipeline
+    // outcome (errors and parsed grammar) together.
+    let Some(outcome) = crate::analysis::analyze(text.to_owned(), uri) else {
+        return Err(());
     };
+    let mut new_diagnostics = match &outcome.pipeline {
+        Some(Err(e)) => dsl_error_to_diagnostics(e, &outcome.module.rope),
+        _ => Vec::new(),
+    };
+    new_diagnostics.extend(outcome.module.cfg_hint_diagnostics());
 
-    let all = {
+    let grammar = outcome.pipeline.and_then(Result::ok);
+    {
         let Some(mut doc) = document_map.get_mut(uri) else {
-            return result.map_err(drop);
+            return grammar.ok_or(());
         };
         doc.dsl_diagnostics = new_diagnostics;
-        merge_diagnostics(&doc)
-    };
-    client
-        .publish_diagnostics(uri.clone(), all, Some(version))
-        .await;
-    result.map_err(drop)
+        let all = merge_diagnostics(&doc);
+        drop(doc);
+        client
+            .publish_diagnostics(uri.clone(), all, Some(version))
+            .await;
+    }
+    grammar.ok_or(())
 }
 
 // ---------------------------------------------------------------------------
