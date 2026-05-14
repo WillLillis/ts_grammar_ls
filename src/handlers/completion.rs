@@ -100,6 +100,13 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
         return Some(CompletionResponse::Array(grammar_config_field_items()));
     }
 
+    // Inside `#[cfg(|` - complete with declared cfg flag names.
+    if text::at_cfg_flag_arg(tokens, &source, cursor_token_idx) {
+        return Some(CompletionResponse::Array(cfg_flag_items(
+            &analysis.declared_cfg_flags,
+        )));
+    }
+
     // `IDENT.` -> complete object fields
     if let Some(Token {
         kind: TokenKind::Dot,
@@ -361,6 +368,20 @@ fn complete_object_field_from_tokens(
         i += 1;
     }
     Vec::new()
+}
+
+fn cfg_flag_items(flags: &[crate::document::CfgFlag]) -> Vec<CompletionItem> {
+    flags
+        .iter()
+        .map(|f| CompletionItem {
+            label: f.name.clone(),
+            kind: Some(CompletionItemKind::CONSTANT),
+            detail: Some(
+                if f.enabled { "cfg flag (enabled)" } else { "cfg flag (disabled)" }.into(),
+            ),
+            ..Default::default()
+        })
+        .collect()
 }
 
 fn grammar_config_field_items() -> Vec<CompletionItem> {

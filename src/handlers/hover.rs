@@ -47,6 +47,18 @@ fn identifier_hover(
         return Some(make_hover(content));
     }
 
+    // `#[cfg(NAME)]` - show the flag's enabled/disabled state.
+    if let Some(tokens) = analysis.tokens.as_deref()
+        && let Some((_, name)) = text::cfg_flag_at_offset(tokens, &analysis.source, offset)
+    {
+        let state = analysis
+            .declared_cfg_flags
+            .iter()
+            .find(|f| f.name == name)
+            .map_or("undeclared", |f| if f.enabled { "enabled" } else { "disabled" });
+        return Some(make_hover(format!("```\ncfg flag `{name}` ({state})\n```")));
+    }
+
     // inherit("path") / import("path") - show the resolved canonical path.
     if let Some(content) = path_string_hover(analysis, offset) {
         return Some(make_hover(content));

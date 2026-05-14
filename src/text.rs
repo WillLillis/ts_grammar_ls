@@ -201,6 +201,79 @@ pub fn at_grammar_config_field_arg(
     false
 }
 
+/// If `offset` lies on the flag-name identifier inside a `#[cfg(NAME)]`
+/// attribute, return its span and the name text. Returns `None` for any
+/// other token position, including malformed/partial attribute syntax.
+#[must_use]
+pub fn cfg_flag_at_offset<'src>(
+    tokens: &[tree_sitter_generate::nativedsl::lexer::Token],
+    source: &'src str,
+    offset: u32,
+) -> Option<(Span, &'src str)> {
+    use tree_sitter_generate::nativedsl::lexer::TokenKind;
+    let idx = tokens
+        .iter()
+        .position(|t| offset >= t.span.start && offset < t.span.end)?;
+    let name_tok = tokens.get(idx)?;
+    if name_tok.kind != TokenKind::Ident {
+        return None;
+    }
+    // Surrounding pattern: Pound LBracket Ident("cfg") LParen | IDENT | RParen RBracket
+    if idx < 4 {
+        return None;
+    }
+    let pound = tokens.get(idx - 4)?;
+    let lbracket = tokens.get(idx - 3)?;
+    let cfg_ident = tokens.get(idx - 2)?;
+    let lparen = tokens.get(idx - 1)?;
+    if pound.kind != TokenKind::Pound
+        || lbracket.kind != TokenKind::LBracket
+        || cfg_ident.kind != TokenKind::Ident
+        || &source[cfg_ident.span.start as usize..cfg_ident.span.end as usize] != "cfg"
+        || lparen.kind != TokenKind::LParen
+    {
+        return None;
+    }
+    Some((
+        name_tok.span,
+        &source[name_tok.span.start as usize..name_tok.span.end as usize],
+    ))
+}
+
+/// True if `start_idx` (a token index, exclusive) sits inside the flag-name
+/// slot of a `#[cfg(|...)]` attribute: cursor is between the opening `(`
+/// and the closing `)`, and the preceding tokens form `#[cfg`.
+#[must_use]
+pub fn at_cfg_flag_arg(
+    tokens: &[tree_sitter_generate::nativedsl::lexer::Token],
+    source: &str,
+    start_idx: usize,
+) -> bool {
+    use tree_sitter_generate::nativedsl::lexer::TokenKind;
+    let mut i = start_idx;
+    while i > 0 {
+        i -= 1;
+        match tokens[i].kind {
+            TokenKind::Ident | TokenKind::Comment => {}
+            TokenKind::LParen => {
+                if i < 3 {
+                    return false;
+                }
+                let pound = &tokens[i - 3];
+                let lbracket = &tokens[i - 2];
+                let cfg_ident = &tokens[i - 1];
+                return pound.kind == TokenKind::Pound
+                    && lbracket.kind == TokenKind::LBracket
+                    && cfg_ident.kind == TokenKind::Ident
+                    && &source[cfg_ident.span.start as usize..cfg_ident.span.end as usize]
+                        == "cfg";
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 #[must_use]
 pub fn span_to_range(rope: &Rope, span: Span) -> Range {
     Range::new(

@@ -4934,3 +4934,102 @@ async fn bench_hover_cpp_end_to_end() {
         miss_time.saturating_sub(change_only_time)
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// Cfg attribute support (#[cfg(NAME)]) - dim/hint diagnostics, hover,
+// completion. Matches the rust-analyzer treatment for conditionally compiled
+// code: disabled regions render dimmed with a hover message.
+// ---------------------------------------------------------------------------
+
+#[expect(clippy::significant_drop_tightening)]
+#[tokio::test(flavor = "current_thread")]
+async fn cfg_disabled_rule_produces_hint_diagnostic() {
+    // `GFM` flag is declared but not enabled, so the `strikethrough` rule
+    // gets gated off. The LSP should surface a HINT+UNNECESSARY diagnostic
+    // over the `#[cfg(GFM)] rule strikethrough { "~~" }` range so editors
+    // render it dimmed.
+    let grammar = r#"grammar { language: "test", flags: { disabled: ["GFM"] } }
+rule program { "x" }
+#[cfg(GFM)]
+rule strikethrough { "~~" }
+"#;
+    let service = init(&[(test_uri(), grammar)]).await;
+    let doc = service.inner().document_map.get(&test_uri()).unwrap();
+
+    // No hard errors - the cfg-gated rule isn't referenced.
+    let hints: Vec<&Diagnostic> = doc
+        .dsl_diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::HINT))
+        .collect();
+    assert_eq!(hints.len(), 1);
+    let h = hints[0];
+    assert_eq!(h.severity, Some(DiagnosticSeverity::HINT));
+    assert_eq!(h.tags.as_deref(), Some(&[DiagnosticTag::UNNECESSARY][..]));
+    assert_eq!(
+        h.message,
+        "disabled by cfg flag `GFM` (currently off)".to_string()
+    );
+    // Range covers the full `#[cfg(GFM)] rule strikethrough { "~~" }` block.
+    assert_eq!(h.range.start, Position::new(2, 0));
+    assert_eq!(h.range.end, Position::new(3, 27));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hover_cfg_flag_name_shows_disabled_state() {
+    let grammar = r#"grammar { language: "test", flags: { disabled: ["GFM"] } }
+rule program { "x" }
+#[cfg(GFM)]
+rule strikethrough { "~~" }
+"#;
+    let mut service = init(&[(test_uri(), grammar)]).await;
+
+    // Cursor on `GFM` inside `#[cfg(GFM)]` (line 2, col 6).
+    let result = hover_at(&mut service, test_uri(), Position::new(2, 6)).await;
+    assert_eq!(result, make_hover("```\ncfg flag `GFM` (disabled)\n```"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hover_cfg_flag_name_shows_enabled_state() {
+    let grammar = r#"grammar { language: "test", flags: { enabled: ["GFM"] } }
+#[cfg(GFM)]
+rule program { "x" }
+"#;
+    let mut service = init(&[(test_uri(), grammar)]).await;
+
+    // Cursor on `GFM` inside `#[cfg(GFM)]` (line 1, col 6).
+    let result = hover_at(&mut service, test_uri(), Position::new(1, 6)).await;
+    assert_eq!(result, make_hover("```\ncfg flag `GFM` (enabled)\n```"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn completion_inside_cfg_lists_declared_flags() {
+    // Grammar must parse cleanly so the loader records the flag registry.
+    // Cursor lands at the start of `GFM` (just after the opening paren).
+    let grammar = r#"grammar { language: "test", flags: { enabled: ["GFM"], disabled: ["TABLES"] } }
+#[cfg(GFM)]
+rule program { "x" }
+"#;
+    let mut service = init(&[(test_uri(), grammar)]).await;
+
+    // Cursor inside `#[cfg(|GFM)]` (line 1, col 6).
+    let items = completions_at(&mut service, test_uri(), Position::new(1, 6)).await;
+    assert_eq!(
+        items,
+        vec![
+            CompletionItem {
+                label: "GFM".into(),
+                kind: Some(CompletionItemKind::CONSTANT),
+                detail: Some("cfg flag (enabled)".into()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "TABLES".into(),
+                kind: Some(CompletionItemKind::CONSTANT),
+                detail: Some("cfg flag (disabled)".into()),
+                ..Default::default()
+            },
+        ]
+    );
+}
