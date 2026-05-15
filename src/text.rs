@@ -313,6 +313,50 @@ mod tests {
         assert_eq!(position_to_offset(&rope, Position::new(99, 0)), None);
     }
 
+    // Pin the LSP line-break convention: only LF (and CRLF) terminate a
+    // line. Unicode line separators (U+2028, U+2029), NEL, VT, FF, and a
+    // lone CR must NOT shift LSP line numbers. Without this, ropey's default
+    // unicode-line-break detection would count those chars (typically buried
+    // in a regex or string literal) as line breaks, throwing every position
+    // mapping after them off by N lines.
+    #[test]
+    fn unicode_line_separators_are_not_lsp_line_breaks() {
+        // Mix VT, FF, U+2028 (LS), U+2029 (PS) into a single line, then
+        // newline, then a regular line. Ropey's default features would
+        // count these as line breaks; LSP wouldn't.
+        let text = "x\u{000B}y\u{000C}z\u{2028}q\u{2029}r\n2\n";
+        let rope = Rope::from_str(text);
+        // Position (1, 0) should be at the byte after the only real `\n`.
+        let line1_offset = text.find('\n').unwrap() as u32 + 1;
+        assert_eq!(
+            position_to_offset(&rope, Position::new(1, 0)),
+            Some(line1_offset)
+        );
+        // The byte after the only real `\n` (== '2') must report at (1, 0).
+        assert_eq!(
+            offset_to_position(&rope, line1_offset),
+            Position::new(1, 0)
+        );
+        // And the line count itself: 3 ropey "lines" (2 LF + EOF empty).
+        assert_eq!(rope.len_lines(), 3);
+    }
+
+    #[test]
+    fn crlf_counts_as_one_line_break() {
+        let text = "a\r\nb\r\n";
+        let rope = Rope::from_str(text);
+        // 'b' starts at byte 3 (after "a\r\n") and should be at (1, 0).
+        let b_offset = text.find('b').unwrap() as u32;
+        assert_eq!(
+            offset_to_position(&rope, b_offset),
+            Position::new(1, 0)
+        );
+        assert_eq!(
+            position_to_offset(&rope, Position::new(1, 0)),
+            Some(b_offset)
+        );
+    }
+
     #[test]
     fn word_at_offset_basic() {
         let text = "rule foo_bar { seq(\"a\") }";

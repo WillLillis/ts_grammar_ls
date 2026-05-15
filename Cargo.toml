@@ -33,7 +33,13 @@ dashmap = "6.1"
 etcetera = "0.8"
 toml = "0.8"
 dunce = "1.0"
-ropey = "1.6"
+# LSP positions count only `\n` and `\r\n` as line breaks. Ropey's default
+# features include Unicode line breaks (U+0085, U+000B, U+000C, U+2028,
+# U+2029, ...) which make `Rope::line` / `line_to_char` diverge from the
+# client's line numbering whenever those bytes appear in string literals or
+# comments. Disable `unicode_lines` and `cr_lines` so only LF terminates a
+# line; CRLF still works because the LF inside it is the terminator.
+ropey = { version = "1.6", default-features = false, features = ["simd"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = [
