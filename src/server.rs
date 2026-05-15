@@ -160,18 +160,30 @@ impl Backend {
         }
     }
 
-    /// Get the analysis for `uri` and convert `pos` to a byte offset within
-    /// it, in one go. Both must succeed; if either fails, this returns
-    /// `None`. Saves repeating the `get_analysis` + `position_to_offset`
-    /// preamble in every position-based handler.
+    /// Get the analysis for `uri` and convert `pos` to a byte offset, in one
+    /// go. Both must succeed; if either fails, this returns `None`.
+    ///
+    /// The position is mapped through the LIVE document's rope, not the
+    /// analysis's. `get_analysis` may serve `last_good_analysis` (a snapshot
+    /// from before a transient parse error), whose rope reflects the older
+    /// text. If the user has edited since that snapshot, mapping a live
+    /// cursor through the stale rope can land on a wholly different region
+    /// of the file - typically shifted by however many line breaks were
+    /// added/removed. Using the live rope keeps the offset in live-buffer
+    /// coordinates; downstream lookups against stale spans degrade
+    /// gracefully (a span that no longer matches the live offset just
+    /// fails to be picked up, rather than picking up the wrong identifier).
     #[must_use]
     pub fn resolve_position(
         &self,
         uri: &tower_lsp::lsp_types::Url,
         pos: tower_lsp::lsp_types::Position,
     ) -> Option<(std::sync::Arc<crate::document::Module>, u32)> {
+        let offset = {
+            let doc = self.document_map.get(uri)?;
+            crate::text::position_to_offset(&doc.rope, pos)?
+        };
         let analysis = self.get_analysis(uri)?;
-        let offset = crate::text::position_to_offset(&analysis.rope, pos)?;
         Some((analysis, offset))
     }
 
