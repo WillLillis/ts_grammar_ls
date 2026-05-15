@@ -82,6 +82,7 @@ impl RenderState<'_> {
                 let flat_fits = self.fits_flat(child, self.max_width.saturating_sub(self.col));
                 self.emit(child, !flat_fits);
             }
+            DocNode::Fill(child) => self.emit_packed(*child),
             DocNode::Indent(child) => {
                 let child = *child;
                 self.indent_level += 1;
@@ -138,6 +139,50 @@ impl RenderState<'_> {
         };
         probe.walk(id)
     }
+
+    /// Pack-mode emission for `Fill`. Walks the child's top-level children
+    /// (flattening one level of `Concat`) and makes a per-`SoftLine`
+    /// decision: if the next chunk (up to the next `SoftLine`) fits in the
+    /// remaining line budget, emit a space; otherwise emit a newline.
+    fn emit_packed(&mut self, id: DocId) {
+        let children: Vec<DocId> = match self.arena.get(id) {
+            DocNode::Concat { start, len } => {
+                self.arena.concat_children(*start, *len).to_vec()
+            }
+            _ => vec![id],
+        };
+        let mut i = 0;
+        while i < children.len() {
+            let c = children[i];
+            if matches!(self.arena.get(c), DocNode::SoftLine) {
+                let mut j = i + 1;
+                while j < children.len()
+                    && !matches!(self.arena.get(children[j]), DocNode::SoftLine)
+                {
+                    j += 1;
+                }
+                let budget = self.max_width.saturating_sub(self.col + 1);
+                let mut probe = FitsProbe {
+                    arena: self.arena,
+                    remaining: budget,
+                };
+                let segment_fits = children[i + 1..j].iter().all(|&c| probe.walk(c));
+                if segment_fits {
+                    self.out.push(' ');
+                    self.col += 1;
+                } else {
+                    self.newline();
+                }
+                i += 1;
+            } else {
+                // Inside a packed Fill, `broken` is true: IfBroken picks the
+                // broken side, SoftLines we encounter as part of nested
+                // structures still respect that.
+                self.emit(c, true);
+                i += 1;
+            }
+        }
+    }
 }
 
 struct FitsProbe<'a> {
@@ -176,6 +221,8 @@ impl FitsProbe<'_> {
             }
             // While probing flat, IfBroken takes the flat side.
             DocNode::IfBroken { flat, .. } => self.walk(*flat),
+            // For a flat probe, a Fill's contents must fit flat too.
+            DocNode::Fill(child) => self.walk(*child),
         }
     }
 

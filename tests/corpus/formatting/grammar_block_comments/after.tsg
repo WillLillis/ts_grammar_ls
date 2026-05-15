@@ -1,9 +1,9 @@
 grammar {
     language: "test",
-    // The word token
-    word: identifier,
     // Extra whitespace and comments
     extras: [regexp(r"\s"), comment],
+    // The word token
+    word: identifier,
 }
 
 rule program { "x" }

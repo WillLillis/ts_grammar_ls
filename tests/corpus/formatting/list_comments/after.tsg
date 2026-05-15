@@ -2,7 +2,7 @@ grammar {
     language: "test",
 }
 
-let extras: list_rule_t = [
+let extras: list_t<rule_t> = [
     // whitespace
     regexp(r"\s"),
     // line comments

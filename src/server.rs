@@ -11,7 +11,7 @@ use tower_lsp::{
         CodeActionParams, CodeActionResponse, CompletionParams, CompletionResponse,
         DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
         DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-        DocumentFormattingParams,
+        DocumentFormattingParams, DocumentRangeFormattingParams,
         DocumentHighlight, DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse,
         GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
         InitializeResult, InitializedParams, Location, PrepareRenameResponse, ReferenceParams,
@@ -288,6 +288,13 @@ impl LanguageServer for Backend {
         params: DocumentFormattingParams,
     ) -> jsonrpc::Result<Option<Vec<TextEdit>>> {
         Ok(handlers::formatting::formatting(self, &params).await)
+    }
+
+    async fn range_formatting(
+        &self,
+        params: DocumentRangeFormattingParams,
+    ) -> jsonrpc::Result<Option<Vec<TextEdit>>> {
+        Ok(handlers::formatting::range_formatting(self, &params).await)
     }
 
     async fn code_action(

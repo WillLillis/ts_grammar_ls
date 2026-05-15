@@ -3,9 +3,10 @@ grammar {
     language: "test",
 }
 
-// Helper functions
-fn commaSep1(item: rule_t) -> rule_t { seq(item, repeat(seq(",", item))) }
-fn commaSep(item: rule_t) -> rule_t { optional(commaSep1(item)) }
+// Helper macros
+macro commaSep1(item: rule_t) rule_t { seq(item, repeat(seq(",", item))) }
+
+macro commaSep(item: rule_t) rule_t { optional(commaSep1(item)) }
 
 // Rules
 rule program { "x" }

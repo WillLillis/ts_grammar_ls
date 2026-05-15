@@ -42,6 +42,7 @@ pub async fn initialize(backend: &Backend, params: InitializeParams) -> Initiali
             }),
             document_symbol_provider: Some(OneOf::Left(true)),
             document_formatting_provider: Some(OneOf::Left(true)),
+            document_range_formatting_provider: Some(OneOf::Left(true)),
             code_action_provider: Some(tower_lsp::lsp_types::CodeActionProviderCapability::Simple(
                 true,
             )),

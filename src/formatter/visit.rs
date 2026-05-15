@@ -13,6 +13,7 @@
 use tree_sitter_generate::nativedsl::ast::{
     ConfigField, IdentKind, ModuleContext, Node, NodeId, RepeatKind, SharedAst, Span,
 };
+use tree_sitter_generate::nativedsl::Ty;
 
 use super::doc::{DocArena, DocId};
 use super::trivia::{TriviaItem, TriviaMap};
@@ -44,15 +45,63 @@ impl<'a> Printer<'a> {
     pub fn module(&mut self) -> DocId {
         let items: Vec<NodeId> = self.ctx.root_items.iter().copied().collect();
         let mut parts: Vec<DocId> = Vec::new();
-        for (i, id) in items.iter().enumerate() {
-            if i > 0 {
-                let line1 = self.arena.line();
-                let line2 = self.arena.line();
-                parts.push(self.arena.concat(&[line1, line2]));
+        let mut first_unit = true;
+        let mut prev_was_off = false;
+        let mut emitted_off_starts: Vec<u32> = Vec::new();
+        for id in &items {
+            let span = self.shared.arena.span(*id);
+            if let Some(range) = self.find_off_range(span.start) {
+                if emitted_off_starts.contains(&range.start) {
+                    continue; // already emitted this off block; skip in-range items
+                }
+                if !first_unit {
+                    let l1 = self.arena.line();
+                    let l2 = self.arena.line();
+                    parts.push(self.arena.concat(&[l1, l2]));
+                }
+                // Preserve the raw source verbatim, including its trailing
+                // newline; that newline is what separates the off block from
+                // the `// tsg-format: on` pragma in the next item's leading.
+                let raw = &self.ctx.source[range.start as usize..range.end as usize];
+                parts.push(self.arena.raw(raw));
+                emitted_off_starts.push(range.start);
+                first_unit = false;
+                prev_was_off = true;
+                continue;
+            }
+            // Skip the inter-item separator right after an off block; the
+            // raw region already ended with a newline and the next item's
+            // leading carries the `// tsg-format: on` pragma in its own
+            // paragraph.
+            if !first_unit && !prev_was_off {
+                let l1 = self.arena.line();
+                let l2 = self.arena.line();
+                parts.push(self.arena.concat(&[l1, l2]));
             }
             parts.push(self.item(*id));
+            first_unit = false;
+            prev_was_off = false;
+        }
+        // Trailing trivia after the last token: emit each comment on its own
+        // line. Strings have to land in the arena, but the Vec itself we walk
+        // by reference.
+        for item in self.trivia.tail.iter() {
+            if let TriviaItem::Comment(s) = item {
+                let nl = self.arena.line();
+                let cmt = self.arena.text(s.as_str());
+                parts.push(self.arena.concat(&[nl, cmt]));
+            }
         }
         self.arena.concat(&parts)
+    }
+
+    /// Find the format-off range that contains `offset`, if any.
+    fn find_off_range(&self, offset: u32) -> Option<std::ops::Range<u32>> {
+        self.trivia
+            .format_off_ranges
+            .iter()
+            .find(|r| r.start <= offset && offset < r.end)
+            .cloned()
     }
 
     // -- Top-level items -------------------------------------------------
@@ -72,7 +121,7 @@ impl<'a> Printer<'a> {
                 name,
                 body,
             } => self.rule_doc(is_override, name, body),
-            Node::Let { name, ty: _, value } => self.let_doc(name, value),
+            Node::Let { name, ty, value } => self.let_doc(name, ty, value),
             Node::Macro(macro_id) => self.macro_doc(macro_id),
             Node::External { name } => {
                 let kw = self.arena.text("external");
@@ -133,14 +182,22 @@ impl<'a> Printer<'a> {
         Some(self.arena.group(full))
     }
 
-    fn let_doc(&mut self, name: Span, value: NodeId) -> DocId {
-        // `let NAME = VALUE`. Object literals on the RHS may wrap; simple
-        // values stay flat.
-        let kw = self.arena.text("let ");
-        let n = self.arena.text(self.span_text(name));
-        let eq = self.arena.text(" = ");
-        let v = self.expr(value);
-        let doc = self.arena.concat(&[kw, n, eq, v]);
+    fn let_doc(
+        &mut self,
+        name: Span,
+        ty: Option<Ty>,
+        value: NodeId,
+    ) -> DocId {
+        let mut parts = Vec::new();
+        parts.push(self.arena.text("let "));
+        parts.push(self.arena.text(self.span_text(name)));
+        if let Some(ty) = ty {
+            parts.push(self.arena.text(": "));
+            parts.push(self.arena.text(ty.to_string()));
+        }
+        parts.push(self.arena.text(" = "));
+        parts.push(self.expr(value));
+        let doc = self.arena.concat(&parts);
         self.arena.group(doc)
     }
 
@@ -200,21 +257,23 @@ impl<'a> Printer<'a> {
             .grammar_config
             .as_ref()
             .expect("grammar_block called without grammar_config");
-        // Always per-line layout: each field on its own line, trailing
-        // comma always present (we're always multi-line).
         let mut field_parts = Vec::new();
         if let Some(lang) = &cfg.language {
+            let leading = self.arena.nil(); // TODO: leading on `language` (uncommon).
             let key = self.arena.text("language");
             let colon = self.arena.text(": \"");
             let val = self.arena.text(lang.clone());
             let close = self.arena.text("\"");
-            field_parts.push(self.arena.concat(&[key, colon, val, close]));
+            field_parts.push(self.arena.concat(&[leading, key, colon, val, close]));
         }
         for (field, node_id) in cfg.node_fields() {
+            let value_start = self.shared.arena.span(node_id).start;
+            let key_start = self.find_key_start(value_start);
+            let leading = self.emit_leading(key_start);
             let key = self.arena.text(config_field_name(field));
             let colon = self.arena.text(": ");
             let val = self.expr(node_id);
-            field_parts.push(self.arena.concat(&[key, colon, val]));
+            field_parts.push(self.arena.concat(&[leading, key, colon, val]));
         }
         if field_parts.is_empty() {
             return self.arena.text("grammar { }");
@@ -229,8 +288,6 @@ impl<'a> Printer<'a> {
             lines.push(self.arena.concat(&[fp, comma]));
         }
         let inner = self.arena.concat(&lines);
-        // Put the leading newline *inside* the indent so the first field
-        // gets indented along with the rest.
         let nl_first = self.arena.line();
         let inner_with_open = self.arena.concat(&[nl_first, inner]);
         let indented = self.arena.indent(inner_with_open);
@@ -238,6 +295,28 @@ impl<'a> Printer<'a> {
         let nl_close = self.arena.line();
         let close = self.arena.text("}");
         self.arena.concat(&[open, indented, nl_close, close])
+    }
+
+    /// Walk back from a value's `span.start` past whitespace, `:`, more
+    /// whitespace, then the key identifier itself, returning the byte offset
+    /// of the key token's start. Used to look up leading trivia on grammar
+    /// block field keys, which aren't tracked as AST nodes.
+    fn find_key_start(&self, value_start: u32) -> u32 {
+        let bytes = self.ctx.source.as_bytes();
+        let mut i = value_start as usize;
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i > 0 && bytes[i - 1] == b':' {
+            i -= 1;
+        }
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+            i -= 1;
+        }
+        i as u32
     }
 
     // -- Expressions -----------------------------------------------------
@@ -261,7 +340,10 @@ impl<'a> Printer<'a> {
                 let body = self.expr(inner);
                 self.arena.concat(&[neg, body])
             }
-            Node::Call { name, args } => self.call_doc(name, args),
+            Node::Call { name, args } => {
+                let parent_end = self.shared.arena.span(id).end;
+                self.call_doc(name, args, parent_end)
+            }
             Node::QualifiedCall(range) => {
                 let (obj, name, _) = self.shared.pools.get_qualified_call(range);
                 let obj_doc = self.expr(obj);
@@ -272,7 +354,8 @@ impl<'a> Printer<'a> {
                 // wrapper around them.
                 let (_, _, args) = self.shared.pools.get_qualified_call(args_start);
                 let args_ids: Vec<NodeId> = args.to_vec();
-                let args_doc = self.args_doc(&args_ids);
+                let parent_end = self.shared.arena.span(id).end;
+                let args_doc = self.args_doc(&args_ids, parent_end);
                 self.arena.concat(&[obj_doc, cc, name_doc, args_doc])
             }
             Node::FieldAccess { obj, field } => {
@@ -290,11 +373,13 @@ impl<'a> Printer<'a> {
             Node::SeqOrChoice { seq, range } => {
                 let name = if seq { "seq" } else { "choice" };
                 let kids: Vec<NodeId> = self.shared.pools.child_slice(range).to_vec();
-                self.named_args_doc(name, &kids)
+                let parent_end = self.shared.arena.span(id).end;
+                self.named_args_doc(name, &kids, parent_end)
             }
             Node::Concat(range) => {
                 let kids: Vec<NodeId> = self.shared.pools.child_slice(range).to_vec();
-                self.named_args_doc("concat", &kids)
+                let parent_end = self.shared.arena.span(id).end;
+                self.named_args_doc("concat", &kids, parent_end)
             }
             Node::Repeat { kind, inner } => {
                 let name = match kind {
@@ -302,7 +387,8 @@ impl<'a> Printer<'a> {
                     RepeatKind::OneOrMore => "repeat1",
                     RepeatKind::Optional => "optional",
                 };
-                self.named_args_doc(name, &[inner])
+                let parent_end = self.shared.arena.span(id).end;
+                self.named_args_doc(name, &[inner], parent_end)
             }
             Node::Field { name, content } => {
                 let head = self.arena.text("field(");
@@ -312,10 +398,14 @@ impl<'a> Printer<'a> {
                 let close = self.arena.text(")");
                 self.arena.concat(&[head, n, comma, c, close])
             }
-            Node::Alias { content, target } => self.named_args_doc("alias", &[content, target]),
+            Node::Alias { content, target } => {
+                let parent_end = self.shared.arena.span(id).end;
+                self.named_args_doc("alias", &[content, target], parent_end)
+            }
             Node::Token { immediate, inner } => {
                 let name = if immediate { "token_immediate" } else { "token" };
-                self.named_args_doc(name, &[inner])
+                let parent_end = self.shared.arena.span(id).end;
+                self.named_args_doc(name, &[inner], parent_end)
             }
             Node::Prec {
                 kind,
@@ -329,7 +419,8 @@ impl<'a> Printer<'a> {
                     PrecKind::Right => "prec_right",
                     PrecKind::Dynamic => "prec_dynamic",
                 };
-                self.named_args_doc(name, &[value, content])
+                let parent_end = self.shared.arena.span(id).end;
+                self.named_args_doc(name, &[value, content], parent_end)
             }
             Node::Reserved { context, content } => {
                 let head = self.arena.text("reserved(");
@@ -340,10 +431,11 @@ impl<'a> Printer<'a> {
                 self.arena.concat(&[head, ctx, comma, c, close])
             }
             Node::DynRegex { pattern, flags } => {
+                let parent_end = self.shared.arena.span(id).end;
                 if let Some(flags) = flags {
-                    self.named_args_doc("regexp", &[pattern, flags])
+                    self.named_args_doc("regexp", &[pattern, flags], parent_end)
                 } else {
-                    self.named_args_doc("regexp", &[pattern])
+                    self.named_args_doc("regexp", &[pattern], parent_end)
                 }
             }
             Node::ModuleRef { import, path, .. } => {
@@ -370,13 +462,18 @@ impl<'a> Printer<'a> {
             Node::For { for_id, body } => self.for_doc(for_id, body),
             Node::List(range) => {
                 let kids: Vec<NodeId> = self.shared.pools.child_slice(range).to_vec();
-                self.delimited_list("[", "]", &kids)
+                let parent_end = self.shared.arena.span(id).end;
+                self.delimited_list("[", "]", &kids, parent_end)
             }
             Node::Tuple(range) => {
                 let kids: Vec<NodeId> = self.shared.pools.child_slice(range).to_vec();
-                self.delimited_list("(", ")", &kids)
+                let parent_end = self.shared.arena.span(id).end;
+                self.delimited_list("(", ")", &kids, parent_end)
             }
-            Node::Object(range) => self.object_doc(range),
+            Node::Object(range) => {
+                let parent_end = self.shared.arena.span(id).end;
+                self.object_doc(range, parent_end)
+            }
             Node::MacroParam { .. } | Node::ForBinding { .. } => {
                 // Resolved bindings keep the source span pointing at the
                 // identifier; emit it verbatim.
@@ -394,90 +491,164 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// `name(arg, arg, ...)` with per-line wrap when broken.
-    fn named_args_doc(&mut self, name: &str, args: &[NodeId]) -> DocId {
+    /// `name(arg, arg, ...)` with per-line wrap when broken. `parent_end`
+    /// is the parent node's `span.end` (exclusive upper bound for trivia
+    /// lookups inside the arg list - excludes the trailing on the close
+    /// paren itself).
+    fn named_args_doc(&mut self, name: &str, args: &[NodeId], parent_end: u32) -> DocId {
         let head = self.arena.text(format!("{name}("));
-        let body = self.args_inner(args);
+        let body = self.args_inner(args, parent_end);
         let close = self.arena.text(")");
         let doc = self.arena.concat(&[head, body, close]);
         self.arena.group(doc)
     }
 
     /// Just the args portion of a call - `( ... )`.
-    fn args_doc(&mut self, args: &[NodeId]) -> DocId {
+    fn args_doc(&mut self, args: &[NodeId], parent_end: u32) -> DocId {
         let open = self.arena.text("(");
-        let body = self.args_inner(args);
+        let body = self.args_inner(args, parent_end);
         let close = self.arena.text(")");
         let doc = self.arena.concat(&[open, body, close]);
         self.arena.group(doc)
     }
 
     /// Body of a call's args: softbreak + indent(items) + trailing-if-broken
-    /// + softbreak. No outer parens.
-    fn args_inner(&mut self, args: &[NodeId]) -> DocId {
+    /// + softbreak. No outer parens. Each arg's leading trivia is emitted
+    /// before it; any trailing comment on the comma between two args (or on
+    /// the arg itself) is queried by range and emitted in place.
+    fn args_inner(&mut self, args: &[NodeId], parent_end: u32) -> DocId {
         if args.is_empty() {
             return self.arena.nil();
         }
         let sb_open = self.arena.softbreak();
-        let mut item_parts = Vec::new();
+        let mut item_parts: Vec<DocId> = Vec::new();
         for (i, a) in args.iter().enumerate() {
+            let span = self.shared.arena.span(*a);
             if i > 0 {
-                let comma = self.arena.text(",");
-                let sl = self.arena.softline();
-                item_parts.push(comma);
-                item_parts.push(sl);
+                item_parts.push(self.arena.text(","));
+                // Trailing comment between previous arg and this one (on the
+                // previous arg itself or on the separating comma).
+                let prev_end = self.shared.arena.span(args[i - 1]).end;
+                if let Some(c) = self.trivia.trailing_in(prev_end, span.start) {
+                    let s = c.to_owned();
+                    item_parts.push(self.arena.text(format!(" {s}")));
+                    item_parts.push(self.arena.line());
+                } else {
+                    item_parts.push(self.arena.softline());
+                }
             }
+            let leading = self.emit_leading(span.start);
+            item_parts.push(leading);
             item_parts.push(self.expr(*a));
         }
         let items = self.arena.concat(&item_parts);
-        let nil = self.arena.nil();
-        let trailing_text = self.arena.text(",");
-        let tc = self.arena.if_broken(trailing_text, nil);
-        let inner = self.arena.concat(&[sb_open, items, tc]);
-        let indented = self.arena.indent(inner);
-        let sb_close = self.arena.softbreak();
-        self.arena.concat(&[indented, sb_close])
+        // Trailing-if-broken comma after the final arg. If a same-line
+        // comment trails the final arg or its (source) trailing comma, emit
+        // the comma unconditionally + the comment, then a hard line OUTSIDE
+        // the indent so the close punctuation lands at the outer column.
+        let last_end = self.shared.arena.span(*args.last().unwrap()).end;
+        let last_trail = self.trivia.trailing_in(last_end, parent_end).map(str::to_owned);
+        if let Some(c) = last_trail {
+            let comma = self.arena.text(",");
+            let cmt = self.arena.text(format!(" {c}"));
+            let inner = self.arena.concat(&[sb_open, items, comma, cmt]);
+            let indented = self.arena.indent(inner);
+            let line = self.arena.line();
+            self.arena.concat(&[indented, line])
+        } else {
+            let nil = self.arena.nil();
+            let trailing_text = self.arena.text(",");
+            let tail = self.arena.if_broken(trailing_text, nil);
+            let inner = self.arena.concat(&[sb_open, items, tail]);
+            let indented = self.arena.indent(inner);
+            let sb_close = self.arena.softbreak();
+            self.arena.concat(&[indented, sb_close])
+        }
     }
 
-    fn delimited_list(&mut self, open: &str, close: &str, items: &[NodeId]) -> DocId {
+    fn delimited_list(
+        &mut self,
+        open: &str,
+        close: &str,
+        items: &[NodeId],
+        parent_end: u32,
+    ) -> DocId {
         let o = self.arena.text(open.to_string());
         let c = self.arena.text(close.to_string());
-        let body = self.args_inner(items);
+        let body = self.args_inner(items, parent_end);
         let doc = self.arena.concat(&[o, body, c]);
         self.arena.group(doc)
     }
 
-    fn object_doc(&mut self, range: tree_sitter_generate::nativedsl::ast::ChildRange) -> DocId {
+    fn object_doc(
+        &mut self,
+        range: tree_sitter_generate::nativedsl::ast::ChildRange,
+        parent_end: u32,
+    ) -> DocId {
         let fields: Vec<(Span, NodeId)> = self.shared.pools.get_object(range).to_vec();
         if fields.is_empty() {
             return self.arena.text("{}");
         }
-        let open = self.arena.text("{");
-        let mut item_parts = Vec::new();
+        // Entries: e1 "," softline e2 "," softline ... e_n if_broken(",", nil)
+        // Each separator is a softline so Fill packs entries per line. The
+        // trailing comma is gated on the surrounding Group's break state.
+        let mut entry_parts: Vec<DocId> = Vec::new();
         for (i, (key, value)) in fields.iter().enumerate() {
             if i > 0 {
-                let comma = self.arena.text(",");
-                let sl = self.arena.softline();
-                item_parts.push(comma);
-                item_parts.push(sl);
+                entry_parts.push(self.arena.text(","));
+                let prev_end = self.shared.arena.span(fields[i - 1].1).end;
+                if let Some(c) = self.trivia.trailing_in(prev_end, key.start) {
+                    let s = c.to_owned();
+                    entry_parts.push(self.arena.text(format!(" {s}")));
+                    entry_parts.push(self.arena.line());
+                } else {
+                    entry_parts.push(self.arena.softline());
+                }
             }
+            let leading = self.emit_leading(key.start);
+            entry_parts.push(leading);
             let k = self.arena.text(self.span_text(*key));
             let colon = self.arena.text(": ");
             let v = self.expr(*value);
-            item_parts.push(self.arena.concat(&[k, colon, v]));
+            entry_parts.push(self.arena.concat(&[k, colon, v]));
         }
-        let items = self.arena.concat(&item_parts);
         let nil = self.arena.nil();
         let tc_text = self.arena.text(",");
-        let tc = self.arena.if_broken(tc_text, nil);
-        let sb_open = self.arena.softline();
-        let inner = self.arena.concat(&[sb_open, items, tc]);
-        let indented = self.arena.indent(inner);
-        let sb_close = self.arena.softline();
+        let trailing_comma = self.arena.if_broken(tc_text, nil);
+        entry_parts.push(trailing_comma);
+        let entries = self.arena.concat(&entry_parts);
+
+        // Flat: `{ e1, e2 }`. Broken: `{<indent \n Fill(entries)> \n }`. A
+        // same-line comment trailing the final entry forces break and adds
+        // ` // comment` between Fill and the closing line.
+        let last_end = self.shared.arena.span(fields.last().unwrap().1).end;
+        let last_trail = self.trivia.trailing_in(last_end, parent_end).map(str::to_owned);
+
+        let flat_body = {
+            let sp1 = self.arena.text(" ");
+            let sp2 = self.arena.text(" ");
+            self.arena.concat(&[sp1, entries, sp2])
+        };
+        let broken_body = {
+            let line_in = self.arena.line();
+            let fill = self.arena.fill(entries);
+            let inner = self.arena.concat(&[line_in, fill]);
+            let indented = self.arena.indent(inner);
+            let line_out = self.arena.line();
+            if let Some(c) = last_trail {
+                let trail_cmt = self.arena.text(format!(" {c}"));
+                self.arena.concat(&[indented, trail_cmt, line_out])
+            } else {
+                self.arena.concat(&[indented, line_out])
+            }
+        };
+        let body = self.arena.if_broken(broken_body, flat_body);
+        let open = self.arena.text("{");
         let close = self.arena.text("}");
-        let doc = self.arena.concat(&[open, indented, sb_close, close]);
+        let doc = self.arena.concat(&[open, body, close]);
         self.arena.group(doc)
     }
+
 
     fn for_doc(&mut self, for_id: tree_sitter_generate::nativedsl::ast::ForId, body: NodeId) -> DocId {
         let cfg = self.shared.pools.get_for(for_id);
@@ -503,10 +674,15 @@ impl<'a> Printer<'a> {
         self.arena.group(doc)
     }
 
-    fn call_doc(&mut self, name: NodeId, args: tree_sitter_generate::nativedsl::ast::ChildRange) -> DocId {
+    fn call_doc(
+        &mut self,
+        name: NodeId,
+        args: tree_sitter_generate::nativedsl::ast::ChildRange,
+        parent_end: u32,
+    ) -> DocId {
         let name_doc = self.expr(name);
         let args_slice: Vec<NodeId> = self.shared.pools.child_slice(args).to_vec();
-        let args_doc = self.args_doc(&args_slice);
+        let args_doc = self.args_doc(&args_slice, parent_end);
         self.arena.concat(&[name_doc, args_doc])
     }
 

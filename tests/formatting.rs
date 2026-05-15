@@ -11,7 +11,6 @@ fn corpus_dir() -> &'static Path {
     ))
 }
 
-#[ignore = "formatter under construction; un-ignore once full corpus passes"]
 #[test]
 fn formatting_corpus() {
     let config = FormattingConfig::default();

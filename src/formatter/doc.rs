@@ -40,6 +40,11 @@ pub enum DocNode {
     /// Try to render flat; if it doesn't fit the width budget, break all
     /// `SoftLine`/`SoftBreak` inside as newlines.
     Group(DocId),
+    /// Like `Group` for the all-flat case, but when it doesn't fit, makes a
+    /// per-`SoftLine` decision: each break point packs as much content as
+    /// fits before wrapping. Used for object literals where multiple
+    /// `key: value` pairs share a line.
+    Fill(DocId),
     /// Render child with indent depth increased by one level.
     Indent(DocId),
     /// Sequence: children stored in `arena.children[start..start+len]`.
@@ -113,6 +118,12 @@ impl DocArena {
         self.alloc(DocNode::Group(child))
     }
 
+    /// Fill wrapper - all-flat if it fits, otherwise pack as many segments
+    /// per line as the width budget allows.
+    pub fn fill(&mut self, child: DocId) -> DocId {
+        self.alloc(DocNode::Fill(child))
+    }
+
     /// Indent wrapper - increment indent depth inside.
     pub fn indent(&mut self, child: DocId) -> DocId {
         self.alloc(DocNode::Indent(child))
@@ -133,21 +144,6 @@ impl DocArena {
         self.children.extend_from_slice(parts);
         let len = u32::try_from(parts.len()).expect("doc arena overflow");
         self.alloc(DocNode::Concat { start, len })
-    }
-
-    /// Join `parts` with `sep` between each pair.
-    pub fn join(&mut self, parts: &[DocId], sep: DocId) -> DocId {
-        if parts.is_empty() {
-            return self.nil();
-        }
-        let mut joined = Vec::with_capacity(parts.len() * 2 - 1);
-        for (i, &p) in parts.iter().enumerate() {
-            if i > 0 {
-                joined.push(sep);
-            }
-            joined.push(p);
-        }
-        self.concat(&joined)
     }
 
     /// Look up a node by id. Panics on invalid id.

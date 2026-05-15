@@ -19,7 +19,8 @@
 //!
 //! Format-off pragma support is layered on top in a later pass.
 
-use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
+
 use tree_sitter_generate::nativedsl::lexer::{Token, TokenKind};
 
 /// A piece of leading trivia attached to a non-comment token.
@@ -40,8 +41,14 @@ pub enum TriviaItem {
 /// needing to know token indices.
 #[derive(Debug, Default)]
 pub struct TriviaMap {
-    leading: FxHashMap<u32, Vec<TriviaItem>>,
-    trailing: FxHashMap<u32, String>,
+    pub leading: BTreeMap<u32, Vec<TriviaItem>>,
+    pub trailing: BTreeMap<u32, String>,
+    /// Comments after the last non-comment token, with no following token to
+    /// attach them to. Drained by `module()` after the last root item.
+    pub tail: Vec<TriviaItem>,
+    /// Byte ranges `[off_pragma.start, on_pragma.start)` where the source
+    /// should be emitted verbatim. Unclosed ranges extend to EOF.
+    pub format_off_ranges: Vec<std::ops::Range<u32>>,
 }
 
 impl TriviaMap {
@@ -49,6 +56,29 @@ impl TriviaMap {
     #[must_use]
     pub fn build(tokens: &[Token], source: &str) -> Self {
         let mut map = Self::default();
+        // Scan comments for `// tsg-format: off` / `... on` pragmas.
+        let mut open_off: Option<u32> = None;
+        for tok in tokens {
+            if tok.kind != TokenKind::Comment {
+                continue;
+            }
+            let text = source[tok.span.start as usize..tok.span.end as usize]
+                .trim_end_matches(['\r', '\n'])
+                .trim();
+            if text == "// tsg-format: off" {
+                if open_off.is_none() {
+                    open_off = Some(tok.span.start);
+                }
+            } else if text == "// tsg-format: on"
+                && let Some(start) = open_off.take()
+            {
+                map.format_off_ranges.push(start..tok.span.start);
+            }
+        }
+        if let Some(start) = open_off {
+            map.format_off_ranges
+                .push(start..u32::try_from(source.len()).unwrap_or(u32::MAX));
+        }
         let mut prev_non_comment_end: Option<u32> = None;
         let mut pending: Vec<TriviaItem> = Vec::new();
         // Position of the last item we already accounted for when checking
@@ -82,7 +112,12 @@ impl TriviaMap {
                     pending.push(TriviaItem::Comment(text));
                     last_seen_end = Some(tok.span.end);
                 }
-                TokenKind::Eof => break,
+                TokenKind::Eof => {
+                    if !pending.is_empty() {
+                        map.tail = std::mem::take(&mut pending);
+                    }
+                    break;
+                }
                 _ => {
                     let nls_before = match (last_seen_end, prev_non_comment_end) {
                         (Some(end), _) | (None, Some(end)) => {
@@ -130,6 +165,14 @@ impl TriviaMap {
     #[must_use]
     pub fn trailing(&self, end: u32) -> Option<&str> {
         self.trailing.get(&end).map(String::as_str)
+    }
+
+    /// First trailing comment whose key falls in `[from, to)`. Used in arg
+    /// lists / object entries to find a same-line comment that landed on the
+    /// arg itself or on the following separator (typically a comma).
+    #[must_use]
+    pub fn trailing_in(&self, from: u32, to: u32) -> Option<&str> {
+        self.trailing.range(from..to).next().map(|(_, s)| s.as_str())
     }
 }
 

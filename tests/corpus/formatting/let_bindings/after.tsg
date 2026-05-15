@@ -3,7 +3,8 @@ grammar {
 }
 
 let PREC = { ADD: 1, MUL: 2, CALL: 8 }
-let extras: list_rule_t = [regexp(r"\s"), comment]
+
+let extras: list_t<rule_t> = [regexp(r"\s"), comment]
 
 rule program { "x" }
 
