@@ -1,7 +1,7 @@
 grammar {
     language: "test",
-    word: identifier,
     extras: [regexp(r"\s"), comment],
+    word: identifier,
 }
 
 rule program { repeat(_statement) }

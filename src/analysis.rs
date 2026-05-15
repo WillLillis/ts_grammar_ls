@@ -558,7 +558,7 @@ fn extract_builtin_references(
 /// `#[cfg(...)]` flag names.
 fn cfg_flag_list(cfg: &nativedsl::apply_cfg::CfgState) -> Vec<CfgFlag> {
     let mut flags: Vec<CfgFlag> = cfg
-        .declared
+        .declared_any
         .iter()
         .map(|name| CfgFlag {
             name: name.clone(),
