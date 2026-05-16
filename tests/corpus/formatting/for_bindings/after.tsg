@@ -1,0 +1,7 @@
+grammar {
+    language: "test",
+}
+
+rule program {
+    for (op: str_t, p: int_t) in [("+", 1), ("-", 2)] { prec_left(p, seq("x", op, "x")) }
+}

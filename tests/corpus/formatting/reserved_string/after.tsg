@@ -1,0 +1,5 @@
+grammar {
+    language: "test",
+}
+
+rule program { reserved("global", seq("a", "b")) }

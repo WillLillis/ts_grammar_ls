@@ -1,0 +1,7 @@
+grammar {
+    language: "test",
+}
+
+let helpers = import("helpers.tsg")
+
+rule program { "x" }

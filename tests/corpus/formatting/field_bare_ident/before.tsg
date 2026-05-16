@@ -1,0 +1,4 @@
+grammar{language:"test"}
+rule program{ seq(field(name,identifier),field(value,_form)) }
+rule identifier{"x"}
+rule _form{"y"}

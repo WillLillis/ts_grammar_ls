@@ -392,7 +392,7 @@ impl<'a> Printer<'a> {
             }
             Node::Field { name, content } => {
                 let head = self.arena.text("field(");
-                let n = self.arena.text(format!("\"{}\"", self.span_text(name)));
+                let n = self.arena.text(self.span_text(name));
                 let comma = self.arena.text(", ");
                 let c = self.expr(content);
                 let close = self.arena.text(")");
@@ -423,8 +423,10 @@ impl<'a> Printer<'a> {
                 self.named_args_doc(name, &[value, content], parent_end)
             }
             Node::Reserved { context, content } => {
+                // Parser strips the surrounding quotes from `context` (it's a
+                // string literal). Re-emit them.
                 let head = self.arena.text("reserved(");
-                let ctx = self.arena.text(self.span_text(context));
+                let ctx = self.arena.text(format!("\"{}\"", self.span_text(context)));
                 let comma = self.arena.text(", ");
                 let c = self.expr(content);
                 let close = self.arena.text(")");
@@ -439,9 +441,11 @@ impl<'a> Printer<'a> {
                 }
             }
             Node::ModuleRef { import, path, .. } => {
+                // Parser strips the surrounding quotes from `path` (same as
+                // StringLit). Re-emit the path as a string literal.
                 let name = if import { "import" } else { "inherit" };
                 let head = self.arena.text(format!("{name}("));
-                let p = self.arena.text(self.span_text(path));
+                let p = self.arena.text(format!("\"{}\"", self.span_text(path)));
                 let close = self.arena.text(")");
                 self.arena.concat(&[head, p, close])
             }
@@ -454,10 +458,8 @@ impl<'a> Printer<'a> {
                 self.arena.concat(&[head, m, comma, f, close])
             }
             Node::Append { left, right } => {
-                let l = self.expr(left);
-                let plus = self.arena.text(" + ");
-                let r = self.expr(right);
-                self.arena.concat(&[l, plus, r])
+                let parent_end = self.shared.arena.span(id).end;
+                self.named_args_doc("append", &[left, right], parent_end)
             }
             Node::For { for_id, body } => self.for_doc(for_id, body),
             Node::List(range) => {
@@ -480,13 +482,14 @@ impl<'a> Printer<'a> {
                 self.arena.text(self.span_text(self.shared.arena.span(id)))
             }
             // Top-level shapes encountered in expression position shouldn't
-            // happen but fall back to source.
+            // happen but fall back to source. Use `raw` (not `text`) because
+            // the source span may legitimately contain newlines.
             Node::Grammar
             | Node::Rule { .. }
             | Node::Let { .. }
             | Node::Macro(_)
             | Node::External { .. }
-            | Node::Cfg { .. } => self.arena.text(self.span_text(self.shared.arena.span(id))),
+            | Node::Cfg { .. } => self.arena.raw(self.span_text(self.shared.arena.span(id))),
             Node::Unreachable => self.arena.text(""),
         }
     }
@@ -652,7 +655,9 @@ impl<'a> Printer<'a> {
 
     fn for_doc(&mut self, for_id: tree_sitter_generate::nativedsl::ast::ForId, body: NodeId) -> DocId {
         let cfg = self.shared.pools.get_for(for_id);
-        let head = self.arena.text("for ");
+        // `for (b1, b2, ...) in iterable { body }`. Parens around the
+        // bindings are required by the parser (even for a single binding).
+        let head = self.arena.text("for (");
         let mut binding_parts = Vec::new();
         for (i, b) in cfg.bindings.iter().enumerate() {
             if i > 0 {
@@ -665,7 +670,7 @@ impl<'a> Printer<'a> {
             binding_parts.push(self.arena.concat(&[name, colon, ty]));
         }
         let bindings = self.arena.concat(&binding_parts);
-        let kw_in = self.arena.text(" in ");
+        let kw_in = self.arena.text(") in ");
         let iterable = self.expr(cfg.iterable);
         let space_brace = self.arena.text(" { ");
         let body_doc = self.expr(body);
