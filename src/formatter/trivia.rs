@@ -125,23 +125,17 @@ impl TriviaMap {
                         }
                         (None, None) => 0,
                     };
-                    if nls_before >= 2 && prev_non_comment_end.is_some() {
-                        // Blank line gap before this token. Prepend a marker
-                        // to the leading list (still respecting any pending
-                        // comments collected so far - they go *after* the
-                        // blank-line if the blank is between prev token and
-                        // first comment; *before* this token if blank is
-                        // between last pending item and this token).
-                        if pending.is_empty() {
-                            pending.push(TriviaItem::BlankLine);
-                        } else {
-                            // Blank line between last pending item and the
-                            // token itself - already represented implicitly
-                            // by the leading list ending and the token
-                            // starting on a new line. We push a marker so
-                            // the printer can preserve it explicitly.
-                            pending.push(TriviaItem::BlankLine);
-                        }
+                    if nls_before >= 2
+                        && (prev_non_comment_end.is_some() || !pending.is_empty())
+                    {
+                        // Blank-line gap before this token. The marker lets
+                        // the printer preserve paragraph breaks (between a
+                        // leading comment block and the token, or between
+                        // the previous token and a comment block above this
+                        // one). Skipped at true file start (no prior tokens
+                        // and no pending comments) so leading blanks at the
+                        // top of the file don't end up emitted.
+                        pending.push(TriviaItem::BlankLine);
                     }
                     if !pending.is_empty() {
                         map.leading

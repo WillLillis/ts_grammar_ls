@@ -523,6 +523,24 @@ impl<'a> Printer<'a> {
         if args.is_empty() {
             return self.arena.nil();
         }
+        // Single-arg "hug": let the inner expression wrap inside our parens
+        // without adding our own indent layer. Turns
+        //     token(
+        //         prec(10, seq(a, b)),
+        //     )
+        // into
+        //     token(prec(10, seq(a, b)))
+        // (and lets the inner call's own wrap, if it has one, bracket the
+        // outer close). Skipped when the arg has its own leading or trailing
+        // trivia, which the normal layout handles.
+        if args.len() == 1 {
+            let span = self.shared.arena.span(args[0]);
+            let no_leading = self.trivia.leading(span.start).is_empty();
+            let no_trailing = self.trivia.trailing_in(span.end, parent_end).is_none();
+            if no_leading && no_trailing {
+                return self.expr(args[0]);
+            }
+        }
         let sb_open = self.arena.softbreak();
         let mut item_parts: Vec<DocId> = Vec::new();
         for (i, a) in args.iter().enumerate() {
