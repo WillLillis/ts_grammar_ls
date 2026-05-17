@@ -569,6 +569,10 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// `[a, b, c]` / `(a, b, c)` - pack multiple per line when broken
+    /// (Fill mode). Flat keeps the literal compact: `[a, b, c]` with no
+    /// inner padding, matching common DSL style for `extras`, `inline`,
+    /// `externals`, etc.
     fn delimited_list(
         &mut self,
         open: &str,
@@ -576,10 +580,57 @@ impl<'a> Printer<'a> {
         items: &[NodeId],
         parent_end: u32,
     ) -> DocId {
-        let o = self.arena.text(open.to_string());
-        let c = self.arena.text(close.to_string());
-        let body = self.args_inner(items, parent_end);
-        let doc = self.arena.concat(&[o, body, c]);
+        if items.is_empty() {
+            return self.arena.text(format!("{open}{close}"));
+        }
+        // Entries: e1 "," softline e2 "," softline ... e_n if_broken(",", nil).
+        // Softline separators let Fill (in the broken branch) pack multiple
+        // entries per line; in the flat branch they render as plain spaces.
+        let mut entry_parts: Vec<DocId> = Vec::new();
+        for (i, &item) in items.iter().enumerate() {
+            let span = self.shared.arena.span(item);
+            if i > 0 {
+                entry_parts.push(self.arena.text(","));
+                let prev_end = self.shared.arena.span(items[i - 1]).end;
+                if let Some(c) = self.trivia.trailing_in(prev_end, span.start) {
+                    let s = c.to_owned();
+                    entry_parts.push(self.arena.text(format!(" {s}")));
+                    entry_parts.push(self.arena.line());
+                } else {
+                    entry_parts.push(self.arena.softline());
+                }
+            }
+            let leading = self.emit_leading(span.start);
+            entry_parts.push(leading);
+            entry_parts.push(self.expr(item));
+        }
+        let nil = self.arena.nil();
+        let tc_text = self.arena.text(",");
+        let trailing_comma = self.arena.if_broken(tc_text, nil);
+        entry_parts.push(trailing_comma);
+        let entries = self.arena.concat(&entry_parts);
+
+        let last_end = self.shared.arena.span(*items.last().unwrap()).end;
+        let last_trail = self.trivia.trailing_in(last_end, parent_end).map(str::to_owned);
+
+        let flat_body = entries;
+        let broken_body = {
+            let line_in = self.arena.line();
+            let fill = self.arena.fill(entries);
+            let inner = self.arena.concat(&[line_in, fill]);
+            let indented = self.arena.indent(inner);
+            let line_out = self.arena.line();
+            if let Some(c) = last_trail {
+                let trail_cmt = self.arena.text(format!(" {c}"));
+                self.arena.concat(&[indented, trail_cmt, line_out])
+            } else {
+                self.arena.concat(&[indented, line_out])
+            }
+        };
+        let body = self.arena.if_broken(broken_body, flat_body);
+        let open_d = self.arena.text(open.to_string());
+        let close_d = self.arena.text(close.to_string());
+        let doc = self.arena.concat(&[open_d, body, close_d]);
         self.arena.group(doc)
     }
 

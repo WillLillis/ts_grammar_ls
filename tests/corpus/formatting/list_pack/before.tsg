@@ -1,0 +1,16 @@
+grammar{
+  language:"test",
+  inline:[_alpha,_beta,_gamma,_delta,_epsilon,_zeta,_eta,_theta,_iota,_kappa,_lambda,_mu],
+}
+rule _alpha{"a"}
+rule _beta{"b"}
+rule _gamma{"c"}
+rule _delta{"d"}
+rule _epsilon{"e"}
+rule _zeta{"f"}
+rule _eta{"g"}
+rule _theta{"h"}
+rule _iota{"i"}
+rule _kappa{"j"}
+rule _lambda{"k"}
+rule _mu{"m"}
