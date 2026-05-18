@@ -1,0 +1,29 @@
+grammar {
+    language: "test",
+}
+
+macro big(item: rule_t) rule_t {
+    seq(choice(item, _a, _b, _c, _d, _e, _f, _g, _h, _i, _j), repeat(item))
+}
+
+rule program { "x" }
+
+rule _a { "a" }
+
+rule _b { "b" }
+
+rule _c { "c" }
+
+rule _d { "d" }
+
+rule _e { "e" }
+
+rule _f { "f" }
+
+rule _g { "g" }
+
+rule _h { "h" }
+
+rule _i { "i" }
+
+rule _j { "j" }

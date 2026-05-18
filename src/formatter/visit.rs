@@ -203,43 +203,60 @@ impl<'a> Printer<'a> {
 
     fn macro_doc(&mut self, macro_id: tree_sitter_generate::nativedsl::ast::MacroId) -> DocId {
         // `macro NAME(p1: T1, p2: T2) RETURN_TY { BODY }`
+        //
+        // Params wrap independently of the body: a long body shouldn't force
+        // a short param list to break onto multiple lines. Body wrap follows
+        // the same shape as `rule NAME { BODY }`: a softline around the body
+        // inside the braces, decided by the macro's outer group.
         let config = self.shared.pools.get_macro(macro_id);
-        let mut parts = Vec::new();
-        parts.push(self.arena.text("macro "));
-        parts.push(self.arena.text(self.span_text(config.name)));
-        parts.push(self.arena.text("("));
-        // Params: try flat, fall back to per-line.
-        let mut param_parts = Vec::new();
-        for (i, param) in config.params.iter().enumerate() {
-            if i > 0 {
-                let comma = self.arena.text(",");
-                let sl = self.arena.softline();
-                param_parts.push(comma);
-                param_parts.push(sl);
+
+        let params_doc = if config.params.is_empty() {
+            self.arena.text("()")
+        } else {
+            let mut param_parts = Vec::new();
+            for (i, param) in config.params.iter().enumerate() {
+                if i > 0 {
+                    let comma = self.arena.text(",");
+                    let sl = self.arena.softline();
+                    param_parts.push(comma);
+                    param_parts.push(sl);
+                }
+                let pname = self.arena.text(self.span_text(param.name));
+                let colon = self.arena.text(": ");
+                let pty = self.arena.text(param.ty.to_string());
+                param_parts.push(self.arena.concat(&[pname, colon, pty]));
             }
-            let pname = self.arena.text(self.span_text(param.name));
-            let colon = self.arena.text(": ");
-            let pty = self.arena.text(param.ty.to_string());
-            param_parts.push(self.arena.concat(&[pname, colon, pty]));
-        }
-        if !config.params.is_empty() {
             let sb_open = self.arena.softbreak();
             let params = self.arena.concat(&param_parts);
             let nil = self.arena.nil();
             let trailing = self.arena.text(",");
             let tc = self.arena.if_broken(trailing, nil);
             let inner = self.arena.concat(&[sb_open, params, tc]);
-            parts.push(self.arena.indent(inner));
+            let indented = self.arena.indent(inner);
             let sb_close = self.arena.softbreak();
-            parts.push(sb_close);
-        }
-        parts.push(self.arena.text(") "));
-        parts.push(self.arena.text(config.return_ty.to_string()));
-        parts.push(self.arena.text(" { "));
-        parts.push(self.expr(config.body));
-        parts.push(self.arena.text(" }"));
-        let doc = self.arena.concat(&parts);
-        self.arena.group(doc)
+            let open = self.arena.text("(");
+            let close = self.arena.text(")");
+            let doc = self.arena.concat(&[open, indented, sb_close, close]);
+            self.arena.group(doc)
+        };
+
+        let head = {
+            let kw = self.arena.text("macro ");
+            let name = self.arena.text(self.span_text(config.name));
+            let ret = self.arena.text(format!(" {} {{", config.return_ty));
+            self.arena.concat(&[kw, name, params_doc, ret])
+        };
+
+        let sl_open = self.arena.softline();
+        let body_doc = self.expr(config.body);
+        let indented = self.arena.concat(&[sl_open, body_doc]);
+        let indented = self.arena.indent(indented);
+
+        let sl_close = self.arena.softline();
+        let close = self.arena.text("}");
+
+        let full = self.arena.concat(&[head, indented, sl_close, close]);
+        self.arena.group(full)
     }
 
     fn cfg_doc(&mut self, name: Span, child: NodeId) -> DocId {
