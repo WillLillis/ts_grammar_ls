@@ -136,6 +136,7 @@ impl RenderState<'_> {
         let mut probe = FitsProbe {
             arena: self.arena,
             remaining: budget,
+            broken: false,
         };
         probe.walk(id)
     }
@@ -165,6 +166,10 @@ impl RenderState<'_> {
                 let mut probe = FitsProbe {
                     arena: self.arena,
                     remaining: budget,
+                    // Emission inside the packed Fill runs with `broken=true`;
+                    // probe with the same so IfBroken contributes its broken
+                    // width (e.g. the trailing comma) to the fit decision.
+                    broken: true,
                 };
                 let segment_fits = children[i + 1..j].iter().all(|&c| probe.walk(c));
                 if segment_fits {
@@ -188,10 +193,16 @@ impl RenderState<'_> {
 struct FitsProbe<'a> {
     arena: &'a DocArena,
     remaining: usize,
+    /// Treat `IfBroken` as if the enclosing group is broken. Used when
+    /// probing Fill segments: emission inside a packed Fill passes
+    /// `broken=true`, so the probe must account for the broken-side width
+    /// (e.g. the trailing comma) when deciding whether the next segment
+    /// fits the current line.
+    broken: bool,
 }
 
 impl FitsProbe<'_> {
-    /// Returns `true` iff the doc fits flat into `remaining`.
+    /// Returns `true` iff the doc fits in `remaining` columns.
     fn walk(&mut self, id: DocId) -> bool {
         match self.arena.get(id) {
             DocNode::Text(s) => self.consume(s.chars().count()),
@@ -219,8 +230,10 @@ impl FitsProbe<'_> {
                 }
                 true
             }
-            // While probing flat, IfBroken takes the flat side.
-            DocNode::IfBroken { flat, .. } => self.walk(*flat),
+            DocNode::IfBroken { broken, flat } => {
+                let pick = if self.broken { *broken } else { *flat };
+                self.walk(pick)
+            }
             // For a flat probe, a Fill's contents must fit flat too.
             DocNode::Fill(child) => self.walk(*child),
         }
