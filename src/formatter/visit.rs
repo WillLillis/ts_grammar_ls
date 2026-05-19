@@ -541,21 +541,47 @@ impl<'a> Printer<'a> {
             return self.arena.nil();
         }
         // Single-arg "hug": let the inner expression wrap inside our parens
-        // without adding our own indent layer. Turns
+        // without adding our own indent layer:
+        //     token(prec(10, seq(a, b)))
+        // instead of
         //     token(
         //         prec(10, seq(a, b)),
         //     )
-        // into
-        //     token(prec(10, seq(a, b)))
-        // (and lets the inner call's own wrap, if it has one, bracket the
-        // outer close). Skipped when the arg has its own leading or trailing
-        // trivia, which the normal layout handles.
+        // Non-leaf args (Call / Seq / etc) have their own group that breaks
+        // internally; for those, plain hug is enough.
+        //
+        // For leaf args that may exceed the line on their own
+        // (StringLit / RawStringLit), wrap as `if_broken(wrap_body, hug_body)`
+        // so the outer group's broken state shifts the leaf onto its own
+        // indented line. That avoids tacking a long literal onto the outer
+        // prefix (e.g. `let X = regexp(r"<143-char>")`).
+        //
+        // Skipped when the arg has its own leading or trailing trivia, which
+        // the normal layout handles.
         if args.len() == 1 {
             let span = self.shared.arena.span(args[0]);
             let no_leading = self.trivia.leading(span.start).is_empty();
             let no_trailing = self.trivia.trailing_in(span.end, parent_end).is_none();
             if no_leading && no_trailing {
-                return self.expr(args[0]);
+                let arg = self.expr(args[0]);
+                let is_long_leaf = matches!(
+                    *self.shared.arena.get(args[0]),
+                    Node::StringLit | Node::RawStringLit { .. }
+                );
+                if !is_long_leaf {
+                    return arg;
+                }
+                let sb_open = self.arena.softbreak();
+                let trailing_comma = {
+                    let comma = self.arena.text(",");
+                    let nil = self.arena.nil();
+                    self.arena.if_broken(comma, nil)
+                };
+                let wrap_inner = self.arena.concat(&[sb_open, arg, trailing_comma]);
+                let indented = self.arena.indent(wrap_inner);
+                let sb_close = self.arena.softbreak();
+                let wrap_body = self.arena.concat(&[indented, sb_close]);
+                return self.arena.if_broken(wrap_body, arg);
             }
         }
         let sb_open = self.arena.softbreak();
