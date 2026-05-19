@@ -478,6 +478,17 @@ impl<'a> Printer<'a> {
                 let parent_end = self.shared.arena.span(id).end;
                 self.named_args_doc("append", &[left, right], parent_end)
             }
+            Node::BinOp { op, lhs, rhs } => {
+                use tree_sitter_generate::nativedsl::ast::BinOp;
+                let l = self.expr(lhs);
+                let symbol = match op {
+                    BinOp::Add => " + ",
+                    BinOp::Sub => " - ",
+                };
+                let s = self.arena.text(symbol);
+                let r = self.expr(rhs);
+                self.arena.concat(&[l, s, r])
+            }
             Node::For { for_id, body } => self.for_doc(for_id, body),
             Node::List(range) => {
                 let kids: Vec<NodeId> = self.shared.pools.child_slice(range).to_vec();

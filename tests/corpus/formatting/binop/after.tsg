@@ -1,0 +1,11 @@
+grammar {
+    language: "test",
+}
+
+let BASE: int_t = 5
+
+let HIGH: int_t = BASE + 2
+
+let LOW: int_t = BASE - 1
+
+rule program { prec(BASE + 1, "x") }
