@@ -4,15 +4,8 @@ grammar {
 
 rule _statement {
     choice(
-        function_definition,
-        let_statement,
-        return_statement,
-        if_statement,
-        for_loop,
-        while_loop,
-        expression_statement,
-        break_statement,
-        continue_statement,
+        function_definition, let_statement, return_statement, if_statement, for_loop, while_loop,
+        expression_statement, break_statement, continue_statement,
     )
 }
 

@@ -527,11 +527,38 @@ impl<'a> Printer<'a> {
     /// lookups inside the arg list - excludes the trailing on the close
     /// paren itself).
     fn named_args_doc(&mut self, name: &str, args: &[NodeId], parent_end: u32) -> DocId {
+        // When every arg is a leaf atom (`choice("u8", "i8", ...)`,
+        // `seq(_a, _b, _c, ...)`) route through `delimited_list` so the
+        // Fill-mode broken layout packs several args per line. Keeps the
+        // status-quo per-line shape when any arg has internal structure
+        // (combinator calls, fields, etc.), where one-per-line reads better.
+        if args.len() >= 2 && args.iter().all(|&a| self.is_atom(a)) {
+            let open = format!("{name}(");
+            return self.delimited_list(&open, ")", args, parent_end);
+        }
         let head = self.arena.text(format!("{name}("));
         let body = self.args_inner(args, parent_end);
         let close = self.arena.text(")");
         let doc = self.arena.concat(&[head, body, close]);
         self.arena.group(doc)
+    }
+
+    /// A "leaf atom" - an expression with no internal group that could
+    /// independently wrap. Used to decide when packing multiple args per
+    /// line (Fill mode) is appropriate instead of per-line wrap. A nested
+    /// `Neg(atom)` (e.g. `-1`) counts since it has no breakable interior.
+    fn is_atom(&self, id: NodeId) -> bool {
+        match *self.shared.arena.get(id) {
+            Node::Ident(_)
+            | Node::IntLit(_)
+            | Node::StringLit
+            | Node::RawStringLit { .. }
+            | Node::Blank
+            | Node::MacroParam { .. }
+            | Node::ForBinding { .. } => true,
+            Node::Neg(inner) => self.is_atom(inner),
+            _ => false,
+        }
     }
 
     /// Just the args portion of a call - `( ... )`.
