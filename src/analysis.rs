@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ropey::Rope;
 use tower_lsp::lsp_types::Url;
@@ -394,7 +395,7 @@ enum ExtractKind<'a> {
 /// cross-module info (`base_module`, `import_modules`) is extracted from
 /// `modules` rather than re-parsing external files.
 fn extract_module(
-    shared: &ast::SharedAst,
+    shared: &Arc<ast::SharedAst>,
     modules: &[nativedsl::Module],
     ctx: &ast::ModuleContext,
     kind: ExtractKind<'_>,
@@ -409,16 +410,17 @@ fn extract_module(
         ExtractKind::Root { env, .. } => env,
         ExtractKind::External { env } => env,
     };
-    let scopes = ScopeIndex::build(shared, ctx);
-    let definitions = extract_definitions(shared, ctx, &scopes, env);
-    let import_names = collect_import_names(shared, ctx);
-    let mut references = extract_references(shared, ctx, &import_names, &scopes);
+    let shared_ref: &ast::SharedAst = shared;
+    let scopes = ScopeIndex::build(shared_ref, ctx);
+    let definitions = extract_definitions(shared_ref, ctx, &scopes, env);
+    let import_names = collect_import_names(shared_ref, ctx);
+    let mut references = extract_references(shared_ref, ctx, &import_names, &scopes);
 
     // Find the inherited grammar module (if any) and extract its info.
     let base_module = ctx.inherit_ref.and_then(|inherit_id| {
         let ast::Node::ModuleRef {
             module: Some(idx), ..
-        } = shared.arena.get(inherit_id)
+        } = shared_ref.arena.get(inherit_id)
         else {
             return None;
         };
@@ -440,7 +442,7 @@ fn extract_module(
             // even when `cfg` itself isn't available, but we gate on it to
             // ensure we're only doing this when the loader actually ran.
             let regions = if cfg.is_some() {
-                scan_disabled_cfg_regions(shared, ctx)
+                scan_disabled_cfg_regions(shared_ref, ctx)
             } else {
                 Vec::new()
             };
@@ -462,12 +464,13 @@ fn extract_module(
         loader_succeeded,
         disabled_regions,
         declared_cfg_flags,
+        shared: Arc::clone(shared),
     }
 }
 
 /// Extract an external (inherit/import) `Module` at index `idx` in `modules`.
 fn extract_external_at(
-    shared: &ast::SharedAst,
+    shared: &Arc<ast::SharedAst>,
     modules: &[nativedsl::Module],
     idx: u8,
     env: Option<&nativedsl::typecheck::TypeEnv>,
@@ -485,7 +488,7 @@ fn extract_external_at(
 /// level of `ctx`. Cycles are impossible here because the core `Loader`
 /// rejects them before we get a successful module list.
 fn collect_import_modules(
-    shared: &ast::SharedAst,
+    shared: &Arc<ast::SharedAst>,
     modules: &[nativedsl::Module],
     ctx: &ast::ModuleContext,
     env: Option<&nativedsl::typecheck::TypeEnv>,
@@ -747,6 +750,9 @@ fn run_loader_pipeline(
                 unreachable!("root module must be Grammar")
             }
         };
+        // Lift the AST arena into an `Arc` now that the loader has stopped
+        // mutating it; every extracted Module shares the same handle.
+        let shared = Arc::new(shared);
         let module = extract_module(
             &shared,
             &modules,
@@ -815,6 +821,7 @@ fn manual_parse_fallback(
     let _ = nativedsl::resolve::resolve(&mut shared, &module_ctx, &[], None);
 
     let modules: Vec<nativedsl::Module> = Vec::new();
+    let shared = Arc::new(shared);
     let module = extract_module(
         &shared,
         &modules,

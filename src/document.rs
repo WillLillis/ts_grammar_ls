@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use ropey::Rope;
 use tower_lsp::lsp_types::Diagnostic;
 
-use tree_sitter_generate::nativedsl::ast::Span;
+use std::sync::Arc;
+
+use tree_sitter_generate::nativedsl::ast::{SharedAst, Span};
 use tree_sitter_generate::nativedsl::lexer::Token;
 use tree_sitter_generate::nativedsl::typecheck::Ty;
 
@@ -260,6 +262,13 @@ pub struct Module {
     /// resolved enabled/disabled state. Used for hover and completion inside
     /// `#[cfg(...)]` attributes.
     pub declared_cfg_flags: Vec<CfgFlag>,
+    /// AST arena + pools shared across this module and any externals it
+    /// references. Retained on the analysis so showcase features
+    /// (macro expansion preview, lowered grammar dump, ...) can re-walk
+    /// the AST without re-running the lex/parse pipeline. `Arc`-shared so
+    /// nested `base_module` / `import_modules` cheaply point at the same
+    /// arena they were built from.
+    pub shared: Arc<SharedAst>,
 }
 
 /// A top-level declaration disabled by `#[cfg(NAME)]`. `full_span` covers the
@@ -282,9 +291,10 @@ pub struct CfgFlag {
 
 impl Module {
     /// Construct a shell `Module` with only the source/rope populated. Used
-    /// when lex or parse fails before we can produce any analysis data.
+    /// when lex or parse fails before we can produce any analysis data. The
+    /// `shared` arena is empty - no AST nodes were produced.
     #[must_use]
-    pub const fn empty(path: PathBuf, source: String, rope: Rope) -> Self {
+    pub fn empty(path: PathBuf, source: String, rope: Rope) -> Self {
         Self {
             path,
             source,
@@ -298,6 +308,7 @@ impl Module {
             loader_succeeded: false,
             disabled_regions: Vec::new(),
             declared_cfg_flags: Vec::new(),
+            shared: Arc::new(SharedAst::new(0)),
         }
     }
 
