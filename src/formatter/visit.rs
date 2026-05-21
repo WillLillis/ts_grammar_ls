@@ -17,16 +17,56 @@ use tree_sitter_generate::nativedsl::Ty;
 
 use super::doc::{DocArena, DocId};
 use super::trivia::{TriviaItem, TriviaMap};
+use crate::document::Module;
+
+/// One active macro-expansion frame. Holds the caller's args, the source
+/// their spans live in, and the module they were captured in. All three
+/// follow the frame: when `MacroParam` substitutes and recurses into an
+/// arg, the printer swaps to the frame's `source` / `module` so
+/// `span_text()` and import lookups resolve against the caller's buffer
+/// (across module boundaries for cross-file macro calls). Frames only
+/// exist while a `Printer::Mode::Expansion` is active, so all fields are
+/// always set.
+pub struct Frame<'a> {
+    pub args: &'a [NodeId],
+    pub source: &'a str,
+    pub module: &'a Module,
+}
+
+/// Why the printer was constructed and what it has access to. These are
+/// two genuinely different modes:
+///   - `File`: format an entire `.tsg` file. Has the module-level context
+///     (`ctx.root_items`, `ctx.grammar_config`) needed for `module()` and
+///     `grammar_block()`. Macro calls render verbatim.
+///   - `Expansion`: inline a macro call. Walks expressions only - never
+///     enters `module()` / `grammar_block()` - and tracks the current
+///     module so cross-file `QualifiedCall`s can resolve their import
+///     binding and swap source for the body traversal.
+pub enum Mode<'a> {
+    File(&'a ModuleContext),
+    Expansion { current_module: &'a Module },
+}
 
 /// Visitor state. One `Printer` is built per `format()` call.
 pub struct Printer<'a> {
     pub arena: &'a mut DocArena,
     pub shared: &'a SharedAst,
-    pub ctx: &'a ModuleContext,
     pub trivia: &'a TriviaMap,
+    /// Source for the AST node currently being rendered. Mirrors the
+    /// current frame / module: swaps as we enter macro bodies in
+    /// different defining modules and back on pop. Set up by the
+    /// constructor from whichever `Mode` we're in.
+    pub source: &'a str,
+    pub mode: Mode<'a>,
+    /// Stack of currently-active expansion frames. Always empty outside
+    /// `Mode::Expansion`. Top is innermost.
+    pub frame_stack: Vec<Frame<'a>>,
 }
 
 impl<'a> Printer<'a> {
+    /// File-formatting Printer: walks the module envelope, emits macro
+    /// calls verbatim. Needs full `ModuleContext` for `root_items` and
+    /// `grammar_config`.
     pub fn new(
         arena: &'a mut DocArena,
         shared: &'a SharedAst,
@@ -36,14 +76,59 @@ impl<'a> Printer<'a> {
         Self {
             arena,
             shared,
-            ctx,
             trivia,
+            source: ctx.source.as_str(),
+            mode: Mode::File(ctx),
+            frame_stack: Vec::new(),
         }
     }
 
-    /// Format the entire module. Returns the root Doc.
+    /// Macro-expansion Printer: walks a single expression (the macro body)
+    /// with caller args substituted, inlining nested macro calls along the
+    /// way (including cross-module via `current_module.import_modules`).
+    pub fn with_expansion(
+        arena: &'a mut DocArena,
+        shared: &'a SharedAst,
+        trivia: &'a TriviaMap,
+        current_module: &'a Module,
+    ) -> Self {
+        Self {
+            arena,
+            shared,
+            trivia,
+            source: current_module.source.as_str(),
+            mode: Mode::Expansion { current_module },
+            frame_stack: Vec::new(),
+        }
+    }
+
+    /// Render `body` with `args` substituted for the body's `MacroParam`
+    /// references. `caller_module` is the module the args were captured
+    /// in; for a `Node::Call` it equals the body's module (a local
+    /// expansion), for a `Node::QualifiedCall` it's the importer.
+    pub fn expand(
+        &mut self,
+        body: NodeId,
+        args: &'a [NodeId],
+        caller_module: &'a Module,
+    ) -> DocId {
+        self.frame_stack.push(Frame {
+            args,
+            source: caller_module.source.as_str(),
+            module: caller_module,
+        });
+        let doc = self.expr(body);
+        self.frame_stack.pop();
+        doc
+    }
+
+    /// Format the entire module. Returns the root Doc. Requires the printer
+    /// to have been built with `Printer::new` (a full module context).
     pub fn module(&mut self) -> DocId {
-        let items: Vec<NodeId> = self.ctx.root_items.iter().copied().collect();
+        let Mode::File(ctx) = self.mode else {
+            panic!("Printer::module requires Mode::File (use Printer::new)")
+        };
+        let items: Vec<NodeId> = ctx.root_items.iter().copied().collect();
         let mut parts: Vec<DocId> = Vec::new();
         let mut first_unit = true;
         let mut prev_was_off = false;
@@ -62,7 +147,7 @@ impl<'a> Printer<'a> {
                 // Preserve the raw source verbatim, including its trailing
                 // newline; that newline is what separates the off block from
                 // the `// tsg-format: on` pragma in the next item's leading.
-                let raw = &self.ctx.source[range.start as usize..range.end as usize];
+                let raw = &self.source[range.start as usize..range.end as usize];
                 parts.push(self.arena.raw(raw));
                 emitted_off_starts.push(range.start);
                 first_unit = false;
@@ -269,8 +354,10 @@ impl<'a> Printer<'a> {
     // -- Grammar config block --------------------------------------------
 
     fn grammar_block(&mut self) -> DocId {
-        let cfg = self
-            .ctx
+        let Mode::File(ctx) = self.mode else {
+            panic!("grammar_block requires Mode::File")
+        };
+        let cfg = ctx
             .grammar_config
             .as_ref()
             .expect("grammar_block called without grammar_config");
@@ -319,7 +406,7 @@ impl<'a> Printer<'a> {
     /// of the key token's start. Used to look up leading trivia on grammar
     /// block field keys, which aren't tracked as AST nodes.
     fn find_key_start(&self, value_start: u32) -> u32 {
-        let bytes = self.ctx.source.as_bytes();
+        let bytes = self.source.as_bytes();
         let mut i = value_start as usize;
         while i > 0 && bytes[i - 1].is_ascii_whitespace() {
             i -= 1;
@@ -359,17 +446,19 @@ impl<'a> Printer<'a> {
             }
             Node::Call { name, args } => {
                 let parent_end = self.shared.arena.span(id).end;
+                if let Some(doc) = self.try_inline_macro_call(name, args) {
+                    return doc;
+                }
                 self.call_doc(name, args, parent_end)
             }
             Node::QualifiedCall(range) => {
-                let (obj, name, _) = self.shared.pools.get_qualified_call(range);
+                let (obj, name, args) = self.shared.pools.get_qualified_call(range);
+                if let Some(doc) = self.try_inline_qualified_macro_call(obj, name, args) {
+                    return doc;
+                }
                 let obj_doc = self.expr(obj);
                 let cc = self.arena.text("::");
                 let name_doc = self.expr(name);
-                let args_start = range; // qualified call's args follow obj+name
-                // get_qualified_call returns the args slice; build a call-like
-                // wrapper around them.
-                let (_, _, args) = self.shared.pools.get_qualified_call(args_start);
                 let args_ids: Vec<NodeId> = args.to_vec();
                 let parent_end = self.shared.arena.span(id).end;
                 let args_doc = self.args_doc(&args_ids, parent_end);
@@ -504,7 +593,30 @@ impl<'a> Printer<'a> {
                 let parent_end = self.shared.arena.span(id).end;
                 self.object_doc(range, parent_end)
             }
-            Node::MacroParam { .. } | Node::ForBinding { .. } => {
+            Node::MacroParam { index, .. } => {
+                // In an active expansion frame, substitute the caller's arg
+                // for this parameter. The substituted arg was captured in
+                // the caller's frame - pop the top frame and swap to its
+                // source + module while traversing the arg, so `span_text`
+                // and import lookups resolve in the caller's context, not
+                // the current frame's. Restore the frame on return.
+                if let Some(top) = self.frame_stack.pop() {
+                    let target = top.args[index as usize];
+                    let saved_source = self.source;
+                    let saved_mode = std::mem::replace(
+                        &mut self.mode,
+                        Mode::Expansion { current_module: top.module },
+                    );
+                    self.source = top.source;
+                    let result = self.expr(target);
+                    self.source = saved_source;
+                    self.mode = saved_mode;
+                    self.frame_stack.push(top);
+                    return result;
+                }
+                self.arena.text(self.span_text(self.shared.arena.span(id)))
+            }
+            Node::ForBinding { .. } => {
                 // Resolved bindings keep the source span pointing at the
                 // identifier; emit it verbatim.
                 self.arena.text(self.span_text(self.shared.arena.span(id)))
@@ -547,6 +659,105 @@ impl<'a> Printer<'a> {
     /// independently wrap. Used to decide when packing multiple args per
     /// line (Fill mode) is appropriate instead of per-line wrap. A nested
     /// `Neg(atom)` (e.g. `-1`) counts since it has no breakable interior.
+    /// Local macro call (`Node::Call`). The macro is defined in the
+    /// current module, so the body lives in `self.source` and the frame
+    /// stays in the same module.
+    ///
+    /// No depth guard: lower's `MAX_CALL_DEPTH = 128` already rejects
+    /// cyclic macro chains, so any call whose name has an
+    /// `IdentKind::Macro(_)` resolution is reachable from a successful
+    /// lower and therefore bounded.
+    fn try_inline_macro_call(
+        &mut self,
+        name: NodeId,
+        args: tree_sitter_generate::nativedsl::ast::ChildRange,
+    ) -> Option<DocId> {
+        let Mode::Expansion { current_module } = self.mode else {
+            return None;
+        };
+        let macro_id = match self.shared.arena.get(name) {
+            Node::Ident(IdentKind::Macro(m)) => *m,
+            _ => return None,
+        };
+        let body = self.shared.pools.get_macro(macro_id).body;
+        let arg_slice = self.shared.pools.child_slice(args);
+        // Same-module call: args' source and body's source are both
+        // self.source (== current_module.source).
+        self.frame_stack.push(Frame {
+            args: arg_slice,
+            source: self.source,
+            module: current_module,
+        });
+        let doc = self.expr(body);
+        self.frame_stack.pop();
+        Some(doc)
+    }
+
+    /// Cross-module macro call (`Node::QualifiedCall`). The `obj` resolves
+    /// to an `import(...)` binding in the current module; look up the
+    /// imported `Module` by binding name, swap `current_module`/`source`
+    /// to it, walk the body, then restore.
+    fn try_inline_qualified_macro_call(
+        &mut self,
+        obj: NodeId,
+        name: NodeId,
+        args: &'a [NodeId],
+    ) -> Option<DocId> {
+        let Mode::Expansion { current_module } = self.mode else {
+            return None;
+        };
+        let macro_id = match self.shared.arena.get(name) {
+            Node::Ident(IdentKind::Macro(m)) => *m,
+            _ => return None,
+        };
+        // Resolve obj -> let-binding -> binding name -> import_modules.
+        let target = self.resolve_qualified_target(obj, current_module)?;
+
+        let body = self.shared.pools.get_macro(macro_id).body;
+        let caller_source = self.source;
+        let caller_module = current_module;
+        // Push the caller's frame so MacroParam pop-restore can swap back.
+        self.frame_stack.push(Frame {
+            args,
+            source: caller_source,
+            module: caller_module,
+        });
+        // Swap to the imported module for the body traversal.
+        self.source = target.source.as_str();
+        self.mode = Mode::Expansion { current_module: target };
+        let doc = self.expr(body);
+        // Restore the caller's mode/source.
+        self.source = caller_source;
+        self.mode = Mode::Expansion { current_module: caller_module };
+        self.frame_stack.pop();
+        Some(doc)
+    }
+
+    /// Given the `obj` NodeId of a `QualifiedCall` (`helpers::macro_name`),
+    /// follow the resolved `IdentKind::Var(let_id)` to its `Node::Let`,
+    /// pull the binding name from the let's name span, and look that name
+    /// up in `current_module.import_modules`. Returns the imported Module.
+    fn resolve_qualified_target(
+        &self,
+        obj: NodeId,
+        current_module: &'a Module,
+    ) -> Option<&'a Module> {
+        let Node::Ident(IdentKind::Var(let_id)) = self.shared.arena.get(obj) else {
+            return None;
+        };
+        let Node::Let { name, .. } = self.shared.arena.get(*let_id) else {
+            return None;
+        };
+        // The let was declared in self.source (the current rendering
+        // context's source), so its name span indexes there.
+        let binding_name = &self.source[name.start as usize..name.end as usize];
+        current_module
+            .import_modules
+            .iter()
+            .find(|(n, _)| n == binding_name)
+            .map(|(_, m)| m)
+    }
+
     fn is_atom(&self, id: NodeId) -> bool {
         match *self.shared.arena.get(id) {
             Node::Ident(_)
@@ -894,8 +1105,7 @@ impl<'a> Printer<'a> {
     // -- Utility ---------------------------------------------------------
 
     fn span_text(&self, span: Span) -> &'a str {
-        let s = self.ctx.source.as_str();
-        &s[span.start as usize..span.end as usize]
+        &self.source[span.start as usize..span.end as usize]
     }
 }
 

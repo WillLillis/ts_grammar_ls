@@ -14,11 +14,12 @@
 
 use std::path::Path;
 
-use tree_sitter_generate::nativedsl::ast::SharedAst;
+use tree_sitter_generate::nativedsl::ast::{NodeId, SharedAst};
 use tree_sitter_generate::nativedsl::lexer::Lexer;
 use tree_sitter_generate::nativedsl::parser::Parser;
 
 use crate::config::FormattingConfig;
+use crate::document::Module;
 
 mod doc;
 mod print;
@@ -46,6 +47,48 @@ pub fn format(source: &str, path: &Path, config: &FormattingConfig) -> Option<St
         config.indent_width,
         config.max_line_width,
     ))
+}
+
+/// Render a macro body with caller-supplied args substituted for each
+/// `MacroParam`. Used by the "inline macro call" code action: the LSP
+/// resolves the call's macro to a body NodeId and passes the call's args
+/// + caller module; this returns the source text that should replace the
+/// call's span.
+///
+/// `body_module` is the module the macro is defined in (provides the
+/// source for body spans and the import lookup for any nested
+/// `QualifiedCall`s inside the body). `caller_module` is where the call
+/// expression itself lives (provides the source for the args' spans).
+/// For a local `Node::Call`, both are the same module; for a
+/// `Node::QualifiedCall`, `body_module` is the imported one.
+///
+/// Trivia is built from the caller module's source. Comments inside an
+/// imported macro's body have spans in `body_module.source` and won't be
+/// emitted - acceptable for V1; revisit by building per-module trivia
+/// if it becomes a real problem.
+#[must_use]
+pub fn format_macro_expansion(
+    body: NodeId,
+    args: &[NodeId],
+    body_module: &Module,
+    caller_module: &Module,
+    config: &FormattingConfig,
+) -> String {
+    let shared: &SharedAst = &body_module.shared;
+    let tokens: Vec<_> = Lexer::new(&caller_module.source).tokenize().unwrap_or_default();
+    let trivia = trivia::TriviaMap::build(&tokens, &caller_module.source);
+    let mut arena = doc::DocArena::new();
+    let root = visit::Printer::with_expansion(&mut arena, shared, &trivia, body_module)
+        .expand(body, args, caller_module);
+    let rendered = print::render_with_opts(
+        &arena,
+        root,
+        config.indent_width,
+        config.max_line_width,
+    );
+    // `render_with_opts` appends a trailing newline (whole-file shape);
+    // strip it for an inline replacement.
+    rendered.trim_end().to_owned()
 }
 
 #[cfg(test)]
