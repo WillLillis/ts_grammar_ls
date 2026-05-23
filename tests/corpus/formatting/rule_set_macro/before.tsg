@@ -1,0 +1,9 @@
+grammar{language:"test"}
+
+macro arith_rules(prec_name:str_t,op:str_t){
+  rule @prec_name { seq(@prec_name,op,@prec_name) }
+}
+
+arith_rules("add","+")
+
+rule program{"x"}

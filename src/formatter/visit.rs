@@ -11,7 +11,7 @@
 //! of each node's last token (trailing-on-same-line case).
 
 use tree_sitter_generate::nativedsl::ast::{
-    ConfigField, IdentKind, ModuleContext, Node, NodeId, RepeatKind, SharedAst, Span,
+    ConfigField, IdentKind, MacroKind, ModuleContext, Node, NodeId, RepeatKind, SharedAst, Span,
 };
 use tree_sitter_generate::nativedsl::Ty;
 
@@ -328,7 +328,14 @@ impl<'a> Printer<'a> {
         let head = {
             let kw = self.arena.text("macro ");
             let name = self.arena.text(self.span_text(config.name));
-            let ret = self.arena.text(format!(" {} {{", config.return_ty));
+            // Expression macro: `macro f(...) ret_t {`.
+            // Rule-set macro: `macro f(...) {` (no return type; body is a
+            //   sequence of rule decls).
+            let after_params = match config.kind {
+                MacroKind::Expression(ty) => format!(" {ty} {{"),
+                MacroKind::RuleSet => " {".to_string(),
+            };
+            let ret = self.arena.text(after_params);
             self.arena.concat(&[kw, name, params_doc, ret])
         };
 
@@ -621,6 +628,31 @@ impl<'a> Printer<'a> {
                 // identifier; emit it verbatim.
                 self.arena.text(self.span_text(self.shared.arena.span(id)))
             }
+            // `Node::RuleSet` is a parser-produced body for rule-set macros:
+            // a sequence of `Rule` / `ComputedRule` decls. We render it as
+            // the macro's body sees it - the macro's outer `{ }` are the
+            // wrapper, so each rule emits on its own line inside.
+            Node::RuleSet(range) => self.rule_set_doc(range),
+            // `rule @<name_expr> { body }` - computed-name rule inside a
+            // RuleSet body. Shape matches `Rule` with an `@`-prefixed
+            // expression in place of the bare identifier.
+            Node::ComputedRule { is_override, name_expr, body } => {
+                self.computed_rule_doc(is_override, name_expr, body)
+            }
+            // `@<expr>` - computed-name rule reference inside a rule body.
+            Node::SymRef { expr } => {
+                let at = self.arena.text("@");
+                let inner = self.expr(expr);
+                self.arena.concat(&[at, inner])
+            }
+            // Post-`expand_macro_calls` nodes. The formatter walks a freshly
+            // parsed AST that hasn't had expansion run, so these shouldn't
+            // appear in practice. If they do (e.g. someone hands the
+            // formatter a loader-derived AST), fall back to source so we
+            // don't drop content silently.
+            Node::ExpandedRule { .. } | Node::SynthRef { .. } => {
+                self.arena.raw(self.span_text(self.shared.arena.span(id)))
+            }
             // Top-level shapes encountered in expression position shouldn't
             // happen but fall back to source. Use `raw` (not `text`) because
             // the source span may legitimately contain newlines.
@@ -632,6 +664,48 @@ impl<'a> Printer<'a> {
             | Node::Cfg { .. } => self.arena.raw(self.span_text(self.shared.arena.span(id))),
             Node::Unreachable => self.arena.text(""),
         }
+    }
+
+    /// Emit the body of a rule-set macro - a sequence of rule decls. Each
+    /// rule on its own line, blank line between like top-level items.
+    fn rule_set_doc(&mut self, range: tree_sitter_generate::nativedsl::ast::ChildRange) -> DocId {
+        let kids: Vec<NodeId> = self.shared.pools.child_slice(range).to_vec();
+        if kids.is_empty() {
+            return self.arena.nil();
+        }
+        let mut parts: Vec<DocId> = Vec::new();
+        for (i, &rule_id) in kids.iter().enumerate() {
+            if i > 0 {
+                let l1 = self.arena.line();
+                let l2 = self.arena.line();
+                parts.push(self.arena.concat(&[l1, l2]));
+            }
+            // Rule / ComputedRule appear here. Dispatch through item_body
+            // since these are item-shaped (have their own block).
+            parts.push(self.item_body(rule_id));
+        }
+        self.arena.concat(&parts)
+    }
+
+    /// `rule @<name_expr> { body }`.
+    fn computed_rule_doc(&mut self, is_override: bool, name_expr: NodeId, body: NodeId) -> DocId {
+        let mut head: Vec<DocId> = Vec::new();
+        if is_override {
+            head.push(self.arena.text("override "));
+        }
+        head.push(self.arena.text("rule @"));
+        head.push(self.expr(name_expr));
+        head.push(self.arena.text(" {"));
+        let head_doc = self.arena.concat(&head);
+
+        let sl_open = self.arena.softline();
+        let body_doc = self.expr(body);
+        let inner = self.arena.concat(&[sl_open, body_doc]);
+        let indented = self.arena.indent(inner);
+        let sl_close = self.arena.softline();
+        let close = self.arena.text("}");
+        let full = self.arena.concat(&[head_doc, indented, sl_close, close]);
+        self.arena.group(full)
     }
 
     /// `name(arg, arg, ...)` with per-line wrap when broken. `parent_end`

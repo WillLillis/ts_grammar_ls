@@ -5,7 +5,7 @@ use std::sync::Arc;
 use ropey::Rope;
 use tower_lsp::lsp_types::Url;
 
-use tree_sitter_generate::nativedsl::{self, ast};
+use tree_sitter_generate::nativedsl::{self, ast, string_pool::StringPool};
 
 use crate::document::{CfgFlag, DefKind, Definition, DisabledRegion, Module, RefKind, Reference};
 
@@ -609,7 +609,16 @@ fn build_fn_signature(
         }
         let _ = write!(sig, "{}: {}", ctx.text(param.name), param.ty);
     }
-    let _ = write!(sig, ") {}", config.return_ty);
+    // `MacroKind::Expression(ty)` carries the return type; rule-set macros
+    // don't have one - they expand to top-level decls instead.
+    match config.kind {
+        ast::MacroKind::Expression(ty) => {
+            let _ = write!(sig, ") {ty}");
+        }
+        ast::MacroKind::RuleSet => {
+            sig.push_str(") rule set");
+        }
+    }
     sig
 }
 
@@ -726,12 +735,14 @@ fn run_loader_pipeline(
     let mut modules: Vec<nativedsl::Module> = Vec::new();
     let mut env = nativedsl::typecheck::TypeEnv::default();
     let mut state = nativedsl::LoweringState::default();
+    let mut strings = StringPool::default();
     let mut cfg = nativedsl::apply_cfg::CfgState::default();
     let mut loader = nativedsl::loader::Loader {
         shared: &mut shared,
         modules: &mut modules,
         env: &mut env,
         state: &mut state,
+        strings: &mut strings,
         cfg: &mut cfg,
         ancestor_paths: vec![canonical.clone()],
         loaded: Vec::new(),
@@ -818,7 +829,11 @@ fn manual_parse_fallback(
 
     // Resolve what we can without loaded children. Imports/inherits won't
     // resolve, but local Ident -> RuleRef/VarRef rewrites will happen.
-    let _ = nativedsl::resolve::resolve(&mut shared, &module_ctx, &[], None);
+    // `expand_macro_calls` doesn't run on this fallback path so no
+    // `SynthRef` / `ExpandedRule` nodes are produced - a default pool is
+    // enough to satisfy resolve's signature.
+    let strings = StringPool::default();
+    let _ = nativedsl::resolve::resolve(&mut shared, &module_ctx, &strings, &[], None);
 
     let modules: Vec<nativedsl::Module> = Vec::new();
     let shared = Arc::new(shared);
