@@ -13,6 +13,7 @@
 use tree_sitter_generate::nativedsl::ast::{
     ConfigField, IdentKind, MacroKind, ModuleContext, Node, NodeId, RepeatKind, SharedAst, Span,
 };
+use tree_sitter_generate::nativedsl::string_pool::Str;
 use tree_sitter_generate::nativedsl::Ty;
 
 use super::doc::{DocArena, DocId};
@@ -645,13 +646,21 @@ impl<'a> Printer<'a> {
                 let inner = self.expr(expr);
                 self.arena.concat(&[at, inner])
             }
-            // Post-`expand_macro_calls` nodes. The formatter walks a freshly
-            // parsed AST that hasn't had expansion run, so these shouldn't
-            // appear in practice. If they do (e.g. someone hands the
-            // formatter a loader-derived AST), fall back to source so we
-            // don't drop content silently.
-            Node::ExpandedRule { .. } | Node::SynthRef { .. } => {
-                self.arena.raw(self.span_text(self.shared.arena.span(id)))
+            // Post-`expand_macro_calls` rule decl. Same shape as `Node::Rule`
+            // but the name is interned: look it up in the module's
+            // `StringTable`. Reachable when the code action handler walks a
+            // loader-derived AST to render the expansion of a top-level
+            // rule-set macro call.
+            Node::ExpandedRule { is_override, name, body } => {
+                let name_text = self.lookup_str(name).unwrap_or("").to_owned();
+                self.expanded_rule_doc(is_override, name_text, body)
+            }
+            // Post-`expand_macro_calls` rule reference. Source-level form
+            // was `@<expr>`; the resolved name is now a concrete rule
+            // identifier, so render it bare.
+            Node::SynthRef { name } => {
+                let s = self.lookup_str(name).unwrap_or("").to_owned();
+                self.arena.text(s)
             }
             // Top-level shapes encountered in expression position shouldn't
             // happen but fall back to source. Use `raw` (not `text`) because
@@ -685,6 +694,40 @@ impl<'a> Printer<'a> {
             parts.push(self.item_body(rule_id));
         }
         self.arena.concat(&parts)
+    }
+
+    /// `[override ]rule <name> { body }` for a post-expand `ExpandedRule`.
+    /// The name comes from the active module's `StringTable` (resolved by
+    /// the caller); body wraps the same way as `Node::Rule`.
+    fn expanded_rule_doc(&mut self, is_override: bool, name: String, body: NodeId) -> DocId {
+        let mut head: Vec<DocId> = Vec::new();
+        if is_override {
+            head.push(self.arena.text("override "));
+        }
+        head.push(self.arena.text("rule "));
+        head.push(self.arena.text(name));
+        head.push(self.arena.text(" {"));
+        let head_doc = self.arena.concat(&head);
+
+        let sl_open = self.arena.softline();
+        let body_doc = self.expr(body);
+        let inner = self.arena.concat(&[sl_open, body_doc]);
+        let indented = self.arena.indent(inner);
+        let sl_close = self.arena.softline();
+        let close = self.arena.text("}");
+        let full = self.arena.concat(&[head_doc, indented, sl_close, close]);
+        self.arena.group(full)
+    }
+
+    /// Look up a `Str` interned by the loader. Only meaningful in
+    /// `Mode::Expansion` where we have a `&Module` to reach the
+    /// `StringTable` through. Returns `None` in `Mode::File` since the
+    /// freshly-parsed AST in file mode never contains post-expand `Str`s.
+    fn lookup_str(&self, s: Str) -> Option<&'a str> {
+        match self.mode {
+            Mode::Expansion { current_module } => current_module.strings.get(s),
+            Mode::File(_) => None,
+        }
     }
 
     /// `rule @<name_expr> { body }`.

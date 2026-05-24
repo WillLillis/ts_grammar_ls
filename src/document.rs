@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::Diagnostic;
 
 use std::sync::Arc;
 
-use tree_sitter_generate::nativedsl::ast::{SharedAst, Span};
+use tree_sitter_generate::nativedsl::ast::{NodeId, SharedAst, Span};
 use tree_sitter_generate::nativedsl::string_pool::Str;
 use tree_sitter_generate::nativedsl::lexer::Token;
 use tree_sitter_generate::nativedsl::typecheck::Ty;
@@ -277,6 +277,12 @@ pub struct Module {
     /// `StringPool` directly because the pool uses `Rc<str>` (`!Send`)
     /// and our Module crosses thread boundaries via the document map.
     pub strings: Arc<StringTable>,
+    /// Top-level items of this module, in source order. Snapshot of
+    /// `ModuleContext.root_items` after the loader's `expand_macro_calls`
+    /// ran, so rule-set macro calls appear as `Node::ExpandedRule`s rather
+    /// than as the original `Node::Call`. Used by the macro-expansion
+    /// code action to locate the synthesized rules covering a cursor.
+    pub root_items: Vec<NodeId>,
 }
 
 /// Owned, thread-safe resolution of the loader's `StringPool`. Indexed by
@@ -341,6 +347,7 @@ impl Module {
             declared_cfg_flags: Vec::new(),
             shared: Arc::new(SharedAst::new(0)),
             strings: Arc::new(StringTable::default()),
+            root_items: Vec::new(),
         }
     }
 

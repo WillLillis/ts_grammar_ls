@@ -2729,6 +2729,101 @@ async fn code_action_not_offered_on_identifier() {
     assert_eq!(result, None);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn code_action_inlines_rule_set_macro_call() {
+    // A top-level rule-set macro generates a rule from the caller's args.
+    // The code action expands the call into the resulting rule decl.
+    let grammar = "\
+grammar { language: \"test\" }
+
+macro arith(prec_name: str_t, op: str_t) {
+    rule @prec_name { seq(@prec_name, op, @prec_name) }
+}
+
+arith(\"add\", \"+\")
+
+rule program { \"x\" }
+";
+    let mut service = init(&[(test_uri(), grammar)]).await;
+
+    // Cursor on the `arith` identifier of the top-level call (line 6, col 0..5).
+    let range = Range::new(Position::new(6, 2), Position::new(6, 2));
+    let result = code_actions_at(&mut service, test_uri(), range).await;
+
+    let expected_edit_range = Range::new(Position::new(6, 0), Position::new(6, 17));
+    assert_eq!(
+        result,
+        Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Inline macro call".into(),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(WorkspaceEdit {
+                changes: Some(std::collections::HashMap::from([(
+                    test_uri(),
+                    vec![TextEdit {
+                        range: expected_edit_range,
+                        new_text: "rule add { seq(add, \"+\", add) }".into(),
+                    }],
+                )])),
+                document_changes: None,
+                change_annotations: None,
+            }),
+            diagnostics: None,
+            command: None,
+            is_preferred: None,
+            disabled: None,
+            data: None,
+        })])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn code_action_inlines_rule_set_macro_call_multi_rule() {
+    // A rule-set macro that generates two rules from one call; both should
+    // be emitted blank-line separated and replace the single call span.
+    let grammar = "\
+grammar { language: \"test\" }
+
+macro pair(a: str_t, b: str_t) {
+    rule @a { \"x\" }
+    rule @b { \"y\" }
+}
+
+pair(\"foo\", \"bar\")
+
+rule program { \"x\" }
+";
+    let mut service = init(&[(test_uri(), grammar)]).await;
+
+    // Cursor on the `pair` identifier of the top-level call (line 7).
+    let range = Range::new(Position::new(7, 1), Position::new(7, 1));
+    let result = code_actions_at(&mut service, test_uri(), range).await;
+
+    let expected_edit_range = Range::new(Position::new(7, 0), Position::new(7, 18));
+    assert_eq!(
+        result,
+        Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Inline macro call".into(),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(WorkspaceEdit {
+                changes: Some(std::collections::HashMap::from([(
+                    test_uri(),
+                    vec![TextEdit {
+                        range: expected_edit_range,
+                        new_text: "rule foo { \"x\" }\n\nrule bar { \"y\" }".into(),
+                    }],
+                )])),
+                document_changes: None,
+                change_annotations: None,
+            }),
+            diagnostics: None,
+            command: None,
+            is_preferred: None,
+            disabled: None,
+            data: None,
+        })])
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Import tests
 // ---------------------------------------------------------------------------

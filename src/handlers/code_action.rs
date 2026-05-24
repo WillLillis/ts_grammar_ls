@@ -1,15 +1,25 @@
 //! `textDocument/codeAction` handler.
 //!
-//! Currently provides a single refactoring: **convert a regular string literal
-//! `"..."` to a raw string literal `r#"..."#`** with the minimum number of
-//! `#` delimiters needed to disambiguate any embedded `"` sequences.
+//! Provides two refactorings:
+//!
+//! - **Convert string to raw string** (`"..."` to `r#"..."#`) with the minimum
+//!   number of `#` delimiters needed to disambiguate embedded `"` sequences.
+//! - **Inline rule-set macro call**: when the cursor is on a top-level
+//!   `Node::Call` to a rule-set macro (one that generates rule decls), expand
+//!   it in place to the rules it produces. The loader's `expand_macro_calls`
+//!   already replaced the call in `root_items` with `Node::ExpandedRule`s
+//!   carrying the original call's span; we find those and render them.
 
 use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
-    TextEdit, WorkspaceEdit,
+    TextEdit, WorkspaceEdit, Url,
 };
+use tree_sitter_generate::nativedsl::ast::{Node, Span};
 use tree_sitter_generate::nativedsl::lexer::TokenKind;
 
+use crate::config::FormattingConfig;
+use crate::document::Module;
+use crate::formatter;
 use crate::server::Backend;
 use crate::text;
 
@@ -26,6 +36,25 @@ pub fn code_action(backend: &Backend, params: &CodeActionParams) -> Option<CodeA
 
     let (analysis, start_offset) = backend.resolve_position(uri, params.range.start)?;
 
+    let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+    if let Some(a) = build_raw_string_action(&analysis, start_offset, uri) {
+        actions.push(CodeActionOrCommand::CodeAction(a));
+    }
+    if let Some(a) = build_inline_macro_action(&analysis, start_offset, uri) {
+        actions.push(CodeActionOrCommand::CodeAction(a));
+    }
+    if actions.is_empty() {
+        None
+    } else {
+        Some(actions)
+    }
+}
+
+fn build_raw_string_action(
+    analysis: &Module,
+    start_offset: u32,
+    uri: &Url,
+) -> Option<CodeAction> {
     // Find a StringLit token covering the cursor in the cached tokens. If lex
     // never produced tokens (very early state), bail.
     let tokens = analysis.tokens.as_deref()?;
@@ -63,7 +92,6 @@ pub fn code_action(backend: &Backend, params: &CodeActionParams) -> Option<CodeA
     }
 
     let edit_range = text::span_to_range(&analysis.rope, span);
-
     let edits = std::collections::HashMap::from([(
         uri.clone(),
         vec![TextEdit {
@@ -72,7 +100,7 @@ pub fn code_action(backend: &Backend, params: &CodeActionParams) -> Option<CodeA
         }],
     )]);
 
-    Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
+    Some(CodeAction {
         title: "Convert to raw string".into(),
         kind: Some(CodeActionKind::REFACTOR_REWRITE),
         edit: Some(WorkspaceEdit {
@@ -85,7 +113,94 @@ pub fn code_action(backend: &Backend, params: &CodeActionParams) -> Option<CodeA
         is_preferred: None,
         disabled: None,
         data: None,
-    })])
+    })
+}
+
+/// "Inline rule-set macro call": when the cursor is inside a top-level
+/// macro call that the loader expanded into `Node::ExpandedRule`s, replace
+/// the call span with the rendered rule decls.
+fn build_inline_macro_action(
+    analysis: &Module,
+    start_offset: u32,
+    uri: &Url,
+) -> Option<CodeAction> {
+    // Only meaningful when the loader actually ran expansion. The manual
+    // parse fallback never produces `ExpandedRule` nodes.
+    if !analysis.loader_succeeded {
+        return None;
+    }
+    // Collect the `ExpandedRule`s synthesized for one call. They all share
+    // the original call's source span - so the first hit anchors the span
+    // and we gather every sibling carrying the same span. Sibling rules
+    // appear contiguously in `root_items` (expand_macro_calls writes them
+    // in order).
+    let arena = &analysis.shared.arena;
+    let mut hit_span: Option<Span> = None;
+    let mut rule_ids: Vec<tree_sitter_generate::nativedsl::ast::NodeId> = Vec::new();
+    for &id in &analysis.root_items {
+        if !matches!(arena.get(id), Node::ExpandedRule { .. }) {
+            continue;
+        }
+        let span = arena.span(id);
+        match hit_span {
+            Some(s) if s == span => rule_ids.push(id),
+            Some(_) => {
+                // Past the run sharing the cursor's call span.
+                if !rule_ids.is_empty() {
+                    break;
+                }
+            }
+            None => {
+                if span.start <= start_offset && start_offset < span.end {
+                    hit_span = Some(span);
+                    rule_ids.push(id);
+                }
+            }
+        }
+    }
+    let call_span = hit_span?;
+
+    // Render each ExpandedRule as `[override ]rule NAME { BODY }` via the
+    // formatter's expansion mode (so `Node::SynthRef` lookups against the
+    // strings table work). Empty `args` slice: the loader has already
+    // substituted the call's args structurally, so no MacroParams remain
+    // in the bodies.
+    let config = FormattingConfig::default();
+    let mut parts: Vec<String> = Vec::with_capacity(rule_ids.len());
+    for rid in rule_ids {
+        let rendered = formatter::format_macro_expansion(
+            rid,
+            &[],
+            analysis,
+            analysis,
+            &config,
+        );
+        parts.push(rendered);
+    }
+    let new_text = parts.join("\n\n");
+    let edit_range = text::span_to_range(&analysis.rope, call_span);
+    let edits = std::collections::HashMap::from([(
+        uri.clone(),
+        vec![TextEdit {
+            range: edit_range,
+            new_text,
+        }],
+    )]);
+
+    Some(CodeAction {
+        title: "Inline macro call".into(),
+        kind: Some(CodeActionKind::REFACTOR_REWRITE),
+        edit: Some(WorkspaceEdit {
+            changes: Some(edits),
+            document_changes: None,
+            change_annotations: None,
+        }),
+        diagnostics: None,
+        command: None,
+        is_preferred: None,
+        disabled: None,
+        data: None,
+    })
 }
 
 fn is_refactor_kind(k: &CodeActionKind) -> bool {

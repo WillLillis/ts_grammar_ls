@@ -513,6 +513,7 @@ fn extract_module(
         declared_cfg_flags,
         shared: Arc::clone(shared),
         strings: Arc::clone(strings),
+        root_items: ctx.root_items.clone(),
     }
 }
 
