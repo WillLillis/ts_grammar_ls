@@ -20,7 +20,6 @@ use crate::analysis::uri_to_grammar_path;
 use crate::document::Document;
 use crate::text;
 use tree_sitter_generate::nativedsl::serialize::grammar_to_json;
-use tree_sitter_generate::parse_grammar::normalize_grammar;
 
 /// Merge DSL-phase and generate-phase diagnostics for publishing.
 fn merge_diagnostics(doc: &Document) -> Vec<Diagnostic> {
@@ -372,8 +371,8 @@ fn spawn_generate_check(
 /// Normalize the parsed grammar and serialize it to JSON for the generate
 /// subprocess. Takes the grammar by value: the DSL pipeline has already run
 /// on this snapshot in `run_dsl_pipeline`, so no reparsing here.
-fn prepare_grammar_json(mut grammar: nativedsl::InputGrammar) -> Option<String> {
-    normalize_grammar(&mut grammar);
+fn prepare_grammar_json(grammar: nativedsl::InputGrammar) -> Option<String> {
+    let grammar = grammar.normalize();
     let json_value = grammar_to_json(&grammar);
     serde_json::to_string(&json_value).ok()
 }
