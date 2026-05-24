@@ -5,9 +5,14 @@ use std::sync::Arc;
 use ropey::Rope;
 use tower_lsp::lsp_types::Url;
 
-use tree_sitter_generate::nativedsl::{self, ast, string_pool::StringPool};
+use tree_sitter_generate::nativedsl::{
+    self, ast,
+    string_pool::{StrEntry, StringPool},
+};
 
-use crate::document::{CfgFlag, DefKind, Definition, DisabledRegion, Module, RefKind, Reference};
+use crate::document::{
+    CfgFlag, DefKind, Definition, DisabledRegion, Module, RefKind, Reference, StringTable,
+};
 
 // ---------------------------------------------------------------------------
 // Analysis extraction - walk the AST to collect definitions and references
@@ -390,6 +395,47 @@ enum ExtractKind<'a> {
     },
 }
 
+/// Resolve the loader's `StringPool` into a `Send + Sync` table by
+/// materialising every entry to an owned `String`. `Source(span, mod_id)`
+/// entries are sliced from the appropriate module's source; `Owned` entries
+/// clone the `Rc<str>` contents. Called once per analyze; the resulting
+/// `StringTable` is `Arc`-shared across the root + every extracted external
+/// module.
+fn build_string_table(
+    strings: &StringPool,
+    modules: &[nativedsl::Module],
+    root_ctx: &ast::ModuleContext,
+) -> StringTable {
+    // The root module's ModuleId is `modules.len()` here: analyze pops the
+    // root off `modules` before extract, so `modules` holds only externals
+    // and the root's source lives on `root_ctx`.
+    let root_id = u8::try_from(modules.len()).unwrap_or(u8::MAX);
+    let resolved: Vec<String> = strings
+        .entries
+        .iter()
+        .map(|entry| match entry {
+            StrEntry::Unreachable => String::new(),
+            StrEntry::Source(span, mod_id) => {
+                let src = if *mod_id == root_id {
+                    root_ctx.source.as_str()
+                } else if let Some(m) = modules.get(*mod_id as usize) {
+                    m.ctx().source.as_str()
+                } else {
+                    // Shouldn't happen for a well-formed analysis - fall
+                    // back to empty so we don't crash the LSP on
+                    // unexpected pool state.
+                    ""
+                };
+                src.get(span.start as usize..span.end as usize)
+                    .unwrap_or("")
+                    .to_string()
+            }
+            StrEntry::Owned(rc_str) => rc_str.to_string(),
+        })
+        .collect();
+    StringTable::from_entries(resolved)
+}
+
 /// Extract a `Module` from a resolved AST. `modules` contains all loaded
 /// modules (root + inherits + imports), produced by the core's `Loader`;
 /// cross-module info (`base_module`, `import_modules`) is extracted from
@@ -398,6 +444,7 @@ fn extract_module(
     shared: &Arc<ast::SharedAst>,
     modules: &[nativedsl::Module],
     ctx: &ast::ModuleContext,
+    strings: &Arc<StringTable>,
     kind: ExtractKind<'_>,
 ) -> Module {
     let grammar_span = ctx
@@ -424,10 +471,10 @@ fn extract_module(
         else {
             return None;
         };
-        extract_external_at(shared, modules, *idx, env).map(Box::new)
+        extract_external_at(shared, modules, *idx, env, strings).map(Box::new)
     });
 
-    let import_modules = collect_import_modules(shared, modules, ctx, env);
+    let import_modules = collect_import_modules(shared, modules, ctx, env, strings);
 
     let (tokens_field, loader_succeeded, disabled_regions, declared_cfg_flags) = match kind {
         ExtractKind::Root {
@@ -465,6 +512,7 @@ fn extract_module(
         disabled_regions,
         declared_cfg_flags,
         shared: Arc::clone(shared),
+        strings: Arc::clone(strings),
     }
 }
 
@@ -474,12 +522,14 @@ fn extract_external_at(
     modules: &[nativedsl::Module],
     idx: u8,
     env: Option<&nativedsl::typecheck::TypeEnv>,
+    strings: &Arc<StringTable>,
 ) -> Option<Module> {
     let module = modules.get(idx as usize)?;
     Some(extract_module(
         shared,
         modules,
         module.ctx(),
+        strings,
         ExtractKind::External { env },
     ))
 }
@@ -492,6 +542,7 @@ fn collect_import_modules(
     modules: &[nativedsl::Module],
     ctx: &ast::ModuleContext,
     env: Option<&nativedsl::typecheck::TypeEnv>,
+    strings: &Arc<StringTable>,
 ) -> Vec<(String, Module)> {
     let mut out = Vec::new();
     for &item_id in &ctx.root_items {
@@ -506,7 +557,7 @@ fn collect_import_modules(
         else {
             continue;
         };
-        if let Some(info) = extract_external_at(shared, modules, *idx, env) {
+        if let Some(info) = extract_external_at(shared, modules, *idx, env, strings) {
             out.push((ctx.text(*name).to_owned(), info));
         }
     }
@@ -764,10 +815,15 @@ fn run_loader_pipeline(
         // Lift the AST arena into an `Arc` now that the loader has stopped
         // mutating it; every extracted Module shares the same handle.
         let shared = Arc::new(shared);
+        // Materialise the loader's StringPool into a Send+Sync table now
+        // (the pool itself uses Rc<str> so isn't thread-safe). Same Arc-
+        // share pattern as `shared`.
+        let strings = Arc::new(build_string_table(&strings, &modules, &ctx));
         let module = extract_module(
             &shared,
             &modules,
             &ctx,
+            &strings,
             ExtractKind::Root {
                 tokens: tokens.to_vec(),
                 loader_succeeded: true,
@@ -832,15 +888,19 @@ fn manual_parse_fallback(
     // `expand_macro_calls` doesn't run on this fallback path so no
     // `SynthRef` / `ExpandedRule` nodes are produced - a default pool is
     // enough to satisfy resolve's signature.
-    let strings = StringPool::default();
-    let _ = nativedsl::resolve::resolve(&mut shared, &module_ctx, &strings, &[], None);
+    let pool = StringPool::default();
+    let _ = nativedsl::resolve::resolve(&mut shared, &module_ctx, &pool, &[], None);
 
     let modules: Vec<nativedsl::Module> = Vec::new();
     let shared = Arc::new(shared);
+    // No ExpandedRule / SynthRef in the manual-parse fallback - the empty
+    // table covers the signature; nothing will ever look up a Str against it.
+    let strings = Arc::new(StringTable::default());
     let module = extract_module(
         &shared,
         &modules,
         &module_ctx,
+        &strings,
         ExtractKind::Root {
             tokens,
             loader_succeeded: false,

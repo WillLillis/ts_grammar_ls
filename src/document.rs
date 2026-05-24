@@ -6,6 +6,7 @@ use tower_lsp::lsp_types::Diagnostic;
 use std::sync::Arc;
 
 use tree_sitter_generate::nativedsl::ast::{SharedAst, Span};
+use tree_sitter_generate::nativedsl::string_pool::Str;
 use tree_sitter_generate::nativedsl::lexer::Token;
 use tree_sitter_generate::nativedsl::typecheck::Ty;
 
@@ -269,6 +270,36 @@ pub struct Module {
     /// nested `base_module` / `import_modules` cheaply point at the same
     /// arena they were built from.
     pub shared: Arc<SharedAst>,
+    /// Eagerly-resolved table of interned strings produced by the loader.
+    /// `Node::ExpandedRule.name` and `Node::SynthRef.name` (a `Str`)
+    /// index into this. Required to render post-expand AST as source.
+    /// We resolve at analyze time instead of storing the upstream
+    /// `StringPool` directly because the pool uses `Rc<str>` (`!Send`)
+    /// and our Module crosses thread boundaries via the document map.
+    pub strings: Arc<StringTable>,
+}
+
+/// Owned, thread-safe resolution of the loader's `StringPool`. Indexed by
+/// the inner `u32` of `Str` (so entry 0 is the unreachable sentinel,
+/// entries 1.. are real). Built once per `analyze()`; cheap clone via
+/// `Arc` for nested modules.
+#[derive(Debug, Default)]
+pub struct StringTable {
+    entries: Vec<String>,
+}
+
+impl StringTable {
+    #[must_use]
+    pub fn from_entries(entries: Vec<String>) -> Self {
+        Self { entries }
+    }
+
+    /// Resolve a `Str` to its text, or `None` if the index is out of range
+    /// (shouldn't happen for AST-produced `Str`s).
+    #[must_use]
+    pub fn get(&self, s: Str) -> Option<&str> {
+        self.entries.get(s.0.get() as usize).map(String::as_str)
+    }
 }
 
 /// A top-level declaration disabled by `#[cfg(NAME)]`. `full_span` covers the
@@ -309,6 +340,7 @@ impl Module {
             disabled_regions: Vec::new(),
             declared_cfg_flags: Vec::new(),
             shared: Arc::new(SharedAst::new(0)),
+            strings: Arc::new(StringTable::default()),
         }
     }
 
