@@ -20,7 +20,14 @@ enum Commands {
 }
 
 #[derive(Args)]
-struct GenerateCheck;
+struct GenerateCheck {
+    /// Also write `grammar.json`, `src/parser.c`, and the tree-sitter
+    /// headers (`src/tree_sitter/*.h`) under this directory, in addition
+    /// to validating the grammar. Used by the LSP to drive the REPL
+    /// compile pipeline without a second subprocess hop.
+    #[arg(long)]
+    write_to: Option<PathBuf>,
+}
 
 #[derive(Args)]
 struct Format {
@@ -46,8 +53,8 @@ async fn main() {
 
     if let Ok(command) = Commands::from_arg_matches(&matches) {
         match command {
-            Commands::GenerateCheck(_) => {
-                ts_grammar_ls::generate_check::run();
+            Commands::GenerateCheck(args) => {
+                ts_grammar_ls::generate_check::run(args.write_to.as_deref());
             }
             Commands::Format(fmt) => {
                 std::process::exit(ts_grammar_ls::cli::format::run(
