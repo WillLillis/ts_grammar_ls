@@ -2824,6 +2824,126 @@ rule program { \"x\" }
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn code_action_inlines_expression_macro_call() {
+    // A local expression-flavor macro called inside a rule body. The cursor
+    // inside the call should produce an "Inline macro call" action that
+    // replaces the call span with the body, args substituted.
+    let grammar = "\
+grammar { language: \"test\" }
+
+macro greet(who: str_t) rule_t {
+    seq(\"hello\", who)
+}
+
+rule program { greet(\"world\") }
+";
+    let mut service = init(&[(test_uri(), grammar)]).await;
+
+    // Cursor on the `greet` identifier inside the call on line 6.
+    let range = Range::new(Position::new(6, 17), Position::new(6, 17));
+    let result = code_actions_at(&mut service, test_uri(), range).await;
+
+    // `greet("world")` spans line 6, col 15..29.
+    let expected_edit_range = Range::new(Position::new(6, 15), Position::new(6, 29));
+    assert_eq!(
+        result,
+        Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Inline macro call".into(),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(WorkspaceEdit {
+                changes: Some(std::collections::HashMap::from([(
+                    test_uri(),
+                    vec![TextEdit {
+                        range: expected_edit_range,
+                        new_text: "seq(\"hello\", \"world\")".into(),
+                    }],
+                )])),
+                document_changes: None,
+                change_annotations: None,
+            }),
+            diagnostics: None,
+            command: None,
+            is_preferred: None,
+            disabled: None,
+            data: None,
+        })])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn code_action_inlines_cross_module_expression_macro_call() {
+    // `helpers::commaSep("x")` should inline to the helper macro body with
+    // `item` substituted. Body / args span different module sources, so this
+    // also exercises the formatter's per-frame source swap in Mode::Expansion.
+    let fix = create_import_fixture();
+    let grammar_uri = Url::from_file_path(&fix.grammar_path).unwrap();
+    let mut service = init(&[(grammar_uri.clone(), &fix.grammar_text)]).await;
+
+    // Locate `commaSep` in the qualified call inside grammar.tsg.
+    let call_offset = fix
+        .grammar_text
+        .find("helpers::commaSep")
+        .unwrap();
+    let rope = ropey::Rope::from_str(&fix.grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(
+        &rope,
+        (call_offset + "helpers::comma".len()) as u32,
+    );
+    let range = Range::new(pos, pos);
+    let result = code_actions_at(&mut service, grammar_uri.clone(), range).await;
+
+    // The full `helpers::commaSep("x")` span gets replaced.
+    let call_start = fix
+        .grammar_text
+        .find("helpers::commaSep")
+        .unwrap();
+    let call_end = call_start + "helpers::commaSep(\"x\")".len();
+    let expected_edit_range = Range::new(
+        ts_grammar_ls::text::offset_to_position(&rope, call_start as u32),
+        ts_grammar_ls::text::offset_to_position(&rope, call_end as u32),
+    );
+    assert_eq!(
+        result,
+        Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Inline macro call".into(),
+            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+            edit: Some(WorkspaceEdit {
+                changes: Some(std::collections::HashMap::from([(
+                    grammar_uri,
+                    vec![TextEdit {
+                        range: expected_edit_range,
+                        new_text: "seq(\"x\", repeat(seq(\",\", \"x\")))".into(),
+                    }],
+                )])),
+                document_changes: None,
+                change_annotations: None,
+            }),
+            diagnostics: None,
+            command: None,
+            is_preferred: None,
+            disabled: None,
+            data: None,
+        })])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn code_action_not_offered_on_non_macro_call() {
+    // `seq` is a builtin combinator, not a macro - shouldn't be inlinable.
+    let grammar = "\
+grammar { language: \"test\" }
+rule program { seq(\"a\", \"b\") }
+";
+    let mut service = init(&[(test_uri(), grammar)]).await;
+
+    // Cursor on `seq` (line 1, col 16).
+    let range = Range::new(Position::new(1, 16), Position::new(1, 16));
+    let result = code_actions_at(&mut service, test_uri(), range).await;
+
+    assert_eq!(result, None);
+}
+
 // ---------------------------------------------------------------------------
 // Import tests
 // ---------------------------------------------------------------------------

@@ -1,20 +1,24 @@
 //! `textDocument/codeAction` handler.
 //!
-//! Provides two refactorings:
+//! Provides three refactorings:
 //!
 //! - **Convert string to raw string** (`"..."` to `r#"..."#`) with the minimum
 //!   number of `#` delimiters needed to disambiguate embedded `"` sequences.
-//! - **Inline rule-set macro call**: when the cursor is on a top-level
-//!   `Node::Call` to a rule-set macro (one that generates rule decls), expand
-//!   it in place to the rules it produces. The loader's `expand_macro_calls`
-//!   already replaced the call in `root_items` with `Node::ExpandedRule`s
-//!   carrying the original call's span; we find those and render them.
+//! - **Inline rule-set macro call**: cursor on a top-level `@NAME(args)`
+//!   invocation that the loader expanded into `Node::ExpandedRule`s. The
+//!   handler finds those `ExpandedRule`s (they share the original call's
+//!   span) and replaces the call span with the rendered rule decls.
+//! - **Inline expression macro call**: cursor on a nested `Node::Call` or
+//!   `Node::QualifiedCall` (cross-module) whose name resolves to an
+//!   expression-flavor macro. The handler renders the macro's body with
+//!   the caller's args substituted (via `format_macro_expansion`) and
+//!   replaces the call's span with the result.
 
 use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
     TextEdit, WorkspaceEdit, Url,
 };
-use tree_sitter_generate::nativedsl::ast::{Node, Span};
+use tree_sitter_generate::nativedsl::ast::{IdentKind, MacroId, MacroKind, Node, NodeId, SharedAst, Span};
 use tree_sitter_generate::nativedsl::lexer::TokenKind;
 
 use crate::config::FormattingConfig;
@@ -41,6 +45,9 @@ pub fn code_action(backend: &Backend, params: &CodeActionParams) -> Option<CodeA
         actions.push(CodeActionOrCommand::CodeAction(a));
     }
     if let Some(a) = build_inline_macro_action(&analysis, start_offset, uri) {
+        actions.push(CodeActionOrCommand::CodeAction(a));
+    }
+    if let Some(a) = build_inline_expression_macro_action(&analysis, start_offset, uri) {
         actions.push(CodeActionOrCommand::CodeAction(a));
     }
     if actions.is_empty() {
@@ -201,6 +208,217 @@ fn build_inline_macro_action(
         disabled: None,
         data: None,
     })
+}
+
+/// "Inline macro call" for an expression-flavor macro. Walks the AST
+/// top-down from `root_items`, finds the innermost `Node::Call` /
+/// `Node::QualifiedCall` whose name resolves to an expression-flavor
+/// macro and whose span contains the cursor, then replaces the call
+/// span with the rendered expansion.
+fn build_inline_expression_macro_action(
+    analysis: &Module,
+    start_offset: u32,
+    uri: &Url,
+) -> Option<CodeAction> {
+    if !analysis.loader_succeeded {
+        return None;
+    }
+    let shared = &analysis.shared;
+    let call_id = analysis
+        .root_items
+        .iter()
+        .find_map(|&id| find_macro_call_at(shared, start_offset, id))?;
+    let (macro_id, body_module, args) = resolve_call_target(analysis, call_id)?;
+    let macro_cfg = shared.pools.get_macro(macro_id);
+    // Only expression-flavor macros are inlinable in expression position.
+    // Rule-set macros are handled by `build_inline_macro_action`.
+    if !matches!(macro_cfg.kind, MacroKind::Expression(_)) {
+        return None;
+    }
+
+    let config = FormattingConfig::default();
+    let new_text = formatter::format_macro_expansion(
+        macro_cfg.body,
+        &args,
+        body_module,
+        analysis,
+        &config,
+    );
+    let call_span = shared.arena.span(call_id);
+    let edit_range = text::span_to_range(&analysis.rope, call_span);
+    let edits = std::collections::HashMap::from([(
+        uri.clone(),
+        vec![TextEdit {
+            range: edit_range,
+            new_text,
+        }],
+    )]);
+    Some(CodeAction {
+        title: "Inline macro call".into(),
+        kind: Some(CodeActionKind::REFACTOR_REWRITE),
+        edit: Some(WorkspaceEdit {
+            changes: Some(edits),
+            document_changes: None,
+            change_annotations: None,
+        }),
+        diagnostics: None,
+        command: None,
+        is_preferred: None,
+        disabled: None,
+        data: None,
+    })
+}
+
+/// Top-down search: smallest-span `Call`/`QualifiedCall` to a macro that
+/// contains `cursor`. Descend through children first so an inner call
+/// wins over an enclosing one.
+fn find_macro_call_at(shared: &SharedAst, cursor: u32, id: NodeId) -> Option<NodeId> {
+    let span = shared.arena.span(id);
+    if !(span.start <= cursor && cursor < span.end) {
+        return None;
+    }
+    let children = collect_children(shared, id);
+    for c in children {
+        if let Some(hit) = find_macro_call_at(shared, cursor, c) {
+            return Some(hit);
+        }
+    }
+    match *shared.arena.get(id) {
+        Node::Call { name, .. } => {
+            if matches!(shared.arena.get(name), Node::Ident(IdentKind::Macro(_))) {
+                return Some(id);
+            }
+        }
+        Node::QualifiedCall(range) => {
+            let (_, name, _) = shared.pools.get_qualified_call(range);
+            if matches!(shared.arena.get(name), Node::Ident(IdentKind::Macro(_))) {
+                return Some(id);
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Enumerate `id`'s direct children. Used by `find_macro_call_at`'s
+/// recursive descent; leaves return an empty list.
+fn collect_children(shared: &SharedAst, id: NodeId) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    match *shared.arena.get(id) {
+        Node::Rule { body, .. } => out.push(body),
+        Node::ComputedRule { name_expr, body, .. } => {
+            out.push(name_expr);
+            out.push(body);
+        }
+        Node::RuleSet(r) | Node::SeqOrChoice { range: r, .. } | Node::Concat(r)
+        | Node::List(r) | Node::Tuple(r) => {
+            out.extend(shared.pools.child_slice(r).iter().copied());
+        }
+        Node::ExpandedRule { body, .. } => out.push(body),
+        Node::Let { value, .. } => out.push(value),
+        Node::Macro(macro_id) => out.push(shared.pools.get_macro(macro_id).body),
+        Node::Cfg { child, .. } => out.push(child),
+        Node::FieldAccess { obj, .. } | Node::QualifiedAccess { obj, .. } => out.push(obj),
+        Node::Repeat { inner, .. } | Node::Token { inner, .. } | Node::Neg(inner) => {
+            out.push(inner);
+        }
+        Node::Field { content, .. } | Node::Reserved { content, .. } => out.push(content),
+        Node::Alias { content, target } => {
+            out.push(content);
+            out.push(target);
+        }
+        Node::Prec { value, content, .. } => {
+            out.push(value);
+            out.push(content);
+        }
+        Node::DynRegex { pattern, flags } => {
+            out.push(pattern);
+            if let Some(f) = flags {
+                out.push(f);
+            }
+        }
+        Node::GrammarConfig { module, .. } => out.push(module),
+        Node::Call { name, args } => {
+            out.push(name);
+            out.extend(shared.pools.child_slice(args).iter().copied());
+        }
+        Node::QualifiedCall(range) => {
+            out.extend(shared.pools.child_slice(range).iter().copied());
+        }
+        Node::Append { left, right } | Node::BinOp { lhs: left, rhs: right, .. } => {
+            out.push(left);
+            out.push(right);
+        }
+        Node::For { for_id, body } => {
+            let cfg = shared.pools.get_for(for_id);
+            out.push(cfg.iterable);
+            out.push(body);
+        }
+        Node::SymRef { expr } => out.push(expr),
+        Node::Object(range) => {
+            for &(_, v) in shared.pools.get_object(range) {
+                out.push(v);
+            }
+        }
+        // Leaves.
+        Node::Grammar | Node::External { .. } | Node::StringLit | Node::RawStringLit { .. }
+        | Node::IntLit(_) | Node::Ident(_) | Node::Blank | Node::SynthRef { .. }
+        | Node::MacroParam { .. } | Node::ForBinding { .. } | Node::ModuleRef { .. }
+        | Node::Unreachable => {}
+    }
+    out
+}
+
+/// Resolve a Call or QualifiedCall NodeId to:
+///   - the `MacroId` it invokes,
+///   - the `Module` whose `StringTable` / source the macro body lives in,
+///   - the argument `NodeId`s.
+/// For a local `Node::Call`, `body_module` is `caller`. For a
+/// `Node::QualifiedCall`, the obj resolves to a `let h = import("...")`
+/// binding and `body_module` is the imported module.
+fn resolve_call_target<'a>(
+    caller: &'a Module,
+    call_id: NodeId,
+) -> Option<(MacroId, &'a Module, Vec<NodeId>)> {
+    let shared = &caller.shared;
+    match *shared.arena.get(call_id) {
+        Node::Call { name, args } => {
+            let macro_id = match shared.arena.get(name) {
+                Node::Ident(IdentKind::Macro(m)) => *m,
+                _ => return None,
+            };
+            let args = shared.pools.child_slice(args).to_vec();
+            Some((macro_id, caller, args))
+        }
+        Node::QualifiedCall(range) => {
+            let (obj, name, args) = shared.pools.get_qualified_call(range);
+            let macro_id = match shared.arena.get(name) {
+                Node::Ident(IdentKind::Macro(m)) => *m,
+                _ => return None,
+            };
+            let body_module = resolve_import_obj(caller, obj)?;
+            Some((macro_id, body_module, args.to_vec()))
+        }
+        _ => None,
+    }
+}
+
+/// Follow `obj`'s `IdentKind::Var(let_id)` to its `Node::Let`, take the
+/// let's binding name, and look it up in `caller.import_modules`.
+fn resolve_import_obj<'a>(caller: &'a Module, obj: NodeId) -> Option<&'a Module> {
+    let shared = &caller.shared;
+    let Node::Ident(IdentKind::Var(let_id)) = shared.arena.get(obj) else {
+        return None;
+    };
+    let Node::Let { name, .. } = shared.arena.get(*let_id) else {
+        return None;
+    };
+    let binding_name = &caller.source[name.start as usize..name.end as usize];
+    caller
+        .import_modules
+        .iter()
+        .find(|(n, _)| n == binding_name)
+        .map(|(_, m)| m)
 }
 
 fn is_refactor_kind(k: &CodeActionKind) -> bool {
