@@ -5192,6 +5192,57 @@ rule strikethrough { "~~" }
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn unreachable_rule_produces_hint_diagnostic() {
+    // `unused_rule` is declared but never referenced from `program` (the
+    // start rule). `InputGrammar::normalize()` drops it; the LSP surfaces a
+    // HINT+UNNECESSARY diagnostic on its declaration so editors render it
+    // dimmed.
+    let grammar = r#"grammar { language: "test" }
+rule program { "x" }
+rule unused_rule { "y" }
+"#;
+    let service = init(&[(test_uri(), grammar)]).await;
+    let doc = service.inner().document_map.get(&test_uri()).unwrap();
+    let hints: Vec<Diagnostic> = doc
+        .dsl_diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::HINT))
+        .cloned()
+        .collect();
+    assert_eq!(
+        hints,
+        vec![Diagnostic {
+            range: Range::new(Position::new(2, 0), Position::new(2, 24)),
+            severity: Some(DiagnosticSeverity::HINT),
+            source: Some("ts_grammar_ls".into()),
+            message: "unused rule `unused_rule`".into(),
+            tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+            ..Default::default()
+        }]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reachable_rule_produces_no_unused_hint() {
+    // `helper` is reachable from `program` via `seq` - no unused diagnostic.
+    let grammar = r#"grammar { language: "test" }
+rule program { seq("x", helper) }
+rule helper { "y" }
+"#;
+    let service = init(&[(test_uri(), grammar)]).await;
+    let doc = service.inner().document_map.get(&test_uri()).unwrap();
+    let unused_hints: Vec<&Diagnostic> = doc
+        .dsl_diagnostics
+        .iter()
+        .filter(|d| {
+            d.severity == Some(DiagnosticSeverity::HINT)
+                && d.message.starts_with("unused rule")
+        })
+        .collect();
+    assert!(unused_hints.is_empty(), "unexpected hints: {unused_hints:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn hover_cfg_flag_name_shows_disabled_state() {
     let grammar = r#"grammar { language: "test", flags: { disabled: ["GFM"] } }
 rule program { "x" }

@@ -17,8 +17,9 @@ use tower_lsp::{
 use tree_sitter_generate::nativedsl::{self, DslError};
 
 use crate::analysis::uri_to_grammar_path;
-use crate::document::Document;
+use crate::document::{DefKind, Document, Module};
 use crate::text;
+use tower_lsp::lsp_types::DiagnosticTag;
 use tree_sitter_generate::nativedsl::serialize::grammar_to_json;
 
 /// Merge DSL-phase and generate-phase diagnostics for publishing.
@@ -173,6 +174,9 @@ async fn publish_dsl_diagnostics(
         _ => Vec::new(),
     };
     new_diagnostics.extend(outcome.module.cfg_hint_diagnostics());
+    if let Some(Ok(ref grammar)) = outcome.pipeline {
+        new_diagnostics.extend(dead_rule_diagnostics(grammar, &outcome.module));
+    }
 
     let grammar = outcome.pipeline.and_then(Result::ok);
     {
@@ -187,6 +191,50 @@ async fn publish_dsl_diagnostics(
             .await;
     }
     grammar.ok_or(())
+}
+
+/// Diff the variable set before and after `InputGrammar::normalize()` to
+/// find rules that are unreachable from the implicit roots (start rule,
+/// `word_token`, names referenced in `extras` / `externals` /
+/// `reserved_words`). Each dropped name that maps to a `Rule` /
+/// `OverrideRule` definition in `module` gets a HINT diagnostic with the
+/// `UNNECESSARY` tag - editors render it dimmed.
+///
+/// Defers the reachability computation to upstream's `normalize` so the
+/// LSP and codegen agree on what "dead" means. Inherited / imported
+/// rules that get dropped are skipped: their definition lives in another
+/// file, and the diagnostic belongs there (that file's own analyze run
+/// will surface it).
+fn dead_rule_diagnostics(grammar: &nativedsl::InputGrammar, module: &Module) -> Vec<Diagnostic> {
+    let before: FxHashSet<String> = grammar.variables.iter().map(|v| v.name.clone()).collect();
+    let after: FxHashSet<String> = grammar
+        .clone()
+        .normalize()
+        .variables
+        .into_iter()
+        .map(|v| v.name)
+        .collect();
+    let Some(defs) = module.definitions.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for name in before.difference(&after) {
+        let Some(def) = defs
+            .iter()
+            .find(|d| d.name == *name && matches!(d.kind, DefKind::Rule | DefKind::OverrideRule))
+        else {
+            continue;
+        };
+        out.push(Diagnostic {
+            range: text::span_to_range(&module.rope, def.full_span),
+            severity: Some(DiagnosticSeverity::HINT),
+            source: Some("ts_grammar_ls".into()),
+            message: format!("unused rule `{name}`"),
+            tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+            ..Default::default()
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
