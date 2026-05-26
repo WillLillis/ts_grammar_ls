@@ -218,6 +218,16 @@ impl<'a> Printer<'a> {
             Node::Cfg { name, child } => self.cfg_doc(name, child),
             // Sentinel marker - the actual fields live on `ctx.grammar_config`.
             Node::Grammar => self.grammar_block(),
+            // `@NAME(args)` at top level: a rule-set macro invocation.
+            // Reachable only when the loader didn't run (`expand_macro_calls`
+            // would have replaced this slot with `Node::ExpandedRule`s);
+            // emit with the leading `@` so the round-trip parses again.
+            Node::Call { name, args } => {
+                let at = self.arena.text("@");
+                let parent_end = self.shared.arena.span(id).end;
+                let call = self.call_doc(name, args, parent_end);
+                self.arena.concat(&[at, call])
+            }
             _ => self.expr(id),
         }
     }
@@ -288,7 +298,8 @@ impl<'a> Printer<'a> {
     }
 
     fn macro_doc(&mut self, macro_id: tree_sitter_generate::nativedsl::ast::MacroId) -> DocId {
-        // `macro NAME(p1: T1, p2: T2) RETURN_TY { BODY }`
+        // Expression-flavor: `macro NAME(p1: T1, p2: T2) RETURN_TY { BODY }`.
+        // Rule-set-flavor:   `rules NAME(p1: T1, p2: T2) { rule decls... }`.
         //
         // Params wrap independently of the body: a long body shouldn't force
         // a short param list to break onto multiple lines. Body wrap follows
@@ -327,10 +338,13 @@ impl<'a> Printer<'a> {
         };
 
         let head = {
-            let kw = self.arena.text("macro ");
+            let kw = self.arena.text(match config.kind {
+                MacroKind::Expression(_) => "macro ",
+                MacroKind::RuleSet => "rules ",
+            });
             let name = self.arena.text(self.span_text(config.name));
             // Expression macro: `macro f(...) ret_t {`.
-            // Rule-set macro: `macro f(...) {` (no return type; body is a
+            // Rule-set macro:   `rules f(...) {` (no return type; body is a
             //   sequence of rule decls).
             let after_params = match config.kind {
                 MacroKind::Expression(ty) => format!(" {ty} {{"),

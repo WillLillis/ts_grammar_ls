@@ -2736,21 +2736,21 @@ async fn code_action_inlines_rule_set_macro_call() {
     let grammar = "\
 grammar { language: \"test\" }
 
-macro arith(prec_name: str_t, op: str_t) {
+rules arith(prec_name: str_t, op: str_t) {
     rule @prec_name { seq(@prec_name, op, @prec_name) }
 }
 
-arith(\"add\", \"+\")
+@arith(\"add\", \"+\")
 
 rule program { \"x\" }
 ";
     let mut service = init(&[(test_uri(), grammar)]).await;
 
-    // Cursor on the `arith` identifier of the top-level call (line 6, col 0..5).
+    // Cursor on the `arith` identifier of the top-level call (line 6).
     let range = Range::new(Position::new(6, 2), Position::new(6, 2));
     let result = code_actions_at(&mut service, test_uri(), range).await;
 
-    let expected_edit_range = Range::new(Position::new(6, 0), Position::new(6, 17));
+    let expected_edit_range = Range::new(Position::new(6, 0), Position::new(6, 18));
     assert_eq!(
         result,
         Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
@@ -2783,22 +2783,22 @@ async fn code_action_inlines_rule_set_macro_call_multi_rule() {
     let grammar = "\
 grammar { language: \"test\" }
 
-macro pair(a: str_t, b: str_t) {
+rules pair(a: str_t, b: str_t) {
     rule @a { \"x\" }
     rule @b { \"y\" }
 }
 
-pair(\"foo\", \"bar\")
+@pair(\"foo\", \"bar\")
 
 rule program { \"x\" }
 ";
     let mut service = init(&[(test_uri(), grammar)]).await;
 
     // Cursor on the `pair` identifier of the top-level call (line 7).
-    let range = Range::new(Position::new(7, 1), Position::new(7, 1));
+    let range = Range::new(Position::new(7, 2), Position::new(7, 2));
     let result = code_actions_at(&mut service, test_uri(), range).await;
 
-    let expected_edit_range = Range::new(Position::new(7, 0), Position::new(7, 18));
+    let expected_edit_range = Range::new(Position::new(7, 0), Position::new(7, 19));
     assert_eq!(
         result,
         Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
