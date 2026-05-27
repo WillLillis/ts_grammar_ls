@@ -57,6 +57,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter-generate = { path = "../tree-sitter/crates/generate", features = [
     "nativedsl",
 ] }
+tree-sitter = { path = "../tree-sitter/lib" }
+tree-sitter-loader = { path = "../tree-sitter/crates/loader" }
 rustc-hash = "2.1.2"
 memchr = "2.8.0"
 

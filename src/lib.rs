@@ -7,6 +7,7 @@ pub mod formatter;
 pub mod generate_check;
 pub mod handlers;
 pub mod hover_docs;
+pub mod repl;
 pub mod server;
 pub mod text;
 pub mod workspace_index;
