@@ -22,7 +22,7 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::document::DefKind;
-use crate::repl::{self, ReplSession};
+use crate::repl::{self, ReplMeta, ReplSession};
 use crate::server::Backend;
 
 pub const OPEN_REPL_COMMAND: &str = "tsg.openRepl";
@@ -48,10 +48,20 @@ pub async fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Opti
     let repl_path = repl_input_path(&args.uri);
     write_initial_input(&repl_path, &rule_name);
 
+    // Persist the grammar URI in a sibling metadata file so the LSP
+    // process that eventually receives `did_open` on the REPL buffer
+    // (often a different process than the one running this command -
+    // see `ReplMeta`'s docstring) can rebuild the session without
+    // requiring shared memory.
+    let meta = ReplMeta {
+        grammar_uri: args.uri.clone(),
+    };
+    let _ = meta.write_for(&repl_path);
+
     let repl_uri = Url::from_file_path(&repl_path).ok()?;
 
-    // Register / refresh the session so subsequent `did_change` events on
-    // this REPL URI know which grammar + rule to compile against.
+    // Register the session locally too. In single-process setups this
+    // avoids a redundant disk read on the upcoming `did_open`.
     backend.repl_sessions.insert(
         repl_uri.clone(),
         std::sync::Mutex::new(ReplSession {
@@ -138,14 +148,6 @@ fn repl_dir() -> PathBuf {
 /// `Language` fresh. Actually parsing the REPL text + publishing
 /// diagnostics + updating the tree-view buffer lands in step 5.
 pub fn handle_repl_change(backend: &Backend, repl_uri: &Url, text: &str) {
-    let Some(session_ref) = backend.repl_sessions.get(repl_uri) else {
-        // The user opened a REPL file directly without going through
-        // `tsg.openRepl`. No session means we don't know which grammar
-        // to compile against; bail. The buffer remains usable for
-        // freeform editing.
-        tracing::info!("repl: no session for {repl_uri}; ignoring");
-        return;
-    };
     let new_rule = match repl::parse_rule_header(text) {
         Some(name) => name.to_owned(),
         None => {
@@ -153,15 +155,47 @@ pub fn handle_repl_change(backend: &Backend, repl_uri: &Url, text: &str) {
             return; // Step #39 follow-up: fall back to grammar start.
         }
     };
+
+    // Locate / rebuild the session. If this LSP process is fresh (e.g.
+    // a second instance spawned by lspconfig for the REPL buffer's
+    // root_dir), the in-memory map is empty. Reconstruct the session
+    // by reading the sibling metadata file written by `tsg.openRepl`.
+    if !backend.repl_sessions.contains_key(repl_uri) {
+        let Ok(repl_path) = repl_uri.to_file_path() else {
+            tracing::info!("repl: non-file repl uri {repl_uri}");
+            return;
+        };
+        let Some(meta) = ReplMeta::read_for(&repl_path) else {
+            tracing::info!(
+                "repl: no sibling metadata for {repl_uri}; user opened a REPL buffer \
+                 without going through tsg.openRepl"
+            );
+            return;
+        };
+        tracing::info!(
+            "repl: rebuilding session for {repl_uri} (grammar={})",
+            meta.grammar_uri
+        );
+        backend.repl_sessions.insert(
+            repl_uri.clone(),
+            std::sync::Mutex::new(ReplSession {
+                grammar_uri: meta.grammar_uri,
+                current_rule: new_rule.clone(),
+                last_key: None,
+                language: None,
+            }),
+        );
+        spawn_compile(backend, repl_uri.clone());
+        return;
+    }
+
+    let session_ref = backend.repl_sessions.get(repl_uri).expect("checked above");
     // Mutate the rule if needed under the session lock, then drop the
-    // map ref before spawning so we don't hold a DashMap guard across an
-    // await. The compile task takes its own clone of the session URI.
+    // map ref before spawning so we don't hold a DashMap guard across
+    // an await. The compile task takes its own clone of the session URI.
     {
         let mut session = session_ref.lock().unwrap();
         if session.current_rule == new_rule && session.language.is_some() {
-            // Rule unchanged and we already have a compiled language. No
-            // re-compile needed; step 5 will use the existing language
-            // to re-parse the buffer's input region.
             tracing::info!("repl: {repl_uri} rule={new_rule} unchanged, language cached");
             return;
         }
@@ -189,23 +223,28 @@ fn spawn_compile(backend: &Backend, repl_uri: Url) {
         grammar_uri = session.grammar_uri.clone();
         rule_name = session.current_rule.clone();
     }
-    let Some(analysis) = backend.get_analysis(&grammar_uri) else {
-        tracing::warn!("repl: no analysis for grammar {grammar_uri}");
-        return;
-    };
-    // The lowered InputGrammar comes from the loader, NOT from the
-    // typecheck step that produces `analysis.module`. We need to
-    // re-run analyze just to grab the pipeline result... actually we
-    // need a different entry point. For now: lift the lowered grammar
-    // from a fresh analyze call against the current grammar text.
-    let Some(grammar_text) = backend
+    // The lowered InputGrammar comes from the loader, so we need to
+    // re-run `analyze` against the current grammar text. Source for
+    // that text:
+    //   - in-memory `document_map` when this process has the grammar
+    //     buffer open (single-process setup),
+    //   - on-disk file otherwise (the common multi-process case where
+    //     the REPL buffer lives under a different `root_dir` than the
+    //     grammar and got spawned its own LSP instance).
+    let grammar_text = backend
         .document_map
         .get(&grammar_uri)
         .map(|d| d.text.clone())
-    else {
+        .or_else(|| {
+            grammar_uri
+                .to_file_path()
+                .ok()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+        });
+    let Some(grammar_text) = grammar_text else {
+        tracing::warn!("repl: couldn't load grammar text for {grammar_uri}");
         return;
     };
-    let _ = analysis; // suppress unused while we use grammar_text path
     let Some(outcome) = crate::analysis::analyze(grammar_text, &grammar_uri) else {
         return;
     };

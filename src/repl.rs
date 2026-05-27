@@ -39,12 +39,68 @@ use tree_sitter_loader::{CompileConfig, Loader};
 /// confuse REPL buffers with real grammar files.
 pub const REPL_INPUT_SUFFIX: &str = ".tsg-repl.tsg";
 
+/// File-name suffix for the sibling metadata file. Each REPL input
+/// buffer has a paired `<basename>.tsg-repl.json` that stores
+/// server-owned state (the grammar URI) so any LSP process can rebuild
+/// its session by reading the buffer + sibling, without depending on
+/// in-memory state surviving a process boundary.
+///
+/// Why this is needed: client frameworks (lspconfig, etc.) compute
+/// `root_dir` per buffer and spawn one LSP process per
+/// `(filetype, root_dir)` pair. The grammar and the REPL buffer have
+/// different roots, so two processes get involved. The process that
+/// handled `tsg.openRepl` registered the session in memory; the process
+/// that receives `did_open` on the REPL buffer is a different one and
+/// has no in-memory state. The sibling file bridges them.
+pub const REPL_META_SUFFIX: &str = ".tsg-repl.json";
+
 /// `true` when `uri` points at a REPL input buffer (created by
 /// `tsg.openRepl`). The naming convention is private to the LSP so
 /// false positives on user-owned files are vanishingly unlikely.
 #[must_use]
 pub fn is_repl_uri(uri: &tower_lsp::lsp_types::Url) -> bool {
     uri.path().ends_with(REPL_INPUT_SUFFIX)
+}
+
+/// Server-owned metadata persisted next to each REPL input buffer.
+/// Read on `did_open`/`did_change` when no in-memory session exists,
+/// which happens whenever a client framework spawned a fresh LSP
+/// process for the REPL buffer's `root_dir`.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct ReplMeta {
+    pub grammar_uri: tower_lsp::lsp_types::Url,
+}
+
+impl ReplMeta {
+    /// Path of the sibling metadata file for a given REPL input path.
+    /// E.g. `/...d.tsg-repl.tsg` -> `/...d.tsg-repl.json`.
+    #[must_use]
+    pub fn sibling_path(repl_input_path: &std::path::Path) -> PathBuf {
+        let parent = repl_input_path.parent().unwrap_or(std::path::Path::new(""));
+        let name = repl_input_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_default();
+        let stem = name.strip_suffix(REPL_INPUT_SUFFIX).unwrap_or(name);
+        parent.join(format!("{stem}{REPL_META_SUFFIX}"))
+    }
+
+    /// Write `self` to its sibling path next to `repl_input_path`. No-op
+    /// on serialization failure (the metadata is best-effort: a missing
+    /// or corrupt file just degrades to the same "no session" path the
+    /// LSP already handles).
+    pub fn write_for(&self, repl_input_path: &std::path::Path) -> std::io::Result<()> {
+        let json = serde_json::to_string(self).map_err(std::io::Error::other)?;
+        std::fs::write(Self::sibling_path(repl_input_path), json)
+    }
+
+    /// Read the metadata file paired with `repl_input_path`. Returns
+    /// `None` if the file is absent or unparseable.
+    #[must_use]
+    pub fn read_for(repl_input_path: &std::path::Path) -> Option<Self> {
+        let raw = std::fs::read_to_string(Self::sibling_path(repl_input_path)).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
 }
 
 /// Extract the rule name from a REPL input buffer's header line.
