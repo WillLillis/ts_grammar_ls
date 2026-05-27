@@ -162,6 +162,12 @@ impl CacheKey {
 pub enum ReplCompileError {
     /// `rule_name` wasn't found in `grammar.variables`.
     RuleNotFound,
+    /// `rule_name` is configured as the grammar's `word_token`, which
+    /// codegen rejects when used as the start rule. We could null out
+    /// `word_token` to make it compile, but that would change the
+    /// grammar's keyword-resolution semantics - the REPL would no
+    /// longer match the real parser. Refuse with a clear message.
+    WordTokenIsStart,
     /// `tree-sitter generate` reported a pipeline error.
     Codegen(String),
     /// `cc` / `dlopen` failed in the loader step.
@@ -174,6 +180,11 @@ impl std::fmt::Display for ReplCompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RuleNotFound => write!(f, "rule not found in grammar"),
+            Self::WordTokenIsStart => write!(
+                f,
+                "this rule is the grammar's `word` token; codegen rejects \
+                 it as a start rule. Pick a rule that references it instead."
+            ),
             Self::Codegen(msg) => write!(f, "codegen failed: {msg}"),
             Self::Compile(msg) => write!(f, "compile/load failed: {msg}"),
             Self::Spawn(e) => write!(f, "spawn failed: {e}"),
@@ -219,6 +230,15 @@ impl ReplCache {
         grammar: &nativedsl::InputGrammar,
         rule_name: &str,
     ) -> Result<(String, CacheKey), ReplCompileError> {
+        // The grammar's `word_token` (if any) is the rule the lexer
+        // prefers when resolving keyword conflicts. Codegen rejects
+        // making it ALSO the start rule. Surface this up front rather
+        // than silently nulling `word_token`, since that would change
+        // the grammar's tokenization semantics and the REPL would no
+        // longer faithfully reflect the real parser's behavior.
+        if grammar.word_token.as_deref() == Some(rule_name) {
+            return Err(ReplCompileError::WordTokenIsStart);
+        }
         let idx = grammar
             .variables
             .iter()
@@ -363,6 +383,26 @@ mod tests {
         assert!(matches!(
             ReplCache::prepare(&grammar, "no_such_rule"),
             Err(ReplCompileError::RuleNotFound)
+        ));
+    }
+
+    #[test]
+    fn prepare_rejects_word_token_as_start() {
+        // `identifier` is declared as the grammar's `word`. Selecting it
+        // as the REPL start would clash with codegen's "word token can't
+        // also be the start rule" check.
+        let json = r#"{
+            "name":"tiny",
+            "rules":{
+                "source_file":{"type":"SYMBOL","name":"identifier"},
+                "identifier":{"type":"PATTERN","value":"[a-z]+"}
+            },
+            "word":"identifier"
+        }"#;
+        let grammar = parse_grammar(json).unwrap();
+        assert!(matches!(
+            ReplCache::prepare(&grammar, "identifier"),
+            Err(ReplCompileError::WordTokenIsStart)
         ));
     }
 

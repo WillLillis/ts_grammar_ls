@@ -254,6 +254,14 @@ fn spawn_compile(backend: &Backend, repl_uri: Url) {
     };
     let prepared = match crate::repl::ReplCache::prepare(&grammar, &rule_name) {
         Ok(p) => p,
+        Err(crate::repl::ReplCompileError::RuleNotFound) => {
+            // Common transient state while the user is typing the rule
+            // name (e.g. "i", "id", "ide" before settling on
+            // "identifier"). Logging this at warn level produces noisy
+            // bursts; demote to debug.
+            tracing::debug!("repl: rule `{rule_name}` not in grammar");
+            return;
+        }
         Err(e) => {
             tracing::warn!("repl: prepare failed: {e}");
             return;
