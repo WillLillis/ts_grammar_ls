@@ -30,7 +30,14 @@ use tree_sitter_loader::{CompileConfig, Loader};
 /// File-name suffix for the REPL input buffer. Used by `is_repl_uri` to
 /// recognize URIs the LSP should treat as REPL state instead of `.tsg`
 /// source.
-pub const REPL_INPUT_SUFFIX: &str = ".tsg-repl-input.txt";
+///
+/// Ends in `.tsg` (rather than `.txt`) so neovim's default filetype
+/// detection picks up the buffer as `tsg`, which lspconfig setups
+/// register against - without this the client never attaches the LSP
+/// to the REPL buffer and `did_open` never fires. The `.tsg-repl.`
+/// segment is what `is_repl_uri` actually keys on, so the LSP doesn't
+/// confuse REPL buffers with real grammar files.
+pub const REPL_INPUT_SUFFIX: &str = ".tsg-repl.tsg";
 
 /// `true` when `uri` points at a REPL input buffer (created by
 /// `tsg.openRepl`). The naming convention is private to the LSP so

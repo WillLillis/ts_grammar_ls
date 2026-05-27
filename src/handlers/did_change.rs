@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::DidChangeTextDocumentParams;
+use tracing::info;
 
 use crate::diagnostics;
 use crate::server::{Backend, cancel_pending_diagnostics};
@@ -9,6 +10,7 @@ use crate::server::{Backend, cancel_pending_diagnostics};
 pub async fn did_change(backend: &Backend, params: DidChangeTextDocumentParams) {
     let uri = params.text_document.uri;
     let version = params.text_document.version;
+    info!("did_change: {uri}");
 
     // We use FULL sync, so there's exactly one change with the full text.
     let Some(change) = params.content_changes.into_iter().next() else {

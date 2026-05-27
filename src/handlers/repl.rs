@@ -115,7 +115,7 @@ fn repl_input_path(grammar_uri: &Url) -> PathBuf {
     let mut hasher = DefaultHasher::new();
     grammar_uri.as_str().hash(&mut hasher);
     let stem = format!("{:016x}", hasher.finish());
-    repl_dir().join(format!("{stem}.tsg-repl-input.txt"))
+    repl_dir().join(format!("{stem}{}", crate::repl::REPL_INPUT_SUFFIX))
 }
 
 /// `$XDG_CACHE_HOME/ts_grammar_ls/repl/`. Falls back to `/tmp/` if the
@@ -143,11 +143,15 @@ pub fn handle_repl_change(backend: &Backend, repl_uri: &Url, text: &str) {
         // `tsg.openRepl`. No session means we don't know which grammar
         // to compile against; bail. The buffer remains usable for
         // freeform editing.
+        tracing::info!("repl: no session for {repl_uri}; ignoring");
         return;
     };
     let new_rule = match repl::parse_rule_header(text) {
         Some(name) => name.to_owned(),
-        None => return, // Step #39 follow-up: fall back to grammar start.
+        None => {
+            tracing::info!("repl: missing header on {repl_uri}; nothing to do");
+            return; // Step #39 follow-up: fall back to grammar start.
+        }
     };
     // Mutate the rule if needed under the session lock, then drop the
     // map ref before spawning so we don't hold a DashMap guard across an
@@ -158,11 +162,13 @@ pub fn handle_repl_change(backend: &Backend, repl_uri: &Url, text: &str) {
             // Rule unchanged and we already have a compiled language. No
             // re-compile needed; step 5 will use the existing language
             // to re-parse the buffer's input region.
+            tracing::info!("repl: {repl_uri} rule={new_rule} unchanged, language cached");
             return;
         }
-        session.current_rule = new_rule;
+        session.current_rule = new_rule.clone();
     }
     drop(session_ref);
+    tracing::info!("repl: {repl_uri} rule={new_rule}; spawning compile");
     spawn_compile(backend, repl_uri.clone());
 }
 
@@ -229,8 +235,10 @@ fn spawn_compile(backend: &Backend, repl_uri: Url) {
     }
 
     tokio::spawn(async move {
+        tracing::info!("repl: compile start key={}", key.as_str());
         match cache.get_or_compile(key.clone(), json).await {
             Ok(language) => {
+                tracing::info!("repl: compile done key={}", key.as_str());
                 if let Some(session_ref) = sessions.get(&repl_uri) {
                     let mut session = session_ref.lock().unwrap();
                     session.language = Some(language);

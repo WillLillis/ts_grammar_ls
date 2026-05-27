@@ -8,6 +8,13 @@ pub async fn did_save(backend: &Backend, params: DidSaveTextDocumentParams) {
     let uri = params.text_document.uri;
     info!("did_save: {uri}");
 
+    // REPL buffers don't go through the `.tsg` diagnostic pipeline.
+    // Saves on a REPL buffer are no-ops: the parse state lives in
+    // memory on the session and is already refreshed by did_change.
+    if crate::repl::is_repl_uri(&uri) {
+        return;
+    }
+
     let (text, version) = match backend.document_map.get(&uri) {
         Some(doc) => (doc.text.clone(), doc.version),
         None => return,
