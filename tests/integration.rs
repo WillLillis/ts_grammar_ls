@@ -9,8 +9,8 @@ use tower_lsp::lsp_types::notification::{
     DidOpenTextDocument, DidSaveTextDocument, Initialized,
 };
 use tower_lsp::lsp_types::request::{
-    CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting,
-    GotoDefinition, HoverRequest, Initialize, PrepareRenameRequest, References, Rename,
+    CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest, ExecuteCommand,
+    Formatting, GotoDefinition, HoverRequest, Initialize, PrepareRenameRequest, References, Rename,
     SemanticTokensFullRequest,
 };
 use tower_lsp::lsp_types::*;
@@ -2715,6 +2715,79 @@ async fn code_action_not_offered_on_raw_string() {
     let result = code_actions_at(&mut service, test_uri(), range).await;
 
     assert_eq!(result, None);
+}
+
+/// Make a real on-disk grammar URI using `tempfile`. Each test gets a
+/// unique path so concurrent tests don't race on the same hashed REPL
+/// buffer location.
+fn temp_grammar_uri(grammar: &str) -> (tempfile::NamedTempFile, Url) {
+    let mut file = tempfile::Builder::new()
+        .suffix(".tsg")
+        .tempfile()
+        .expect("tempfile");
+    use std::io::Write as _;
+    file.write_all(grammar.as_bytes()).unwrap();
+    let uri = Url::from_file_path(file.path()).unwrap();
+    (file, uri)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn open_repl_creates_input_buffer_with_default_rule() {
+    let grammar = "grammar { language: \"test\" }\nrule program { \"x\" }\nrule expression { \"y\" }\n";
+    let (_keep_alive, uri) = temp_grammar_uri(grammar);
+    let mut service = init(&[(uri.clone(), grammar)]).await;
+
+    // No position - defaults to first rule (`program`).
+    let result = lsp_request::<ExecuteCommand>(
+        &mut service,
+        ExecuteCommandParams {
+            command: "tsg.openRepl".into(),
+            arguments: vec![serde_json::json!({ "uri": uri.to_string() })],
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        },
+    )
+    .await
+    .expect("command returned a value");
+
+    let obj = result.as_object().expect("object response");
+    assert_eq!(obj.get("rule").and_then(|v| v.as_str()), Some("program"));
+    let repl_uri = Url::parse(obj.get("uri").and_then(|v| v.as_str()).expect("uri field"))
+        .expect("valid url");
+    let path = repl_uri.to_file_path().expect("file path");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "# rule: program\n");
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn open_repl_picks_rule_from_cursor_position() {
+    let grammar = "grammar { language: \"test\" }\nrule program { \"x\" }\nrule expression { \"y\" }\n";
+    let (_keep_alive, uri) = temp_grammar_uri(grammar);
+    let mut service = init(&[(uri.clone(), grammar)]).await;
+
+    // Cursor at line 2, col 5 - inside `rule expression { ... }`.
+    let result = lsp_request::<ExecuteCommand>(
+        &mut service,
+        ExecuteCommandParams {
+            command: "tsg.openRepl".into(),
+            arguments: vec![serde_json::json!({
+                "uri": uri.to_string(),
+                "position": { "line": 2, "character": 5 }
+            })],
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        },
+    )
+    .await
+    .expect("command returned a value");
+
+    assert_eq!(
+        result.as_object().and_then(|o| o.get("rule")).and_then(|v| v.as_str()),
+        Some("expression")
+    );
+    let repl_uri = Url::parse(
+        result.as_object().and_then(|o| o.get("uri")).and_then(|v| v.as_str()).unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_file(repl_uri.to_file_path().unwrap()).ok();
 }
 
 #[tokio::test(flavor = "current_thread")]

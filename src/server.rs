@@ -326,4 +326,11 @@ impl LanguageServer for Backend {
     ) -> jsonrpc::Result<Option<PrepareRenameResponse>> {
         Ok(handlers::rename::prepare_rename(self, &params))
     }
+
+    async fn execute_command(
+        &self,
+        params: tower_lsp::lsp_types::ExecuteCommandParams,
+    ) -> jsonrpc::Result<Option<serde_json::Value>> {
+        Ok(handlers::repl::open_repl(self, &params).await)
+    }
 }

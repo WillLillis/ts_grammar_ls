@@ -1,7 +1,7 @@
 use tower_lsp::lsp_types::{
-    CompletionOptions, DidChangeWatchedFilesRegistrationOptions, FileSystemWatcher,
-    GlobPattern, HoverProviderCapability, InitializeParams, InitializeResult, OneOf, Registration,
-    RenameOptions, SemanticTokensFullOptions, SemanticTokensOptions,
+    CompletionOptions, DidChangeWatchedFilesRegistrationOptions, ExecuteCommandOptions,
+    FileSystemWatcher, GlobPattern, HoverProviderCapability, InitializeParams, InitializeResult,
+    OneOf, Registration, RenameOptions, SemanticTokensFullOptions, SemanticTokensOptions,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
     TextDocumentSyncKind, WorkDoneProgressOptions,
 };
@@ -58,6 +58,10 @@ pub async fn initialize(backend: &Backend, params: InitializeParams) -> Initiali
                     ..Default::default()
                 }),
             ),
+            execute_command_provider: Some(ExecuteCommandOptions {
+                commands: vec![crate::handlers::repl::OPEN_REPL_COMMAND.into()],
+                work_done_progress_options: WorkDoneProgressOptions::default(),
+            }),
             ..Default::default()
         },
         server_info: Some(ServerInfo {
