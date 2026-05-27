@@ -50,11 +50,54 @@ pub fn code_action(backend: &Backend, params: &CodeActionParams) -> Option<CodeA
     if let Some(a) = build_inline_expression_macro_action(&analysis, start_offset, uri) {
         actions.push(CodeActionOrCommand::CodeAction(a));
     }
+    if let Some(a) = build_open_repl_action(&analysis, start_offset, uri, params.range.start) {
+        actions.push(CodeActionOrCommand::CodeAction(a));
+    }
     if actions.is_empty() {
         None
     } else {
         Some(actions)
     }
+}
+
+/// "Open REPL for rule `X`" when the cursor sits on the rule's *name*
+/// identifier in its declaration. Narrower than checking `full_span`
+/// (which covers the entire `rule X { ... }` body) so the action is
+/// scoped to "I clicked on the rule name", matching how users actually
+/// invoke it. Surfaces the `tsg.openRepl` workspace command as a
+/// discoverable refactor, rather than requiring the user to type out
+/// `vim.lsp.buf.execute_command(...)`.
+fn build_open_repl_action(
+    analysis: &Module,
+    start_offset: u32,
+    uri: &Url,
+    position: tower_lsp::lsp_types::Position,
+) -> Option<CodeAction> {
+    use crate::document::DefKind;
+    let defs = analysis.definitions.as_ref()?;
+    let def = defs.iter().find(|d| {
+        matches!(d.kind, DefKind::Rule | DefKind::OverrideRule)
+            && d.name_span.start <= start_offset
+            && start_offset < d.name_span.end
+    })?;
+    let arguments = vec![serde_json::json!({
+        "uri": uri.to_string(),
+        "position": { "line": position.line, "character": position.character }
+    })];
+    Some(CodeAction {
+        title: format!("Open REPL for rule `{}`", def.name),
+        kind: Some(CodeActionKind::EMPTY),
+        command: Some(tower_lsp::lsp_types::Command {
+            title: "Open REPL".into(),
+            command: crate::handlers::repl::OPEN_REPL_COMMAND.into(),
+            arguments: Some(arguments),
+        }),
+        edit: None,
+        diagnostics: None,
+        is_preferred: None,
+        disabled: None,
+        data: None,
+    })
 }
 
 fn build_raw_string_action(
