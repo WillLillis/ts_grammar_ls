@@ -44,6 +44,7 @@ async fn init_with_capture(
         },
         ..Default::default()
     };
+    let repl_cache_dir = tempfile::tempdir().expect("repl cache tempdir");
     let (mut service, socket) = LspService::build(|client| Backend {
         client,
         document_map: Arc::new(dashmap::DashMap::new()),
@@ -53,8 +54,15 @@ async fn init_with_capture(
         closed_file_deps: Arc::new(dashmap::DashMap::new()),
         workspace_roots: Arc::default(),
         config: Arc::new(config.into()),
+        repl_cache: Arc::new(ts_grammar_ls::repl::ReplCache::new(
+            repl_cache_dir.path().to_path_buf(),
+        )),
+        repl_sessions: Arc::new(dashmap::DashMap::new()),
     })
     .finish();
+    // Keep the tempdir alive for the service's lifetime by leaking it -
+    // dropping would delete the dir mid-test if any REPL compile lands.
+    std::mem::forget(repl_cache_dir);
 
     // Drain server-to-client messages so internal buffers don't fill up
     // (multiple `publish_diagnostics` calls would otherwise deadlock).

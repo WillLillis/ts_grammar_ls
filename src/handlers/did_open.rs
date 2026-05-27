@@ -12,6 +12,14 @@ pub async fn did_open(backend: &Backend, params: DidOpenTextDocumentParams) {
     let version = params.text_document.version;
     info!("did_open: {uri}");
 
+    // REPL buffers: skip the `.tsg` analysis path, route to the session
+    // handler so it can refresh the rule from the header + trigger a
+    // compile if needed.
+    if crate::repl::is_repl_uri(&uri) {
+        crate::handlers::repl::handle_repl_change(backend, &uri, &text);
+        return;
+    }
+
     // If this URI already had a pending debounced publish, supersede it.
     cancel_pending_diagnostics(&backend.publish_handle, &uri);
 

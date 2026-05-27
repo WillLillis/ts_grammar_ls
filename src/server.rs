@@ -52,6 +52,14 @@ pub struct Backend {
     pub workspace_roots: Arc<RwLock<Vec<PathBuf>>>,
     /// Server configuration (can be updated at runtime).
     pub config: Arc<RwLock<Config>>,
+    /// On-disk + in-memory cache of compiled REPL parsers (one entry per
+    /// (grammar JSON, rule name) pair). Shared across all REPL sessions
+    /// since two sessions for the same grammar+rule can share the load.
+    pub repl_cache: Arc<crate::repl::ReplCache>,
+    /// Per-REPL-buffer state. Keyed by the REPL input URI. Created when
+    /// `tsg.openRepl` fires; the change handler looks the session up by
+    /// URI to know which grammar / rule to compile against.
+    pub repl_sessions: Arc<DashMap<Url, std::sync::Mutex<crate::repl::ReplSession>>>,
 }
 
 /// Abort and discard any pending diagnostic-publish task for `uri`.

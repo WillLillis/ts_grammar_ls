@@ -16,6 +16,13 @@ pub async fn did_change(backend: &Backend, params: DidChangeTextDocumentParams) 
     };
     let text = change.text;
 
+    // REPL buffers don't go through the `.tsg` diagnostic pipeline -
+    // they're treated as parse input, not grammar source.
+    if crate::repl::is_repl_uri(&uri) {
+        crate::handlers::repl::handle_repl_change(backend, &uri, &text);
+        return;
+    }
+
     if let Some(mut doc) = backend.document_map.get_mut(&uri) {
         doc.text.clone_from(&text);
         doc.rope = ropey::Rope::from_str(&text);

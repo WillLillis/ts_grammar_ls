@@ -22,6 +22,7 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::document::DefKind;
+use crate::repl::{self, ReplSession};
 use crate::server::Backend;
 
 pub const OPEN_REPL_COMMAND: &str = "tsg.openRepl";
@@ -48,6 +49,23 @@ pub async fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Opti
     write_initial_input(&repl_path, &rule_name);
 
     let repl_uri = Url::from_file_path(&repl_path).ok()?;
+
+    // Register / refresh the session so subsequent `did_change` events on
+    // this REPL URI know which grammar + rule to compile against.
+    backend.repl_sessions.insert(
+        repl_uri.clone(),
+        std::sync::Mutex::new(ReplSession {
+            grammar_uri: args.uri.clone(),
+            current_rule: rule_name.clone(),
+            last_key: None,
+            language: None,
+        }),
+    );
+
+    // Kick off the first compile asynchronously; the user can already
+    // start typing while the parser is being built. Result lands on the
+    // session.
+    spawn_compile(backend, repl_uri.clone());
     // Fire `window/showDocument` as a detached task. The request awaits
     // a client response, and we don't want our `executeCommand` reply
     // gated on that round trip (the URI is in our return value anyway).
@@ -109,6 +127,121 @@ fn repl_dir() -> PathBuf {
         .map(|s| s.cache_dir())
         .unwrap_or_else(std::env::temp_dir);
     base.join("ts_grammar_ls").join("repl")
+}
+
+/// Called from `did_change`/`did_open` when the touched URI is a REPL
+/// input buffer. Re-parses the header to detect rule changes and
+/// triggers a recompile when the (grammar, rule) fingerprint differs
+/// from the session's last-cached key.
+///
+/// Step 4 of the REPL feature: this just keeps the session's compiled
+/// `Language` fresh. Actually parsing the REPL text + publishing
+/// diagnostics + updating the tree-view buffer lands in step 5.
+pub fn handle_repl_change(backend: &Backend, repl_uri: &Url, text: &str) {
+    let Some(session_ref) = backend.repl_sessions.get(repl_uri) else {
+        // The user opened a REPL file directly without going through
+        // `tsg.openRepl`. No session means we don't know which grammar
+        // to compile against; bail. The buffer remains usable for
+        // freeform editing.
+        return;
+    };
+    let new_rule = match repl::parse_rule_header(text) {
+        Some(name) => name.to_owned(),
+        None => return, // Step #39 follow-up: fall back to grammar start.
+    };
+    // Mutate the rule if needed under the session lock, then drop the
+    // map ref before spawning so we don't hold a DashMap guard across an
+    // await. The compile task takes its own clone of the session URI.
+    {
+        let mut session = session_ref.lock().unwrap();
+        if session.current_rule == new_rule && session.language.is_some() {
+            // Rule unchanged and we already have a compiled language. No
+            // re-compile needed; step 5 will use the existing language
+            // to re-parse the buffer's input region.
+            return;
+        }
+        session.current_rule = new_rule;
+    }
+    drop(session_ref);
+    spawn_compile(backend, repl_uri.clone());
+}
+
+/// Asynchronously prepare + compile a parser for the current state of
+/// the session at `repl_uri`. On success, swaps the loaded `Language`
+/// into the session. Failures are logged at `warn` level; in step 5
+/// they'll become diagnostics on the REPL buffer.
+fn spawn_compile(backend: &Backend, repl_uri: Url) {
+    let cache = std::sync::Arc::clone(&backend.repl_cache);
+    let sessions = std::sync::Arc::clone(&backend.repl_sessions);
+    let grammar_uri;
+    let rule_name;
+    {
+        let Some(session_ref) = sessions.get(&repl_uri) else {
+            return;
+        };
+        let session = session_ref.lock().unwrap();
+        grammar_uri = session.grammar_uri.clone();
+        rule_name = session.current_rule.clone();
+    }
+    let Some(analysis) = backend.get_analysis(&grammar_uri) else {
+        tracing::warn!("repl: no analysis for grammar {grammar_uri}");
+        return;
+    };
+    // The lowered InputGrammar comes from the loader, NOT from the
+    // typecheck step that produces `analysis.module`. We need to
+    // re-run analyze just to grab the pipeline result... actually we
+    // need a different entry point. For now: lift the lowered grammar
+    // from a fresh analyze call against the current grammar text.
+    let Some(grammar_text) = backend
+        .document_map
+        .get(&grammar_uri)
+        .map(|d| d.text.clone())
+    else {
+        return;
+    };
+    let _ = analysis; // suppress unused while we use grammar_text path
+    let Some(outcome) = crate::analysis::analyze(grammar_text, &grammar_uri) else {
+        return;
+    };
+    let Some(Ok(grammar)) = outcome.pipeline else {
+        tracing::warn!("repl: grammar didn't reach lower stage");
+        return;
+    };
+    let prepared = match crate::repl::ReplCache::prepare(&grammar, &rule_name) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("repl: prepare failed: {e}");
+            return;
+        }
+    };
+    let (json, key) = prepared;
+
+    // Compare against last_key. If the session was just recompiled for
+    // the same key (e.g. concurrent did_change events arrived), skip.
+    {
+        let Some(session_ref) = sessions.get(&repl_uri) else {
+            return;
+        };
+        let session = session_ref.lock().unwrap();
+        if session.last_key.as_ref() == Some(&key) && session.language.is_some() {
+            return;
+        }
+    }
+
+    tokio::spawn(async move {
+        match cache.get_or_compile(key.clone(), json).await {
+            Ok(language) => {
+                if let Some(session_ref) = sessions.get(&repl_uri) {
+                    let mut session = session_ref.lock().unwrap();
+                    session.language = Some(language);
+                    session.last_key = Some(key);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("repl: compile failed: {e}");
+            }
+        }
+    });
 }
 
 /// Reset the REPL input to just the header line. The REPL is intended

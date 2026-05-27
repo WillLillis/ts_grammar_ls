@@ -88,6 +88,10 @@ async fn main() {
         closed_file_deps: Arc::new(dashmap::DashMap::new()),
         workspace_roots: Arc::default(),
         config: Arc::default(),
+        repl_cache: Arc::new(ts_grammar_ls::repl::ReplCache::new(
+            ts_grammar_ls::repl::default_cache_root(),
+        )),
+        repl_sessions: Arc::new(dashmap::DashMap::new()),
     })
     .finish();
 

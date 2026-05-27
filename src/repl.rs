@@ -27,6 +27,61 @@ use tree_sitter_generate::nativedsl;
 use tree_sitter_generate::nativedsl::serialize::grammar_to_json;
 use tree_sitter_loader::{CompileConfig, Loader};
 
+/// File-name suffix for the REPL input buffer. Used by `is_repl_uri` to
+/// recognize URIs the LSP should treat as REPL state instead of `.tsg`
+/// source.
+pub const REPL_INPUT_SUFFIX: &str = ".tsg-repl-input.txt";
+
+/// `true` when `uri` points at a REPL input buffer (created by
+/// `tsg.openRepl`). The naming convention is private to the LSP so
+/// false positives on user-owned files are vanishingly unlikely.
+#[must_use]
+pub fn is_repl_uri(uri: &tower_lsp::lsp_types::Url) -> bool {
+    uri.path().ends_with(REPL_INPUT_SUFFIX)
+}
+
+/// Extract the rule name from a REPL input buffer's header line.
+/// Format: `# rule: <name>` on line 0. Returns `None` for buffers
+/// missing the header (e.g. the user blew it away).
+#[must_use]
+pub fn parse_rule_header(text: &str) -> Option<&str> {
+    let first_line = text.lines().next()?;
+    let rest = first_line.strip_prefix("# rule:")?;
+    let name = rest.trim();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Production cache root for REPL artifacts. Matches the path
+/// `handlers::repl::open_repl` writes input buffers to, so the
+/// compiled `.so` and the input buffer live as siblings under
+/// `$XDG_CACHE_HOME/ts_grammar_ls/repl/`.
+#[must_use]
+pub fn default_cache_root() -> PathBuf {
+    use etcetera::BaseStrategy as _;
+    let base = etcetera::choose_base_strategy()
+        .ok()
+        .map(|s| s.cache_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("ts_grammar_ls").join("repl")
+}
+
+/// Per-REPL-buffer state. Tracks which grammar/rule the REPL is bound
+/// to and the most recently compiled `Language` so per-keystroke parses
+/// don't need to re-compile.
+pub struct ReplSession {
+    /// The grammar this REPL parses against.
+    pub grammar_uri: tower_lsp::lsp_types::Url,
+    /// Last rule name parsed from the header. Re-parsed on every change.
+    pub current_rule: String,
+    /// Cache key for the most recently compiled language. `None` if no
+    /// compile has completed yet. Compared against the next attempt's
+    /// key to detect "needs recompile" without re-running the loader.
+    pub last_key: Option<CacheKey>,
+    /// Most recent loaded language. Used to parse REPL input. `None`
+    /// until the first compile completes.
+    pub language: Option<Arc<Language>>,
+}
+
 /// Stable on-disk + in-memory identifier for one compiled REPL parser.
 /// Hex-encoded hash of the post-swap, post-normalize grammar JSON.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -246,6 +301,23 @@ mod tests {
             ReplCache::prepare(&grammar, "no_such_rule"),
             Err(ReplCompileError::RuleNotFound)
         ));
+    }
+
+    #[test]
+    fn parse_rule_header_basic() {
+        assert_eq!(parse_rule_header("# rule: expression\n1 + 2"), Some("expression"));
+        assert_eq!(parse_rule_header("# rule: program"), Some("program"));
+        // Tolerate extra whitespace around the name.
+        assert_eq!(parse_rule_header("# rule:    spaced   \n"), Some("spaced"));
+    }
+
+    #[test]
+    fn parse_rule_header_missing_or_malformed() {
+        assert_eq!(parse_rule_header(""), None);
+        assert_eq!(parse_rule_header("rule: no_pound"), None);
+        assert_eq!(parse_rule_header("# something else"), None);
+        assert_eq!(parse_rule_header("# rule:"), None);
+        assert_eq!(parse_rule_header("# rule:   "), None);
     }
 
     #[test]
