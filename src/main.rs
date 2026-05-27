@@ -73,7 +73,13 @@ async fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "ts_grammar_ls=info".into()),
         )
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        // No ANSI: stderr goes to the client's LSP log file, where escape
+        // sequences just become noise (`\27[2m...`) rather than coloring.
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false),
+        )
         .init();
 
     let stdin = tokio::io::stdin();
