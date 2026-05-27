@@ -45,7 +45,7 @@ pub async fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Opti
 
     let rule_name = resolve_default_rule(backend, &args)?;
     let repl_path = repl_input_path(&args.uri);
-    write_initial_input_if_absent(&repl_path, &rule_name);
+    write_initial_input(&repl_path, &rule_name);
 
     let repl_uri = Url::from_file_path(&repl_path).ok()?;
     // Fire `window/showDocument` as a detached task. The request awaits
@@ -111,12 +111,11 @@ fn repl_dir() -> PathBuf {
     base.join("ts_grammar_ls").join("repl")
 }
 
-/// Write the header line on first open. If the file already exists,
-/// leave it alone so the user's prior session content survives.
-fn write_initial_input_if_absent(path: &std::path::Path, rule_name: &str) {
-    if path.exists() {
-        return;
-    }
+/// Reset the REPL input to just the header line. The REPL is intended
+/// to be ephemeral: prior session content shouldn't bleed across
+/// invocations, since the user's mental model is "this is a scratch
+/// buffer that opens fresh each time".
+fn write_initial_input(path: &std::path::Path, rule_name: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
