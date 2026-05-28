@@ -229,8 +229,17 @@ pub fn handle_repl_change(backend: &Backend, repl_uri: &Url, text: &str) {
             // header.
             session.language.clone().map(|lang| (lang, session.format))
         } else {
+            // Rule changed. Invalidate the cached language + key so
+            // any subsequent did_change events that arrive before the
+            // recompile completes don't take the fast path and parse
+            // with the OLD rule's language - that would silently
+            // produce nonsense (e.g., keywords like `int` matching as
+            // `identifier` because the prior rule's grammar didn't
+            // extract those keywords).
             session.current_rule = new_rule.clone();
-            None // Rule changed -> drop into recompile path below.
+            session.language = None;
+            session.last_key = None;
+            None // Drop into recompile path below.
         }
     };
     drop(session_ref);
