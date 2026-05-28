@@ -509,6 +509,67 @@ mod tests {
         assert_eq!(k1, k2);
     }
 
+    /// Repro for the "(ERROR (comment))" issue: comment is a token-only
+    /// rule, in extras, with a regex pattern that *should* match
+    /// `// this is a comment` cleanly. Run with
+    /// `cargo test --lib --ignored repl::tests::comment_as_start_rule`.
+    #[test]
+    #[ignore = "requires cc; run with --ignored"]
+    fn comment_as_start_rule() {
+        // Minimal grammar mirroring tree-sitter-c's shape, including:
+        //   - comment is in extras AND defined as a token-wrapped rule.
+        //   - comment's regex is escape-aware like the real C grammar.
+        //   - source_file is the original start, references everything.
+        let json = r#"{
+            "name":"tinyc",
+            "rules":{
+                "source_file":{"type":"REPEAT","content":{"type":"SYMBOL","name":"statement"}},
+                "statement":{"type":"SEQ","members":[
+                    {"type":"STRING","value":"x"},
+                    {"type":"STRING","value":";"}
+                ]},
+                "comment":{"type":"TOKEN","content":{"type":"CHOICE","members":[
+                    {"type":"SEQ","members":[
+                        {"type":"STRING","value":"//"},
+                        {"type":"PATTERN","value":"(\\\\+(.|\\r?\\n)|[^\\\\\\n])*"}
+                    ]},
+                    {"type":"SEQ","members":[
+                        {"type":"STRING","value":"/*"},
+                        {"type":"PATTERN","value":"[^*]*\\*+([^/*][^*]*\\*+)*"},
+                        {"type":"STRING","value":"/"}
+                    ]}
+                ]}}
+            },
+            "extras":[
+                {"type":"PATTERN","value":"\\s|\\\\\\r?\\n"},
+                {"type":"SYMBOL","name":"comment"}
+            ]
+        }"#;
+        let grammar = parse_grammar(json).unwrap();
+
+        let (prepared_json, _) =
+            ReplCache::prepare(&grammar, "comment").expect("prepare succeeds");
+
+        // Compile in a temp dir + load.
+        let tmp = tempfile::TempDir::new().unwrap();
+        crate::generate_check::generate_to_dir(tmp.path(), &prepared_json).expect("generate");
+        let language = load_language(&tmp.path().join("src")).expect("loader");
+
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse("// this is a comment", None).unwrap();
+        let sexp = tree.root_node().to_sexp();
+        eprintln!("PARSED SEXP: {sexp}");
+        // The whole input should parse as a `comment` with no error
+        // wrapping. Failure here matches what the user reports in their
+        // REPL session.
+        assert!(
+            !tree.root_node().has_error(),
+            "tree contains an ERROR despite matching the start rule: {sexp}"
+        );
+        assert_eq!(sexp, "(comment)");
+    }
+
     /// End-to-end loader exercise: produce artifacts in-process (skipping
     /// the `generate-check` subprocess hop, which the test binary can't
     /// re-enter), then drive `load_language` + `tree_sitter::Parser`.
