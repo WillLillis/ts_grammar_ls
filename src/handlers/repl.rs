@@ -394,14 +394,18 @@ async fn parse_and_publish(client: tower_lsp::Client, repl_uri: Url, text: Strin
         tracing::warn!("repl: parse returned None");
         return;
     };
+    tracing::info!("repl: parsed {} bytes for {repl_uri}", input.len());
 
     let tree_str = render_sexp(&tree);
     write_tree(&repl_uri, &tree_str);
 
     // Header is line 0; user input starts at line 1. Tree-sitter row
     // numbers count from 0 within the input slice, so add 1 to align
-    // with LSP line numbers in the full buffer.
-    let diagnostics = collect_error_diagnostics(&tree, /* line_offset = */ 1);
+    // with LSP line numbers in the full buffer. Clamp end points to
+    // the buffer's actual line count so neovim's diagnostic handler
+    // doesn't read past EOF (which throws "Index out of bounds").
+    let total_lines = u32::try_from(text.lines().count().max(1)).unwrap_or(u32::MAX);
+    let diagnostics = collect_error_diagnostics(&tree, /* line_offset = */ 1, total_lines);
     client
         .publish_diagnostics(repl_uri, diagnostics, None)
         .await;
@@ -414,59 +418,26 @@ async fn clear_repl_diagnostics(client: &tower_lsp::Client, repl_uri: &Url) {
 }
 
 /// Pretty-print a tree-sitter tree as an indented s-expression.
-/// `to_sexp()` returns it on one line; this version puts each named
-/// node on its own line with two-space indentation, which is much
-/// easier to scan for the user.
+/// `Tree::root_node().to_sexp()` produces the content (field names,
+/// anonymous tokens, ERROR / MISSING markers); `tree_sitter::format_sexp`
+/// re-flows the whitespace into the canonical indented form.
 fn render_sexp(tree: &tree_sitter::Tree) -> String {
-    let mut out = String::new();
-    render_node(tree.root_node(), 0, &mut out);
-    out
-}
-
-fn render_node(node: tree_sitter::Node<'_>, depth: usize, out: &mut String) {
-    use std::fmt::Write as _;
-    let indent = "  ".repeat(depth);
-    if !node.is_named() {
-        // Anonymous tokens render as their kind in quotes, on the same
-        // line as the parent's open paren - skip the indent here so the
-        // walk-and-emit caller can keep them inline.
-        let _ = write!(out, "{indent}\"{}\"", escape_kind(node.kind()));
-        return;
-    }
-    let _ = write!(out, "{indent}({}", node.kind());
-    let child_count = node.named_child_count();
-    if child_count > 0 || node.child_count() > 0 {
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                if child.is_named() {
-                    out.push('\n');
-                    render_node(child, depth + 1, out);
-                }
-            }
-        }
-    }
-    if node.is_missing() {
-        let _ = write!(out, " MISSING");
-    }
-    if node.is_error() {
-        let _ = write!(out, " ERROR");
-    }
-    out.push(')');
-}
-
-fn escape_kind(kind: &str) -> String {
-    kind.replace('\\', "\\\\").replace('"', "\\\"")
+    tree_sitter::format_sexp(&tree.root_node().to_sexp(), 0)
 }
 
 /// Collect a flat list of LSP `Diagnostic`s for every ERROR / MISSING
 /// node in the tree. `line_offset` is added to each diagnostic line so
 /// the ranges land in the full REPL buffer's coordinates (accounting
-/// for the header line).
+/// for the header line). `total_lines` is the line count of the full
+/// REPL buffer; we clamp every end position to it so the client's
+/// diagnostic handler doesn't try to look past the buffer.
 fn collect_error_diagnostics(
     tree: &tree_sitter::Tree,
     line_offset: u32,
+    total_lines: u32,
 ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
     use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+    let max_line = total_lines.saturating_sub(1);
     let mut out = Vec::new();
     let mut cursor = tree.walk();
     loop {
@@ -474,13 +445,15 @@ fn collect_error_diagnostics(
         let (is_err, is_missing) = (node.is_error(), node.is_missing());
         if is_err || is_missing {
             let r = node.range();
+            let start_line = (r.start_point.row as u32 + line_offset).min(max_line);
+            let end_line = (r.end_point.row as u32 + line_offset).min(max_line);
             let range = Range {
                 start: Position {
-                    line: r.start_point.row as u32 + line_offset,
+                    line: start_line,
                     character: r.start_point.column as u32,
                 },
                 end: Position {
-                    line: r.end_point.row as u32 + line_offset,
+                    line: end_line,
                     character: r.end_point.column as u32,
                 },
             };

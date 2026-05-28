@@ -181,12 +181,6 @@ impl CacheKey {
 pub enum ReplCompileError {
     /// `rule_name` wasn't found in `grammar.variables`.
     RuleNotFound,
-    /// `rule_name` is configured as the grammar's `word_token`, which
-    /// codegen rejects when used as the start rule. We could null out
-    /// `word_token` to make it compile, but that would change the
-    /// grammar's keyword-resolution semantics - the REPL would no
-    /// longer match the real parser. Refuse with a clear message.
-    WordTokenIsStart,
     /// `tree-sitter generate` reported a pipeline error.
     Codegen(String),
     /// `cc` / `dlopen` failed in the loader step.
@@ -199,11 +193,6 @@ impl std::fmt::Display for ReplCompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RuleNotFound => write!(f, "rule not found in grammar"),
-            Self::WordTokenIsStart => write!(
-                f,
-                "this rule is the grammar's `word` token; codegen rejects \
-                 it as a start rule. Pick a rule that references it instead."
-            ),
             Self::Codegen(msg) => write!(f, "codegen failed: {msg}"),
             Self::Compile(msg) => write!(f, "compile/load failed: {msg}"),
             Self::Spawn(e) => write!(f, "spawn failed: {e}"),
@@ -249,15 +238,6 @@ impl ReplCache {
         grammar: &nativedsl::InputGrammar,
         rule_name: &str,
     ) -> Result<(String, CacheKey), ReplCompileError> {
-        // The grammar's `word_token` (if any) is the rule the lexer
-        // prefers when resolving keyword conflicts. Codegen rejects
-        // making it ALSO the start rule. Surface this up front rather
-        // than silently nulling `word_token`, since that would change
-        // the grammar's tokenization semantics and the REPL would no
-        // longer faithfully reflect the real parser's behavior.
-        if grammar.word_token.as_deref() == Some(rule_name) {
-            return Err(ReplCompileError::WordTokenIsStart);
-        }
         let idx = grammar
             .variables
             .iter()
@@ -265,6 +245,29 @@ impl ReplCache {
             .ok_or(ReplCompileError::RuleNotFound)?;
         let mut g = grammar.clone();
         g.variables.swap(0, idx);
+
+        // Strip configuration that would conflict with the chosen rule
+        // being the start. The REPL is a "what does this rule match?"
+        // tool; the user picked the rule explicitly and expects it to
+        // parse their input directly, not be eaten as background.
+        //
+        // Specific conflicts:
+        //   - `word_token`: codegen rejects making it also the start.
+        //   - `extras`: a top-level `NamedSymbol(rule_name)` in extras
+        //     means "treat matches of this rule as background between
+        //     tokens" - if rule_name is also start, the parser eats
+        //     all input as extras and leaves nothing to match.
+        //   - `supertype_symbols`: harmless to leave alone (only affects
+        //     node-type inheritance, not parsing), but cheap to strip.
+        if g.word_token.as_deref() == Some(rule_name) {
+            g.word_token = None;
+        }
+        g.extra_symbols.retain(|r| match r {
+            tree_sitter_generate::rules::Rule::NamedSymbol(n) => n != rule_name,
+            _ => true,
+        });
+        g.supertype_symbols.retain(|s| s != rule_name);
+
         let g = g.normalize();
         let json_value = grammar_to_json(&g);
         let json = serde_json::to_string(&json_value)
@@ -406,10 +409,9 @@ mod tests {
     }
 
     #[test]
-    fn prepare_rejects_word_token_as_start() {
-        // `identifier` is declared as the grammar's `word`. Selecting it
-        // as the REPL start would clash with codegen's "word token can't
-        // also be the start rule" check.
+    fn prepare_strips_word_token_when_used_as_start() {
+        // `identifier` is declared as the grammar's `word`. The REPL
+        // strips it so codegen accepts the rule as a start.
         let json = r#"{
             "name":"tiny",
             "rules":{
@@ -419,10 +421,44 @@ mod tests {
             "word":"identifier"
         }"#;
         let grammar = parse_grammar(json).unwrap();
-        assert!(matches!(
-            ReplCache::prepare(&grammar, "identifier"),
-            Err(ReplCompileError::WordTokenIsStart)
-        ));
+        let (prepared_json, _) =
+            ReplCache::prepare(&grammar, "identifier").expect("prepare succeeds");
+        assert!(
+            !prepared_json.contains("\"word\""),
+            "word_token should be stripped: {prepared_json}"
+        );
+    }
+
+    #[test]
+    fn prepare_strips_extras_referencing_start() {
+        // `comment` is in extras. Picking it as start would make the
+        // parser eat all input as extras, leaving the start rule
+        // nothing to match. REPL prepare strips it from extras.
+        let json = r#"{
+            "name":"tiny",
+            "rules":{
+                "source_file":{"type":"SYMBOL","name":"word"},
+                "word":{"type":"PATTERN","value":"[a-z]+"},
+                "comment":{"type":"PATTERN","value":"//[^\\n]*"}
+            },
+            "extras":[
+                {"type":"PATTERN","value":"\\s"},
+                {"type":"SYMBOL","name":"comment"}
+            ]
+        }"#;
+        let grammar = parse_grammar(json).unwrap();
+        let (prepared_json, _) =
+            ReplCache::prepare(&grammar, "comment").expect("prepare succeeds");
+        // Extras still has the whitespace pattern but not the comment
+        // symbol reference.
+        let extras_pos = prepared_json.find("\"extras\"").expect("extras present");
+        let after_extras = &prepared_json[extras_pos..];
+        let extras_end = after_extras.find(']').expect("closing bracket");
+        let extras_slice = &after_extras[..=extras_end];
+        assert!(
+            !extras_slice.contains("\"comment\""),
+            "comment symbol should not be in extras: {extras_slice}"
+        );
     }
 
     #[test]
