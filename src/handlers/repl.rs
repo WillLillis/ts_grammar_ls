@@ -380,10 +380,13 @@ async fn parse_and_publish(client: tower_lsp::Client, repl_uri: Url, text: Strin
         // No newline yet (just `# rule: X` with no trailing newline):
         // empty input. Publish nothing.
         clear_repl_diagnostics(&client, &repl_uri).await;
-        write_tree(&repl_uri, "");
+        update_tree_buffer(&client, &repl_uri, "").await;
         return;
     };
-    let input = &text[header_end + 1..];
+    // Trim trailing whitespace so the user's editor-supplied final
+    // newline doesn't show up as an unparsed-tail ERROR for rules whose
+    // pattern stops at \n (e.g. `comment` in tree-sitter-c).
+    let input = text[header_end + 1..].trim_end();
 
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&language).is_err() {
@@ -397,7 +400,7 @@ async fn parse_and_publish(client: tower_lsp::Client, repl_uri: Url, text: Strin
     tracing::info!("repl: parsed {} bytes for {repl_uri}", input.len());
 
     let tree_str = render_sexp(&tree);
-    write_tree(&repl_uri, &tree_str);
+    update_tree_buffer(&client, &repl_uri, &tree_str).await;
 
     // Header is line 0; user input starts at line 1. Tree-sitter row
     // numbers count from 0 within the input slice, so add 1 to align
@@ -408,6 +411,42 @@ async fn parse_and_publish(client: tower_lsp::Client, repl_uri: Url, text: Strin
     let diagnostics = collect_error_diagnostics(&tree, /* line_offset = */ 1, total_lines);
     client
         .publish_diagnostics(repl_uri, diagnostics, None)
+        .await;
+}
+
+/// Push a fresh parse tree into the side buffer. Writes to disk for
+/// the initial-open case, then sends a `workspace/applyEdit` so any
+/// already-open instance of the buffer in the client refreshes in
+/// place - clients (notably neovim) don't auto-reload on disk change
+/// unless `autoread` + focus events fire, which is unreliable for a
+/// buffer that's been sitting in an unfocused split.
+async fn update_tree_buffer(client: &tower_lsp::Client, repl_uri: &Url, tree_str: &str) {
+    let Ok(repl_path) = repl_uri.to_file_path() else {
+        return;
+    };
+    let tree_path = crate::repl::tree_path_for(&repl_path);
+    let _ = std::fs::write(&tree_path, tree_str);
+    let Ok(tree_uri) = Url::from_file_path(&tree_path) else {
+        return;
+    };
+    let edits = std::collections::HashMap::from([(
+        tree_uri,
+        vec![tower_lsp::lsp_types::TextEdit {
+            // Replace the entire buffer. The client clamps `u32::MAX`
+            // to the actual end-of-buffer line.
+            range: tower_lsp::lsp_types::Range {
+                start: tower_lsp::lsp_types::Position { line: 0, character: 0 },
+                end: tower_lsp::lsp_types::Position { line: u32::MAX, character: 0 },
+            },
+            new_text: tree_str.to_string(),
+        }],
+    )]);
+    let _ = client
+        .apply_edit(tower_lsp::lsp_types::WorkspaceEdit {
+            changes: Some(edits),
+            document_changes: None,
+            change_annotations: None,
+        })
         .await;
 }
 
@@ -482,10 +521,3 @@ fn collect_error_diagnostics(
     }
 }
 
-fn write_tree(repl_uri: &Url, tree_str: &str) {
-    let Ok(repl_path) = repl_uri.to_file_path() else {
-        return;
-    };
-    let tree_path = crate::repl::tree_path_for(&repl_path);
-    let _ = std::fs::write(tree_path, tree_str);
-}
