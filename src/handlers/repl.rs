@@ -376,17 +376,23 @@ fn write_initial_input(path: &std::path::Path, rule_name: &str) {
 ///     as a fresh compile lands (the user changed the rule, waited a
 ///     few seconds, now wants to see the parse).
 async fn parse_and_publish(client: tower_lsp::Client, repl_uri: Url, text: String, language: std::sync::Arc<tree_sitter::Language>) {
-    let Some(header_end) = text.find('\n') else {
-        // No newline yet (just `# rule: X` with no trailing newline):
-        // empty input. Publish nothing.
+    // Trim trailing whitespace so the user's editor-supplied final
+    // newline doesn't show up as an unparsed-tail ERROR for rules whose
+    // pattern stops at `\n` (e.g. `comment` in tree-sitter-c).
+    let input = match text.find('\n') {
+        Some(header_end) => text[header_end + 1..].trim_end(),
+        None => "",
+    };
+
+    // Empty input is a normal state (the user just opened the buffer
+    // and hasn't typed anything yet). Parsing `""` produces an error
+    // tree for most start rules, which would surface as a misleading
+    // "syntax error" diagnostic. Treat empty as "nothing to report".
+    if input.is_empty() {
         clear_repl_diagnostics(&client, &repl_uri).await;
         update_tree_buffer(&client, &repl_uri, "").await;
         return;
-    };
-    // Trim trailing whitespace so the user's editor-supplied final
-    // newline doesn't show up as an unparsed-tail ERROR for rules whose
-    // pattern stops at \n (e.g. `comment` in tree-sitter-c).
-    let input = text[header_end + 1..].trim_end();
+    }
 
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&language).is_err() {
@@ -397,7 +403,6 @@ async fn parse_and_publish(client: tower_lsp::Client, repl_uri: Url, text: Strin
         tracing::warn!("repl: parse returned None");
         return;
     };
-    tracing::info!("repl: parsed {} bytes for {repl_uri}", input.len());
 
     let tree_str = render_sexp(&tree);
     update_tree_buffer(&client, &repl_uri, &tree_str).await;
@@ -409,6 +414,11 @@ async fn parse_and_publish(client: tower_lsp::Client, repl_uri: Url, text: Strin
     // doesn't read past EOF (which throws "Index out of bounds").
     let total_lines = u32::try_from(text.lines().count().max(1)).unwrap_or(u32::MAX);
     let diagnostics = collect_error_diagnostics(&tree, /* line_offset = */ 1, total_lines);
+    tracing::info!(
+        "repl: parsed {} bytes, {} diagnostics for {repl_uri}",
+        input.len(),
+        diagnostics.len()
+    );
     client
         .publish_diagnostics(repl_uri, diagnostics, None)
         .await;
