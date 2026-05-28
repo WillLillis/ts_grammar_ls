@@ -55,6 +55,7 @@ pub async fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Opti
     // requiring shared memory.
     let meta = ReplMeta {
         grammar_uri: args.uri.clone(),
+        format: crate::repl::TreeFormat::default(),
     };
     let _ = meta.write_for(&repl_path);
 
@@ -69,6 +70,7 @@ pub async fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Opti
             current_rule: rule_name.clone(),
             last_key: None,
             language: None,
+            format: meta.format,
         }),
     );
 
@@ -208,6 +210,7 @@ pub fn handle_repl_change(backend: &Backend, repl_uri: &Url, text: &str) {
                 current_rule: new_rule.clone(),
                 last_key: None,
                 language: None,
+                format: meta.format,
             }),
         );
         spawn_compile(backend, repl_uri.clone());
@@ -218,13 +221,13 @@ pub fn handle_repl_change(backend: &Backend, repl_uri: &Url, text: &str) {
     // Mutate the rule if needed under the session lock, then drop the
     // map ref before spawning so we don't hold a DashMap guard across
     // an await. The compile task takes its own clone of the session URI.
-    let cached_language = {
+    let cached = {
         let mut session = session_ref.lock().unwrap();
         if session.current_rule == new_rule {
             // Rule unchanged: just re-parse with the existing language
             // (if any). The user is editing the input region, not the
             // header.
-            session.language.clone()
+            session.language.clone().map(|lang| (lang, session.format))
         } else {
             session.current_rule = new_rule.clone();
             None // Rule changed -> drop into recompile path below.
@@ -232,14 +235,14 @@ pub fn handle_repl_change(backend: &Backend, repl_uri: &Url, text: &str) {
     };
     drop(session_ref);
 
-    if let Some(language) = cached_language {
+    if let Some((language, format)) = cached {
         // Fast path: parse the new text with the existing compiled
         // language and publish results. No subprocess needed.
         let client = backend.client.clone();
         let repl_uri = repl_uri.clone();
         let text = text.to_owned();
         tokio::spawn(async move {
-            parse_and_publish(client, repl_uri, text, language).await;
+            parse_and_publish(client, repl_uri, text, language, format).await;
         });
         return;
     }
@@ -329,6 +332,10 @@ fn spawn_compile(backend: &Backend, repl_uri: Url) {
         match cache.get_or_compile(key.clone(), json).await {
             Ok(language) => {
                 tracing::info!("repl: compile done key={}", key.as_str());
+                let format = sessions
+                    .get(&repl_uri)
+                    .map(|s| s.lock().unwrap().format)
+                    .unwrap_or_default();
                 if let Some(session_ref) = sessions.get(&repl_uri) {
                     let mut session = session_ref.lock().unwrap();
                     session.language = Some(std::sync::Arc::clone(&language));
@@ -341,7 +348,7 @@ fn spawn_compile(backend: &Backend, repl_uri: Url) {
                 if let Ok(repl_path) = repl_uri.to_file_path()
                     && let Ok(text) = std::fs::read_to_string(&repl_path)
                 {
-                    parse_and_publish(client, repl_uri, text, language).await;
+                    parse_and_publish(client, repl_uri, text, language, format).await;
                 }
             }
             Err(e) => {
@@ -375,7 +382,13 @@ fn write_initial_input(path: &std::path::Path, rule_name: &str) {
 ///   - `spawn_compile`'s completion path, so the tree updates as soon
 ///     as a fresh compile lands (the user changed the rule, waited a
 ///     few seconds, now wants to see the parse).
-async fn parse_and_publish(client: tower_lsp::Client, repl_uri: Url, text: String, language: std::sync::Arc<tree_sitter::Language>) {
+async fn parse_and_publish(
+    client: tower_lsp::Client,
+    repl_uri: Url,
+    text: String,
+    language: std::sync::Arc<tree_sitter::Language>,
+    format: crate::repl::TreeFormat,
+) {
     // Trim trailing whitespace so the user's editor-supplied final
     // newline doesn't show up as an unparsed-tail ERROR for rules whose
     // pattern stops at `\n` (e.g. `comment` in tree-sitter-c).
@@ -404,7 +417,7 @@ async fn parse_and_publish(client: tower_lsp::Client, repl_uri: Url, text: Strin
         return;
     };
 
-    let tree_str = render_sexp(&tree);
+    let tree_str = render_tree(format, input.as_bytes(), &tree);
     update_tree_buffer(&client, &repl_uri, &tree_str).await;
 
     // Header is line 0; user input starts at line 1. Tree-sitter row
@@ -413,7 +426,7 @@ async fn parse_and_publish(client: tower_lsp::Client, repl_uri: Url, text: Strin
     // the buffer's actual line count so neovim's diagnostic handler
     // doesn't read past EOF (which throws "Index out of bounds").
     let total_lines = u32::try_from(text.lines().count().max(1)).unwrap_or(u32::MAX);
-    let diagnostics = collect_error_diagnostics(&tree, /* line_offset = */ 1, total_lines);
+    let diagnostics = collect_error_diagnostics(&tree, input, /* line_offset = */ 1, total_lines);
     tracing::info!(
         "repl: parsed {} bytes, {} diagnostics for {repl_uri}",
         input.len(),
@@ -466,12 +479,17 @@ async fn clear_repl_diagnostics(client: &tower_lsp::Client, repl_uri: &Url) {
         .await;
 }
 
-/// Pretty-print a tree-sitter tree as an indented s-expression.
-/// `Tree::root_node().to_sexp()` produces the content (field names,
-/// anonymous tokens, ERROR / MISSING markers); `tree_sitter::format_sexp`
-/// re-flows the whitespace into the canonical indented form.
-fn render_sexp(tree: &tree_sitter::Tree) -> String {
-    tree_sitter::format_sexp(&tree.root_node().to_sexp(), 0)
+/// Render a parse tree for display, picking the format per the
+/// session's `TreeFormat` setting. Sexp is the compact one-line-per-
+/// node structural view; CST is the verbose `tree-sitter parse
+/// --output-cst` format with row ranges + literal text.
+fn render_tree(format: crate::repl::TreeFormat, source: &[u8], tree: &tree_sitter::Tree) -> String {
+    match format {
+        crate::repl::TreeFormat::Sexp => {
+            tree_sitter::format_sexp(&tree.root_node().to_sexp(), 0)
+        }
+        crate::repl::TreeFormat::Cst => crate::cst::render(source, tree),
+    }
 }
 
 /// Collect a flat list of LSP `Diagnostic`s for every ERROR / MISSING
@@ -482,6 +500,7 @@ fn render_sexp(tree: &tree_sitter::Tree) -> String {
 /// diagnostic handler doesn't try to look past the buffer.
 fn collect_error_diagnostics(
     tree: &tree_sitter::Tree,
+    input: &str,
     line_offset: u32,
     total_lines: u32,
 ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
@@ -491,8 +510,14 @@ fn collect_error_diagnostics(
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
-        let (is_err, is_missing) = (node.is_error(), node.is_missing());
-        if is_err || is_missing {
+        // Emit a diagnostic only for the deepest error site - if any
+        // descendant of this node also has an error / missing, the
+        // child's diagnostic is more specific and pointing at this
+        // node would double-report the same problem. For tree-sitter
+        // `/` parsed as `comment` the tree is `(ERROR (MISSING "//"))`
+        // - we want one diagnostic on the MISSING, not two.
+        let descendant_has_error = any_descendant_has_error(node);
+        if (node.is_error() || node.is_missing()) && !descendant_has_error {
             let r = node.range();
             let start_line = (r.start_point.row as u32 + line_offset).min(max_line);
             let end_line = (r.end_point.row as u32 + line_offset).min(max_line);
@@ -506,10 +531,24 @@ fn collect_error_diagnostics(
                     character: r.end_point.column as u32,
                 },
             };
-            let message = if is_missing {
+            // Match tree-sitter core's own diagnostic vocabulary
+            // (`MISSING <symbol>` / `UNEXPECTED '<char>'` in the sexp,
+            // see lib/src/subtree.c). For a MISSING node the symbol
+            // kind is what's expected; for an ERROR with no children
+            // and non-empty byte range the bytes themselves are the
+            // unexpected content; for an ERROR at EOF (no input
+            // consumed) it's an unexpected end-of-input.
+            let message = if node.is_missing() {
                 format!("missing `{}`", node.kind())
             } else {
-                "syntax error".to_string()
+                let span = input
+                    .get(node.start_byte()..node.end_byte())
+                    .unwrap_or("");
+                if span.is_empty() {
+                    "unexpected end of input".to_string()
+                } else {
+                    format!("unexpected `{}`", span.escape_default())
+                }
             };
             out.push(Diagnostic {
                 range,
@@ -527,6 +566,25 @@ fn collect_error_diagnostics(
             if !cursor.goto_parent() {
                 return out;
             }
+        }
+    }
+}
+
+/// `true` if any proper descendant of `node` is an ERROR or MISSING.
+/// `Node::has_error()` includes the node itself, so we walk the
+/// children directly to check "is there an error STRICTLY below?".
+fn any_descendant_has_error(node: tree_sitter::Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return false;
+    }
+    loop {
+        let child = cursor.node();
+        if child.is_error() || child.is_missing() || child.has_error() {
+            return true;
+        }
+        if !cursor.goto_next_sibling() {
+            return false;
         }
     }
 }

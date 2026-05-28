@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod cli;
 pub mod config;
+pub mod cst;
 pub mod diagnostics;
 pub mod document;
 pub mod formatter;

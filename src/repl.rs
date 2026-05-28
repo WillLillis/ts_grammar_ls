@@ -85,9 +85,27 @@ pub fn is_repl_uri(uri: &tower_lsp::lsp_types::Url) -> bool {
 /// Read on `did_open`/`did_change` when no in-memory session exists,
 /// which happens whenever a client framework spawned a fresh LSP
 /// process for the REPL buffer's `root_dir`.
+/// Output format for the tree side buffer. Persisted in the metadata
+/// file so the user's preference survives across LSP restarts.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TreeFormat {
+    /// The structural s-expression. Compact; one line per node when
+    /// pretty-printed. Good for an overview of the parse shape.
+    Sexp,
+    /// The full CST (`tree-sitter parse --output-cst` format) with row
+    /// ranges and literal text for each node. More informative; one
+    /// line per node, vertically larger. The default - matches what
+    /// the upstream `tree-sitter` CLI produces.
+    #[default]
+    Cst,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ReplMeta {
     pub grammar_uri: tower_lsp::lsp_types::Url,
+    #[serde(default)]
+    pub format: TreeFormat,
 }
 
 impl ReplMeta {
@@ -162,6 +180,8 @@ pub struct ReplSession {
     /// Most recent loaded language. Used to parse REPL input. `None`
     /// until the first compile completes.
     pub language: Option<Arc<Language>>,
+    /// User-selected output format for the tree side buffer.
+    pub format: TreeFormat,
 }
 
 /// Stable on-disk + in-memory identifier for one compiled REPL parser.
