@@ -327,7 +327,12 @@ impl ReplCache {
             run_codegen_subprocess(&dir, &grammar_json).await?;
         }
 
-        let language = load_language(&src_dir)?;
+        // Put the compiled `.so` inside this cache entry's own dir so
+        // it can't collide with sibling entries that share the same
+        // grammar `name` (every rule-swap of one grammar carries the
+        // same `name`). See `load_language`'s docstring.
+        let lib_path = dir.join(format!("parser.{}", std::env::consts::DLL_EXTENSION));
+        let language = load_language(&src_dir, lib_path)?;
         let arc = Arc::new(language);
         self.entries.lock().await.insert(key, Arc::clone(&arc));
         Ok(arc)
@@ -372,9 +377,18 @@ async fn run_codegen_subprocess(dir: &Path, grammar_json: &str) -> Result<(), Re
 /// shared library and load it as a `tree_sitter::Language`. Uses the
 /// stock `tree_sitter_loader::Loader`; per-grammar `src/tree_sitter/`
 /// headers in the same dir resolve `#include "tree_sitter/parser.h"`.
-pub fn load_language(src_dir: &Path) -> Result<Language, ReplCompileError> {
+///
+/// `output_path` MUST be unique per (grammar, rule). The loader keys
+/// its on-disk `.so` location by the grammar's `name` field, but
+/// every rule-swapped version of one grammar shares the same name -
+/// so without an explicit `output_path`, all rules' compiles would
+/// overwrite the same `<parser_lib_path>/<name>.so`. Switching
+/// between rules would then load the most-recently-written `.so`
+/// regardless of which rule was requested - silently parsing input
+/// with the wrong rule's grammar.
+pub fn load_language(src_dir: &Path, output_path: PathBuf) -> Result<Language, ReplCompileError> {
     let loader = Loader::new().map_err(|e| ReplCompileError::Compile(e.to_string()))?;
-    let config = CompileConfig::new(src_dir, None, None);
+    let config = CompileConfig::new(src_dir, None, Some(output_path));
     // `load_language_at_path` (vs `_with_name`) reads the `name` field
     // from `<src_dir>/grammar.json`, which is what the generated parser's
     // exported `tree_sitter_<name>` symbol matches.
@@ -553,7 +567,7 @@ mod tests {
         // Compile in a temp dir + load.
         let tmp = tempfile::TempDir::new().unwrap();
         crate::generate_check::generate_to_dir(tmp.path(), &prepared_json).expect("generate");
-        let language = load_language(&tmp.path().join("src")).expect("loader");
+        let language = load_language(&tmp.path().join("src"), tmp.path().join(format!("parser.{}", std::env::consts::DLL_EXTENSION))).expect("loader");
 
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language).unwrap();
@@ -568,6 +582,46 @@ mod tests {
             "tree contains an ERROR despite matching the start rule: {sexp}"
         );
         assert_eq!(sexp, "(comment)");
+    }
+
+    /// Faithful repro using tree-sitter-c's real grammar.tsg. Runs the
+    /// full analyze -> prepare(rule="comment") -> generate -> compile
+    /// -> parse pipeline; ensures the *actual* C grammar's comment rule
+    /// is usable as a REPL start. The minimal repro above stays as a
+    /// fast regression guard; this one catches anything specific to
+    /// the C grammar's shape (conflicts, inline, supertypes,
+    /// word_token, ...). Marked `#[ignore]` (requires cc + the
+    /// grammars/ checkout). Run with
+    /// `cargo test --lib --ignored repl::tests::tree_sitter_c_comment_as_start`.
+    #[test]
+    #[ignore = "requires cc + ~/projects/grammars/tree-sitter-c"]
+    fn tree_sitter_c_comment_as_start() {
+        let grammar_path = std::path::PathBuf::from(
+            "/home/lillis/projects/grammars/tree-sitter-c/grammar.tsg",
+        );
+        let text = std::fs::read_to_string(&grammar_path).expect("read grammar");
+        let uri = tower_lsp::lsp_types::Url::from_file_path(&grammar_path).unwrap();
+        let outcome = crate::analysis::analyze(text, &uri).expect("analyze");
+        let grammar = outcome
+            .pipeline
+            .expect("pipeline ran")
+            .expect("loader succeeded");
+
+        let (prepared_json, _) =
+            ReplCache::prepare(&grammar, "comment").expect("prepare succeeds");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        crate::generate_check::generate_to_dir(tmp.path(), &prepared_json).expect("generate");
+        let language = load_language(&tmp.path().join("src"), tmp.path().join(format!("parser.{}", std::env::consts::DLL_EXTENSION))).expect("loader");
+
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        for input in ["//", "// ", "// h", "// this is a co", "// this is a comment"] {
+            let tree = parser.parse(input, None).unwrap();
+            let sexp = tree.root_node().to_sexp();
+            let has_err = tree.root_node().has_error();
+            eprintln!("input={input:?} has_err={has_err} sexp={sexp}");
+        }
     }
 
     /// End-to-end loader exercise: produce artifacts in-process (skipping
@@ -588,7 +642,7 @@ mod tests {
         }"#;
         let tmp = tempfile::TempDir::new().unwrap();
         crate::generate_check::generate_to_dir(tmp.path(), json).expect("generate");
-        let language = load_language(&tmp.path().join("src")).expect("loader compile + dlopen");
+        let language = load_language(&tmp.path().join("src"), tmp.path().join(format!("parser.{}", std::env::consts::DLL_EXTENSION))).expect("loader compile + dlopen");
 
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language).unwrap();
