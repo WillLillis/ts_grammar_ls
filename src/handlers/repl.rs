@@ -71,6 +71,7 @@ pub async fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Opti
             last_key: None,
             language: None,
             format: meta.format,
+            current_text: None,
         }),
     );
 
@@ -211,6 +212,7 @@ pub fn handle_repl_change(backend: &Backend, repl_uri: &Url, text: &str) {
                 last_key: None,
                 language: None,
                 format: meta.format,
+                current_text: Some(text.to_owned()),
             }),
         );
         spawn_compile(backend, repl_uri.clone());
@@ -223,6 +225,11 @@ pub fn handle_repl_change(backend: &Backend, repl_uri: &Url, text: &str) {
     // an await. The compile task takes its own clone of the session URI.
     let cached = {
         let mut session = session_ref.lock().unwrap();
+        // Stash the live buffer text so the async compile-completion
+        // can re-parse against the current state without going through
+        // disk (neovim doesn't flush to disk until `:w`, so disk reads
+        // would see stale content - typically just the initial header).
+        session.current_text = Some(text.to_owned());
         if session.current_rule == new_rule {
             // Rule unchanged: just re-parse with the existing language
             // (if any). The user is editing the input region, not the
@@ -341,22 +348,24 @@ fn spawn_compile(backend: &Backend, repl_uri: Url) {
         match cache.get_or_compile(key.clone(), json).await {
             Ok(language) => {
                 tracing::info!("repl: compile done key={}", key.as_str());
-                let format = sessions
-                    .get(&repl_uri)
-                    .map(|s| s.lock().unwrap().format)
-                    .unwrap_or_default();
-                if let Some(session_ref) = sessions.get(&repl_uri) {
+                // Stash the freshly compiled language on the session
+                // and grab the live buffer text + format under one
+                // lock (the text comes from did_change, not disk -
+                // neovim doesn't flush until `:w`).
+                let (text, format) = {
+                    let Some(session_ref) = sessions.get(&repl_uri) else {
+                        return;
+                    };
                     let mut session = session_ref.lock().unwrap();
                     session.language = Some(std::sync::Arc::clone(&language));
                     session.last_key = Some(key);
-                }
+                    (session.current_text.clone(), session.format)
+                };
                 // Re-parse the input region with the fresh language so
                 // the tree buffer + diagnostics catch up to the rule
                 // change (the user may have been waiting seconds for
                 // this compile and now expects to see results).
-                if let Ok(repl_path) = repl_uri.to_file_path()
-                    && let Ok(text) = std::fs::read_to_string(&repl_path)
-                {
+                if let Some(text) = text {
                     parse_and_publish(client, repl_uri, text, language, format).await;
                 }
             }

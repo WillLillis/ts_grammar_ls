@@ -182,6 +182,11 @@ pub struct ReplSession {
     pub language: Option<Arc<Language>>,
     /// User-selected output format for the tree side buffer.
     pub format: TreeFormat,
+    /// Live buffer contents as of the most recent `did_change`. The
+    /// disk file is stale until the user saves; we hold the live text
+    /// here so the async compile-completion path can re-parse against
+    /// the current state without going through disk.
+    pub current_text: Option<String>,
 }
 
 /// Stable on-disk + in-memory identifier for one compiled REPL parser.
