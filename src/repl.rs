@@ -54,6 +54,25 @@ pub const REPL_INPUT_SUFFIX: &str = ".tsg-repl.tsg";
 /// has no in-memory state. The sibling file bridges them.
 pub const REPL_META_SUFFIX: &str = ".tsg-repl.json";
 
+/// File-name suffix for the parse-tree side buffer. Plain `.txt` keeps
+/// editors from running our LSP against it (no `.tsg` extension) and
+/// suppresses syntax highlighting; the contents are just a rendered
+/// s-expression refreshed on every keystroke of the input buffer.
+pub const REPL_TREE_SUFFIX: &str = ".tsg-repl-tree.txt";
+
+/// On-disk path of the tree side buffer paired with a given REPL input
+/// path. Mirrors `ReplMeta::sibling_path`'s naming.
+#[must_use]
+pub fn tree_path_for(repl_input_path: &std::path::Path) -> PathBuf {
+    let parent = repl_input_path.parent().unwrap_or(std::path::Path::new(""));
+    let name = repl_input_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default();
+    let stem = name.strip_suffix(REPL_INPUT_SUFFIX).unwrap_or(name);
+    parent.join(format!("{stem}{REPL_TREE_SUFFIX}"))
+}
+
 /// `true` when `uri` points at a REPL input buffer (created by
 /// `tsg.openRepl`). The naming convention is private to the LSP so
 /// false positives on user-owned files are vanishingly unlikely.

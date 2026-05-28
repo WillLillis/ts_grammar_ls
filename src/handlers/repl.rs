@@ -72,19 +72,40 @@ pub async fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Opti
         }),
     );
 
+    // Create the tree side buffer (empty until the first parse lands).
+    // Doing it up front means the editor finds a real file when we ask
+    // it to open one, rather than racing the first compile.
+    let tree_path = crate::repl::tree_path_for(&repl_path);
+    let _ = std::fs::write(&tree_path, "");
+    let tree_uri = Url::from_file_path(&tree_path).ok();
+
     // Kick off the first compile asynchronously; the user can already
     // start typing while the parser is being built. Result lands on the
     // session.
     spawn_compile(backend, repl_uri.clone());
-    // Fire `window/showDocument` as a detached task. The request awaits
-    // a client response, and we don't want our `executeCommand` reply
-    // gated on that round trip (the URI is in our return value anyway).
+
+    // Fire `window/showDocument` as detached tasks for both buffers.
+    // The request awaits a client response, and we don't want our
+    // `executeCommand` reply gated on that round trip. Open the tree
+    // buffer first (so it's the unfocused split) then the input (so
+    // it ends up focused).
     let client = backend.client.clone();
-    let show_uri = repl_uri.clone();
+    let input_uri = repl_uri.clone();
+    let tree_uri_clone = tree_uri.clone();
     tokio::spawn(async move {
+        if let Some(tu) = tree_uri_clone {
+            let _ = client
+                .show_document(ShowDocumentParams {
+                    uri: tu,
+                    external: Some(false),
+                    take_focus: Some(false),
+                    selection: None,
+                })
+                .await;
+        }
         let _ = client
             .show_document(ShowDocumentParams {
-                uri: show_uri,
+                uri: input_uri,
                 external: Some(false),
                 take_focus: Some(true),
                 selection: None,
@@ -92,7 +113,11 @@ pub async fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Opti
             .await;
     });
 
-    Some(serde_json::json!({ "uri": repl_uri.to_string(), "rule": rule_name }))
+    Some(serde_json::json!({
+        "uri": repl_uri.to_string(),
+        "tree_uri": tree_uri.map(|u| u.to_string()),
+        "rule": rule_name,
+    }))
 }
 
 /// Cursor-aware rule pick: if `position` falls inside a `rule X { ... }`
@@ -193,15 +218,32 @@ pub fn handle_repl_change(backend: &Backend, repl_uri: &Url, text: &str) {
     // Mutate the rule if needed under the session lock, then drop the
     // map ref before spawning so we don't hold a DashMap guard across
     // an await. The compile task takes its own clone of the session URI.
-    {
+    let cached_language = {
         let mut session = session_ref.lock().unwrap();
-        if session.current_rule == new_rule && session.language.is_some() {
-            tracing::info!("repl: {repl_uri} rule={new_rule} unchanged, language cached");
-            return;
+        if session.current_rule == new_rule {
+            // Rule unchanged: just re-parse with the existing language
+            // (if any). The user is editing the input region, not the
+            // header.
+            session.language.clone()
+        } else {
+            session.current_rule = new_rule.clone();
+            None // Rule changed -> drop into recompile path below.
         }
-        session.current_rule = new_rule.clone();
-    }
+    };
     drop(session_ref);
+
+    if let Some(language) = cached_language {
+        // Fast path: parse the new text with the existing compiled
+        // language and publish results. No subprocess needed.
+        let client = backend.client.clone();
+        let repl_uri = repl_uri.clone();
+        let text = text.to_owned();
+        tokio::spawn(async move {
+            parse_and_publish(client, repl_uri, text, language).await;
+        });
+        return;
+    }
+
     tracing::info!("repl: {repl_uri} rule={new_rule}; spawning compile");
     spawn_compile(backend, repl_uri.clone());
 }
@@ -281,6 +323,7 @@ fn spawn_compile(backend: &Backend, repl_uri: Url) {
         }
     }
 
+    let client = backend.client.clone();
     tokio::spawn(async move {
         tracing::info!("repl: compile start key={}", key.as_str());
         match cache.get_or_compile(key.clone(), json).await {
@@ -288,8 +331,17 @@ fn spawn_compile(backend: &Backend, repl_uri: Url) {
                 tracing::info!("repl: compile done key={}", key.as_str());
                 if let Some(session_ref) = sessions.get(&repl_uri) {
                     let mut session = session_ref.lock().unwrap();
-                    session.language = Some(language);
+                    session.language = Some(std::sync::Arc::clone(&language));
                     session.last_key = Some(key);
+                }
+                // Re-parse the input region with the fresh language so
+                // the tree buffer + diagnostics catch up to the rule
+                // change (the user may have been waiting seconds for
+                // this compile and now expects to see results).
+                if let Ok(repl_path) = repl_uri.to_file_path()
+                    && let Ok(text) = std::fs::read_to_string(&repl_path)
+                {
+                    parse_and_publish(client, repl_uri, text, language).await;
                 }
             }
             Err(e) => {
@@ -309,4 +361,158 @@ fn write_initial_input(path: &std::path::Path, rule_name: &str) {
     }
     let initial = format!("# rule: {rule_name}\n");
     let _ = std::fs::write(path, initial);
+}
+
+/// Parse the input region (everything after the `# rule:` header) with
+/// the session's cached `Language`. Renders the parse tree as a
+/// pretty-printed s-expression to the sibling tree file, and publishes
+/// LSP diagnostics for any ERROR / MISSING nodes back on the input
+/// buffer.
+///
+/// Triggered from two places:
+///   - `handle_repl_change` after the rule + compile bookkeeping, when
+///     a language is already on the session.
+///   - `spawn_compile`'s completion path, so the tree updates as soon
+///     as a fresh compile lands (the user changed the rule, waited a
+///     few seconds, now wants to see the parse).
+async fn parse_and_publish(client: tower_lsp::Client, repl_uri: Url, text: String, language: std::sync::Arc<tree_sitter::Language>) {
+    let Some(header_end) = text.find('\n') else {
+        // No newline yet (just `# rule: X` with no trailing newline):
+        // empty input. Publish nothing.
+        clear_repl_diagnostics(&client, &repl_uri).await;
+        write_tree(&repl_uri, "");
+        return;
+    };
+    let input = &text[header_end + 1..];
+
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        tracing::warn!("repl: set_language failed");
+        return;
+    }
+    let Some(tree) = parser.parse(input, None) else {
+        tracing::warn!("repl: parse returned None");
+        return;
+    };
+
+    let tree_str = render_sexp(&tree);
+    write_tree(&repl_uri, &tree_str);
+
+    // Header is line 0; user input starts at line 1. Tree-sitter row
+    // numbers count from 0 within the input slice, so add 1 to align
+    // with LSP line numbers in the full buffer.
+    let diagnostics = collect_error_diagnostics(&tree, /* line_offset = */ 1);
+    client
+        .publish_diagnostics(repl_uri, diagnostics, None)
+        .await;
+}
+
+async fn clear_repl_diagnostics(client: &tower_lsp::Client, repl_uri: &Url) {
+    client
+        .publish_diagnostics(repl_uri.clone(), Vec::new(), None)
+        .await;
+}
+
+/// Pretty-print a tree-sitter tree as an indented s-expression.
+/// `to_sexp()` returns it on one line; this version puts each named
+/// node on its own line with two-space indentation, which is much
+/// easier to scan for the user.
+fn render_sexp(tree: &tree_sitter::Tree) -> String {
+    let mut out = String::new();
+    render_node(tree.root_node(), 0, &mut out);
+    out
+}
+
+fn render_node(node: tree_sitter::Node<'_>, depth: usize, out: &mut String) {
+    use std::fmt::Write as _;
+    let indent = "  ".repeat(depth);
+    if !node.is_named() {
+        // Anonymous tokens render as their kind in quotes, on the same
+        // line as the parent's open paren - skip the indent here so the
+        // walk-and-emit caller can keep them inline.
+        let _ = write!(out, "{indent}\"{}\"", escape_kind(node.kind()));
+        return;
+    }
+    let _ = write!(out, "{indent}({}", node.kind());
+    let child_count = node.named_child_count();
+    if child_count > 0 || node.child_count() > 0 {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                if child.is_named() {
+                    out.push('\n');
+                    render_node(child, depth + 1, out);
+                }
+            }
+        }
+    }
+    if node.is_missing() {
+        let _ = write!(out, " MISSING");
+    }
+    if node.is_error() {
+        let _ = write!(out, " ERROR");
+    }
+    out.push(')');
+}
+
+fn escape_kind(kind: &str) -> String {
+    kind.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Collect a flat list of LSP `Diagnostic`s for every ERROR / MISSING
+/// node in the tree. `line_offset` is added to each diagnostic line so
+/// the ranges land in the full REPL buffer's coordinates (accounting
+/// for the header line).
+fn collect_error_diagnostics(
+    tree: &tree_sitter::Tree,
+    line_offset: u32,
+) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+    let mut out = Vec::new();
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        let (is_err, is_missing) = (node.is_error(), node.is_missing());
+        if is_err || is_missing {
+            let r = node.range();
+            let range = Range {
+                start: Position {
+                    line: r.start_point.row as u32 + line_offset,
+                    character: r.start_point.column as u32,
+                },
+                end: Position {
+                    line: r.end_point.row as u32 + line_offset,
+                    character: r.end_point.column as u32,
+                },
+            };
+            let message = if is_missing {
+                format!("missing `{}`", node.kind())
+            } else {
+                "syntax error".to_string()
+            };
+            out.push(Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("ts_grammar_ls (repl)".into()),
+                message,
+                ..Default::default()
+            });
+        }
+        // Only descend if there's an error somewhere below.
+        if node.has_error() && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return out;
+            }
+        }
+    }
+}
+
+fn write_tree(repl_uri: &Url, tree_str: &str) {
+    let Ok(repl_path) = repl_uri.to_file_path() else {
+        return;
+    };
+    let tree_path = crate::repl::tree_path_for(&repl_path);
+    let _ = std::fs::write(tree_path, tree_str);
 }
