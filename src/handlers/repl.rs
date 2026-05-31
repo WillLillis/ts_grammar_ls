@@ -1,31 +1,77 @@
-//! `tsg.openRepl` workspace command.
+//! REPL workspace commands and per-buffer state plumbing.
 //!
-//! Creates (or reuses) a REPL "input" buffer for the user's grammar:
-//! a real file under `$XDG_CACHE_HOME/ts_grammar_ls/repl/` with a stable
-//! per-grammar path. The file's first line is `# rule: <name>` (header);
-//! subsequent lines are the parse input. Compilation and per-keystroke
-//! parsing land in later commits - this step only stands the buffer up
-//! and points the client at it via `window/showDocument`.
+//! The REPL is a scratch input buffer bound to one (grammar, rule) pair.
+//! The buffer's contents are pure parse input; configuration (which
+//! grammar, which rule, output format) lives in the sibling
+//! `<basename>.tsg-repl.json` metadata file and in the in-memory
+//! `ReplSession`. The rule is surfaced to the user via a `CodeLens` on
+//! line 0 (see `handlers::code_lens`) and changed via the
+//! `tsg.setReplRule` command, which prompts through
+//! `window/showMessageRequest`.
 //!
-//! Arguments (single JSON object in `arguments[0]`):
-//! - `uri` (string, required): grammar URI to open a REPL session for.
-//! - `position` ({line, character}, optional): cursor in the grammar. If
-//!   provided and inside a `rule X { ... }` declaration, `X` is chosen
-//!   as the start rule. Otherwise the grammar's first rule is used.
+//! Commands:
+//! - `tsg.openRepl { uri, position? }` - creates (or reuses) the input +
+//!   tree buffers + metadata for a grammar URI, then asks the client to
+//!   open the buffers via `window/showDocument`. If `position` lands
+//!   inside a `rule X { ... }` declaration, `X` is the start rule;
+//!   otherwise the grammar's first rule.
+//! - `tsg.setReplRule { uri }` - changes the start rule for the REPL
+//!   bound to `uri`. Picks the new rule via `window/showMessageRequest`
+//!   populated from the grammar's analysis.
+//!
+//! ## Process model
+//!
+//! `tsg.openRepl` always runs in the LSP process serving the grammar
+//! buffer (call it process A): the action's code-action entry lives on
+//! the grammar URI, which only that process owns. The REPL input +
+//! tree buffers live under `$XDG_CACHE_HOME/ts_grammar_ls/repl/`,
+//! whose `root_dir` is almost always different from the grammar's, so
+//! lspconfig (and similar client frameworks) spawn a separate process
+//! (call it process B) to serve them.
+//!
+//! That means every `did_open` / `did_change` / `codeLens` /
+//! `tsg.setReplRule` on the REPL URI lands in process B, never A. So
+//! all per-buffer state - the `ReplSession`, the in-flight compile,
+//! the cached `Language` - lives in B's `Backend`. Process A only
+//! writes the on-disk `ReplMeta` and the empty buffer files, then asks
+//! the client to open them; it intentionally does NOT register a
+//! session or kick a compile (doing so would race B's own compile on
+//! the shared cache dir).
+//!
+//! Single-process configs (A == B) still work: B's `did_open` handler
+//! reads the metadata file just like any other process would.
 
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
+use rustc_hash::FxHasher;
 use serde::Deserialize;
 use tower_lsp::lsp_types::{
-    ExecuteCommandParams, Position, ShowDocumentParams, Url,
+    ExecuteCommandParams, MessageActionItem, MessageType, Position, ShowDocumentParams, Url,
 };
 
 use crate::document::DefKind;
-use crate::repl::{self, ReplMeta, ReplSession};
+use crate::repl::{ReplMeta, ReplSession};
 use crate::server::Backend;
 
 pub const OPEN_REPL_COMMAND: &str = "tsg.openRepl";
+pub const SET_REPL_RULE_COMMAND: &str = "tsg.setReplRule";
+pub const TOGGLE_REPL_FORMAT_COMMAND: &str = "tsg.toggleReplFormat";
+
+/// Top-level dispatch for `workspace/executeCommand`. Routes to the
+/// per-command handler based on `params.command`; unknown commands
+/// return `None`, which tower-lsp surfaces as an empty result.
+pub async fn execute_command(
+    backend: &Backend,
+    params: &ExecuteCommandParams,
+) -> Option<serde_json::Value> {
+    match params.command.as_str() {
+        OPEN_REPL_COMMAND => open_repl(backend, params),
+        SET_REPL_RULE_COMMAND => set_repl_rule(backend, params).await,
+        TOGGLE_REPL_FORMAT_COMMAND => toggle_repl_format(backend, params).await,
+        _ => None,
+    }
+}
 
 #[derive(Deserialize, Debug)]
 struct OpenReplArgs {
@@ -34,58 +80,37 @@ struct OpenReplArgs {
     position: Option<Position>,
 }
 
-/// Handle `workspace/executeCommand` for `tsg.openRepl`. Returns the
-/// REPL input URI as JSON on success so the client knows where the
-/// session landed; opening the file is also pushed via `window/showDocument`.
-pub async fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Option<serde_json::Value> {
-    if params.command != OPEN_REPL_COMMAND {
-        return None;
-    }
+/// Handle `workspace/executeCommand` for `tsg.openRepl`. Writes the
+/// empty input + tree buffers, persists the `(grammar, rule, format)`
+/// binding to the sibling metadata file, then asks the client to open
+/// both buffers via `window/showDocument`.
+///
+/// Intentionally does NOT register a `ReplSession` or kick a compile:
+/// this handler runs in the grammar's LSP process, which never serves
+/// the REPL buffer's events. The process that DOES serve them (B) will
+/// build its session from the metadata file on `did_open`. Doing
+/// either here would just produce a write-only session and a compile
+/// that races B's compile on the same on-disk cache dir.
+fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Option<serde_json::Value> {
     let args = params.arguments.first()?;
     let args: OpenReplArgs = serde_json::from_value(args.clone()).ok()?;
 
     let rule_name = resolve_default_rule(backend, &args)?;
-    let repl_path = repl_input_path(&args.uri);
-    write_initial_input(&repl_path, &rule_name);
+    let input_uri = repl_input_uri(&args.uri);
+    let tree_uri = input_uri.tree_uri();
+    ensure_input_buffer(&input_uri.input_path());
 
-    // Persist the grammar URI in a sibling metadata file so the LSP
-    // process that eventually receives `did_open` on the REPL buffer
-    // (often a different process than the one running this command -
-    // see `ReplMeta`'s docstring) can rebuild the session without
-    // requiring shared memory.
     let meta = ReplMeta {
-        grammar_uri: args.uri.clone(),
+        grammar_uri: args.uri,
+        current_rule: rule_name.clone(),
         format: crate::repl::TreeFormat::default(),
     };
-    let _ = meta.write_for(&repl_path);
+    meta.write_for(&input_uri);
 
-    let repl_uri = Url::from_file_path(&repl_path).ok()?;
-
-    // Register the session locally too. In single-process setups this
-    // avoids a redundant disk read on the upcoming `did_open`.
-    backend.repl_sessions.insert(
-        repl_uri.clone(),
-        std::sync::Mutex::new(ReplSession {
-            grammar_uri: args.uri.clone(),
-            current_rule: rule_name.clone(),
-            last_key: None,
-            language: None,
-            format: meta.format,
-            current_text: None,
-        }),
-    );
-
-    // Create the tree side buffer (empty until the first parse lands).
-    // Doing it up front means the editor finds a real file when we ask
-    // it to open one, rather than racing the first compile.
-    let tree_path = crate::repl::tree_path_for(&repl_path);
-    let _ = std::fs::write(&tree_path, "");
-    let tree_uri = Url::from_file_path(&tree_path).ok();
-
-    // Kick off the first compile asynchronously; the user can already
-    // start typing while the parser is being built. Result lands on the
-    // session.
-    spawn_compile(backend, repl_uri.clone());
+    // Stand up the tree side buffer (empty until the first parse
+    // lands). Doing it up front means the editor finds a real file
+    // when we ask it to open one, rather than racing the first compile.
+    let _ = std::fs::write(tree_uri.tree_path(), "");
 
     // Fire `window/showDocument` as detached tasks for both buffers.
     // The request awaits a client response, and we don't want our
@@ -93,22 +118,20 @@ pub async fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Opti
     // buffer first (so it's the unfocused split) then the input (so
     // it ends up focused).
     let client = backend.client.clone();
-    let input_uri = repl_uri.clone();
-    let tree_uri_clone = tree_uri.clone();
+    let input_url = input_uri.as_url().clone();
+    let tree_url = tree_uri.as_url().clone();
     tokio::spawn(async move {
-        if let Some(tu) = tree_uri_clone {
-            let _ = client
-                .show_document(ShowDocumentParams {
-                    uri: tu,
-                    external: Some(false),
-                    take_focus: Some(false),
-                    selection: None,
-                })
-                .await;
-        }
         let _ = client
             .show_document(ShowDocumentParams {
-                uri: input_uri,
+                uri: tree_url,
+                external: Some(false),
+                take_focus: Some(false),
+                selection: None,
+            })
+            .await;
+        let _ = client
+            .show_document(ShowDocumentParams {
+                uri: input_url,
                 external: Some(false),
                 take_focus: Some(true),
                 selection: None,
@@ -117,8 +140,8 @@ pub async fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Opti
     });
 
     Some(serde_json::json!({
-        "uri": repl_uri.to_string(),
-        "tree_uri": tree_uri.map(|u| u.to_string()),
+        "uri": input_uri.as_url().to_string(),
+        "tree_uri": tree_uri.as_url().to_string(),
         "rule": rule_name,
     }))
 }
@@ -146,14 +169,19 @@ fn resolve_default_rule(backend: &Backend, args: &OpenReplArgs) -> Option<String
         .map(|d| d.name.clone())
 }
 
-/// Stable on-disk path for a grammar's REPL input buffer. Hash of the
+/// Stable input-buffer URI for a given grammar URI. Hashing the
 /// grammar URI keeps the path deterministic across LSP restarts, so
 /// reopening the REPL for the same grammar reuses the same buffer.
-fn repl_input_path(grammar_uri: &Url) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
+fn repl_input_uri(grammar_uri: &Url) -> crate::repl::ReplInputUri {
+    let mut hasher = FxHasher::default();
     grammar_uri.as_str().hash(&mut hasher);
-    let stem = format!("{:016x}", hasher.finish());
-    repl_dir().join(format!("{stem}{}", crate::repl::REPL_INPUT_SUFFIX))
+    let path = repl_dir().join(format!(
+        "{:016x}{}",
+        hasher.finish(),
+        crate::repl::REPL_INPUT_SUFFIX
+    ));
+    let url = Url::from_file_path(&path).expect("repl_dir is absolute");
+    crate::repl::ReplInputUri::try_from_uri(&url).expect("path ends with REPL_INPUT_SUFFIX")
 }
 
 /// `$XDG_CACHE_HOME/ts_grammar_ls/repl/`. Falls back to `/tmp/` if the
@@ -167,131 +195,274 @@ fn repl_dir() -> PathBuf {
     base.join("ts_grammar_ls").join("repl")
 }
 
-/// Called from `did_change`/`did_open` when the touched URI is a REPL
-/// input buffer. Re-parses the header to detect rule changes and
-/// triggers a recompile when the (grammar, rule) fingerprint differs
-/// from the session's last-cached key.
+/// Ensure a `ReplSession` exists in `backend.repl_sessions` for
+/// `repl_uri`, reconstructing it from the sibling metadata file if
+/// this process hasn't touched the URI yet (the typical first-event
+/// path - whoever ran `tsg.openRepl` was a different process, so our
+/// session map is empty).
 ///
-/// Step 4 of the REPL feature: this just keeps the session's compiled
-/// `Language` fresh. Actually parsing the REPL text + publishing
-/// diagnostics + updating the tree-view buffer lands in step 5.
-pub fn handle_repl_change(backend: &Backend, repl_uri: &Url, text: &str) {
-    let new_rule = match repl::parse_rule_header(text) {
-        Some(name) => name.to_owned(),
-        None => {
-            tracing::info!("repl: missing header on {repl_uri}; nothing to do");
-            return; // Step #39 follow-up: fall back to grammar start.
-        }
-    };
-
-    // Locate / rebuild the session. If this LSP process is fresh (e.g.
-    // a second instance spawned by lspconfig for the REPL buffer's
-    // root_dir), the in-memory map is empty. Reconstruct the session
-    // by reading the sibling metadata file written by `tsg.openRepl`.
-    if !backend.repl_sessions.contains_key(repl_uri) {
-        let Ok(repl_path) = repl_uri.to_file_path() else {
-            tracing::info!("repl: non-file repl uri {repl_uri}");
-            return;
-        };
-        let Some(meta) = ReplMeta::read_for(&repl_path) else {
-            tracing::info!(
-                "repl: no sibling metadata for {repl_uri}; user opened a REPL buffer \
-                 without going through tsg.openRepl"
-            );
-            return;
-        };
+/// Returns `true` if a session is present after the call. `false`
+/// means there's no metadata file either (e.g., the user manually
+/// opened a `*.tsg-repl.tsg` file the LSP never wrote), so callers
+/// should bail.
+fn ensure_session(backend: &Backend, input_uri: &crate::repl::ReplInputUri) -> bool {
+    if backend.repl_sessions.contains_key(input_uri) {
+        return true;
+    }
+    let Some(meta) = ReplMeta::read_for(input_uri) else {
         tracing::info!(
-            "repl: rebuilding session for {repl_uri} (grammar={})",
-            meta.grammar_uri
+            "repl: no sibling metadata for {}; user opened a REPL buffer \
+             without going through tsg.openRepl",
+            input_uri.as_url(),
         );
-        backend.repl_sessions.insert(
-            repl_uri.clone(),
-            std::sync::Mutex::new(ReplSession {
-                grammar_uri: meta.grammar_uri,
-                current_rule: new_rule.clone(),
-                last_key: None,
-                language: None,
-                format: meta.format,
-                current_text: Some(text.to_owned()),
-            }),
-        );
-        spawn_compile(backend, repl_uri.clone());
+        return false;
+    };
+    tracing::info!(
+        "repl: rebuilding session for {} (grammar={}, rule={})",
+        input_uri.as_url(),
+        meta.grammar_uri,
+        meta.current_rule,
+    );
+    backend.repl_sessions.insert(
+        input_uri.clone(),
+        std::sync::Mutex::new(ReplSession {
+            grammar_uri: meta.grammar_uri,
+            current_rule: meta.current_rule,
+            last_key: None,
+            language: None,
+            format: meta.format,
+            current_text: None,
+            last_tree_text: String::new(),
+            last_tree_spans: Vec::new(),
+        }),
+    );
+    true
+}
+
+/// Called from `did_change`/`did_open` when the touched URI is a REPL
+/// input buffer. Caches the live buffer text on the session and either
+/// re-parses with the cached `Language` (fast path) or kicks a compile
+/// if no language is loaded yet.
+///
+/// Rule binding never changes here - it's owned by the session +
+/// metadata file and only mutated via `tsg.setReplRule`. The buffer
+/// text is pure parse input.
+pub fn handle_repl_change(backend: &Backend, input_uri: &crate::repl::ReplInputUri, text: &str) {
+    if !ensure_session(backend, input_uri) {
         return;
     }
 
-    let session_ref = backend.repl_sessions.get(repl_uri).expect("checked above");
-    // Mutate the rule if needed under the session lock, then drop the
-    // map ref before spawning so we don't hold a DashMap guard across
-    // an await. The compile task takes its own clone of the session URI.
+    let session_ref = backend.repl_sessions.get(input_uri).expect("ensured above");
+    // Cache the live buffer text and grab the current language under
+    // the lock; drop the DashMap ref before spawning so we don't hold
+    // a guard across an await.
     let cached = {
         let mut session = session_ref.lock().unwrap();
         // Stash the live buffer text so the async compile-completion
-        // can re-parse against the current state without going through
-        // disk (neovim doesn't flush to disk until `:w`, so disk reads
-        // would see stale content - typically just the initial header).
+        // path can re-parse against the current state without going
+        // through disk (neovim doesn't flush to disk until `:w`).
         session.current_text = Some(text.to_owned());
-        if session.current_rule == new_rule {
-            // Rule unchanged: just re-parse with the existing language
-            // (if any). The user is editing the input region, not the
-            // header.
-            session.language.clone().map(|lang| (lang, session.format))
-        } else {
-            // Rule changed. Invalidate the cached language + key so
-            // any subsequent did_change events that arrive before the
-            // recompile completes don't take the fast path and parse
-            // with the OLD rule's language - that would silently
-            // produce nonsense (e.g., keywords like `int` matching as
-            // `identifier` because the prior rule's grammar didn't
-            // extract those keywords).
-            session.current_rule = new_rule.clone();
-            session.language = None;
-            session.last_key = None;
-            None // Drop into recompile path below.
-        }
+        session.language.clone().map(|lang| (lang, session.format))
     };
     drop(session_ref);
 
     if let Some((language, format)) = cached {
-        // Fast path: parse the new text with the existing compiled
-        // language and publish results. No subprocess needed.
         let client = backend.client.clone();
-        let repl_uri = repl_uri.clone();
+        let sessions = std::sync::Arc::clone(&backend.repl_sessions);
+        let input_uri = input_uri.clone();
         let text = text.to_owned();
         tokio::spawn(async move {
-            parse_and_publish(client, repl_uri, text, language, format).await;
+            parse_and_publish(sessions, client, input_uri, text, language, format).await;
         });
         return;
     }
 
-    tracing::info!("repl: {repl_uri} rule={new_rule}; spawning compile");
-    spawn_compile(backend, repl_uri.clone());
+    tracing::info!(
+        "repl: {} no language cached; spawning compile",
+        input_uri.as_url()
+    );
+    spawn_compile(backend, input_uri.clone());
+}
+
+/// Handle `workspace/executeCommand` for `tsg.setReplRule`. Picks a new
+/// rule via `window/showMessageRequest` populated from the grammar's
+/// analysis, then updates the session + metadata file, kicks a
+/// recompile, and asks the client to refresh code lenses so the
+/// displayed rule name updates.
+async fn set_repl_rule(
+    backend: &Backend,
+    params: &ExecuteCommandParams,
+) -> Option<serde_json::Value> {
+    #[derive(Deserialize)]
+    struct Args {
+        uri: Url,
+    }
+    let args = params.arguments.first()?;
+    let Args { uri } = serde_json::from_value(args.clone()).ok()?;
+    let input_uri = crate::repl::ReplInputUri::try_from_uri(&uri)?;
+
+    // Make sure the session exists locally - if the user opened the
+    // REPL and immediately clicked the lens without typing, no
+    // did_change has fired yet and our map is empty. Without this,
+    // the post-pick spawn_compile would be a no-op (it bails on
+    // missing session) and the new rule wouldn't take effect until
+    // the next keystroke.
+    if !ensure_session(backend, &input_uri) {
+        return None;
+    }
+    let (grammar_uri, current_rule) = {
+        let s = backend.repl_sessions.get(&input_uri)?;
+        let g = s.lock().unwrap();
+        (g.grammar_uri.clone(), g.current_rule.clone())
+    };
+
+    // List the grammar's rules. We need the live analysis (which may
+    // include rules contributed by inherits/imports), not just whatever
+    // is in the buffer.
+    let analysis = backend.analysis_for_uri(&grammar_uri)?;
+    let defs = analysis.definitions.as_ref()?;
+    let rules: Vec<String> = defs
+        .iter()
+        .filter(|d| matches!(d.kind, DefKind::Rule | DefKind::OverrideRule))
+        .map(|d| d.name.clone())
+        .collect();
+    if rules.is_empty() {
+        return None;
+    }
+
+    let actions: Vec<MessageActionItem> = rules
+        .into_iter()
+        .map(|r| MessageActionItem {
+            title: r,
+            properties: Default::default(),
+        })
+        .collect();
+    let prompt = format!("REPL rule (current: {current_rule})");
+    let picked = backend
+        .client
+        .show_message_request(MessageType::INFO, prompt, Some(actions))
+        .await
+        .ok()
+        .flatten()?;
+    let new_rule = picked.title;
+    if new_rule == current_rule {
+        return None;
+    }
+
+    // Update session under lock; drop guard before any awaits.
+    {
+        let s = backend.repl_sessions.get(&input_uri)?;
+        let mut g = s.lock().unwrap();
+        g.current_rule = new_rule.clone();
+        g.language = None;
+        g.last_key = None;
+    }
+
+    // Persist to disk so a future LSP process / restart picks up the
+    // new rule.
+    if let Some(mut meta) = ReplMeta::read_for(&input_uri) {
+        meta.current_rule = new_rule.clone();
+        meta.write_for(&input_uri);
+    }
+
+    spawn_compile(backend, input_uri);
+    // Best-effort: ask the client to refresh code lenses so the title
+    // ("Rule: <name>") updates immediately. Clients that don't support
+    // refresh just leave the stale lens until the next natural refresh.
+    let _ = backend.client.code_lens_refresh().await;
+
+    Some(serde_json::json!({ "rule": new_rule }))
+}
+
+/// Handle `workspace/executeCommand` for `tsg.toggleReplFormat`. Flips
+/// the session's `format` between `Cst` and `Sexp`, persists to the
+/// metadata file, re-renders the tree using the cached `Language` (no
+/// recompile - format choice doesn't affect parsing), and asks the
+/// client to refresh the code lenses so the `Tree:` lens title
+/// updates.
+///
+/// Accepts the REPL input URI in `arguments[0].uri`.
+async fn toggle_repl_format(
+    backend: &Backend,
+    params: &ExecuteCommandParams,
+) -> Option<serde_json::Value> {
+    #[derive(Deserialize)]
+    struct Args {
+        uri: Url,
+    }
+    let args = params.arguments.first()?;
+    let Args { uri } = serde_json::from_value(args.clone()).ok()?;
+    let input_uri = crate::repl::ReplInputUri::try_from_uri(&uri)?;
+
+    if !ensure_session(backend, &input_uri) {
+        return None;
+    }
+
+    // Flip the format and grab a snapshot of the bits we need for the
+    // re-render outside the lock.
+    let (new_format, language, current_text) = {
+        let s = backend.repl_sessions.get(&input_uri)?;
+        let mut g = s.lock().unwrap();
+        g.format = match g.format {
+            crate::repl::TreeFormat::Cst => crate::repl::TreeFormat::Sexp,
+            crate::repl::TreeFormat::Sexp => crate::repl::TreeFormat::Cst,
+        };
+        (g.format, g.language.clone(), g.current_text.clone())
+    };
+
+    // Persist so the choice survives an LSP restart.
+    if let Some(mut meta) = ReplMeta::read_for(&input_uri) {
+        meta.format = new_format;
+        meta.write_for(&input_uri);
+    }
+
+    // Re-render whatever the user has parsed so far in the new format.
+    // If no language/text yet (REPL just opened, nothing typed), the
+    // next did_change will pick up the new format naturally.
+    if let (Some(lang), Some(text)) = (language, current_text) {
+        let sessions = std::sync::Arc::clone(&backend.repl_sessions);
+        let client = backend.client.clone();
+        let uri = input_uri.clone();
+        tokio::spawn(async move {
+            parse_and_publish(sessions, client, uri, text, lang, new_format).await;
+        });
+    }
+
+    let _ = backend.client.code_lens_refresh().await;
+    Some(serde_json::json!({
+        "format": match new_format {
+            crate::repl::TreeFormat::Cst => "cst",
+            crate::repl::TreeFormat::Sexp => "sexp",
+        }
+    }))
 }
 
 /// Asynchronously prepare + compile a parser for the current state of
 /// the session at `repl_uri`. On success, swaps the loaded `Language`
-/// into the session. Failures are logged at `warn` level; in step 5
-/// they'll become diagnostics on the REPL buffer.
-fn spawn_compile(backend: &Backend, repl_uri: Url) {
+/// into the session and re-parses the cached live text.
+///
+/// Callers must run `ensure_session` first - we early-return silently
+/// if the session is missing rather than reconstruct it here, since
+/// reconstruction is a sync I/O step and `spawn_compile` is only
+/// supposed to dispatch async work.
+fn spawn_compile(backend: &Backend, input_uri: crate::repl::ReplInputUri) {
     let cache = std::sync::Arc::clone(&backend.repl_cache);
     let sessions = std::sync::Arc::clone(&backend.repl_sessions);
     let grammar_uri;
     let rule_name;
     {
-        let Some(session_ref) = sessions.get(&repl_uri) else {
+        let Some(session_ref) = sessions.get(&input_uri) else {
             return;
         };
         let session = session_ref.lock().unwrap();
         grammar_uri = session.grammar_uri.clone();
         rule_name = session.current_rule.clone();
     }
-    // The lowered InputGrammar comes from the loader, so we need to
-    // re-run `analyze` against the current grammar text. Source for
-    // that text:
-    //   - in-memory `document_map` when this process has the grammar
-    //     buffer open (single-process setup),
-    //   - on-disk file otherwise (the common multi-process case where
-    //     the REPL buffer lives under a different `root_dir` than the
-    //     grammar and got spawned its own LSP instance).
+    // Re-run `analyze` against the current grammar text. The grammar
+    // buffer is normally owned by a different LSP process (see the
+    // module docstring), so the on-disk read is the usual path; the
+    // `document_map` hit only fires in single-process configs where
+    // the same instance happens to serve both buffers.
     let grammar_text = backend
         .document_map
         .get(&grammar_uri)
@@ -313,14 +484,14 @@ fn spawn_compile(backend: &Backend, repl_uri: Url) {
         tracing::warn!("repl: grammar didn't reach lower stage");
         return;
     };
-    let prepared = match crate::repl::ReplCache::prepare(&grammar, &rule_name) {
+    let prepared = match crate::repl::ReplCache::prepare(grammar, &rule_name) {
         Ok(p) => p,
-        Err(crate::repl::ReplCompileError::RuleNotFound) => {
+        Err(crate::repl::ReplCompileError::RuleNotFound(name)) => {
             // Common transient state while the user is typing the rule
             // name (e.g. "i", "id", "ide" before settling on
             // "identifier"). Logging this at warn level produces noisy
             // bursts; demote to debug.
-            tracing::debug!("repl: rule `{rule_name}` not in grammar");
+            tracing::debug!(rule = %name, "repl: rule not in grammar");
             return;
         }
         Err(e) => {
@@ -333,7 +504,7 @@ fn spawn_compile(backend: &Backend, repl_uri: Url) {
     // Compare against last_key. If the session was just recompiled for
     // the same key (e.g. concurrent did_change events arrived), skip.
     {
-        let Some(session_ref) = sessions.get(&repl_uri) else {
+        let Some(session_ref) = sessions.get(&input_uri) else {
             return;
         };
         let session = session_ref.lock().unwrap();
@@ -344,16 +515,16 @@ fn spawn_compile(backend: &Backend, repl_uri: Url) {
 
     let client = backend.client.clone();
     tokio::spawn(async move {
-        tracing::info!("repl: compile start key={}", key.as_str());
+        tracing::info!("repl: compile start key={key}");
         match cache.get_or_compile(key.clone(), json).await {
             Ok(language) => {
-                tracing::info!("repl: compile done key={}", key.as_str());
+                tracing::info!("repl: compile done key={key}");
                 // Stash the freshly compiled language on the session
                 // and grab the live buffer text + format under one
                 // lock (the text comes from did_change, not disk -
                 // neovim doesn't flush until `:w`).
                 let (text, format) = {
-                    let Some(session_ref) = sessions.get(&repl_uri) else {
+                    let Some(session_ref) = sessions.get(&input_uri) else {
                         return;
                     };
                     let mut session = session_ref.lock().unwrap();
@@ -366,7 +537,7 @@ fn spawn_compile(backend: &Backend, repl_uri: Url) {
                 // change (the user may have been waiting seconds for
                 // this compile and now expects to see results).
                 if let Some(text) = text {
-                    parse_and_publish(client, repl_uri, text, language, format).await;
+                    parse_and_publish(sessions, client, input_uri, text, language, format).await;
                 }
             }
             Err(e) => {
@@ -376,33 +547,33 @@ fn spawn_compile(backend: &Backend, repl_uri: Url) {
     });
 }
 
-/// Reset the REPL input to just the header line. The REPL is intended
-/// to be ephemeral: prior session content shouldn't bleed across
+/// Stand up an empty input buffer at `path`. The REPL is intended to
+/// be ephemeral: prior session content shouldn't bleed across
 /// invocations, since the user's mental model is "this is a scratch
 /// buffer that opens fresh each time".
-fn write_initial_input(path: &std::path::Path, rule_name: &str) {
+fn ensure_input_buffer(path: &std::path::Path) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let initial = format!("# rule: {rule_name}\n");
-    let _ = std::fs::write(path, initial);
+    let _ = std::fs::write(path, "");
 }
 
-/// Parse the input region (everything after the `# rule:` header) with
-/// the session's cached `Language`. Renders the parse tree as a
-/// pretty-printed s-expression to the sibling tree file, and publishes
-/// LSP diagnostics for any ERROR / MISSING nodes back on the input
-/// buffer.
+/// Parse the buffer text with the session's cached `Language`. Renders
+/// the parse tree to the sibling tree file and publishes LSP
+/// diagnostics for any ERROR / MISSING nodes.
 ///
 /// Triggered from two places:
-///   - `handle_repl_change` after the rule + compile bookkeeping, when
-///     a language is already on the session.
+///   - `handle_repl_change` after the bookkeeping, when a language is
+///     already on the session.
 ///   - `spawn_compile`'s completion path, so the tree updates as soon
 ///     as a fresh compile lands (the user changed the rule, waited a
 ///     few seconds, now wants to see the parse).
 async fn parse_and_publish(
+    backend_sessions: std::sync::Arc<
+        dashmap::DashMap<crate::repl::ReplInputUri, std::sync::Mutex<ReplSession>>,
+    >,
     client: tower_lsp::Client,
-    repl_uri: Url,
+    input_uri: crate::repl::ReplInputUri,
     text: String,
     language: std::sync::Arc<tree_sitter::Language>,
     format: crate::repl::TreeFormat,
@@ -410,18 +581,16 @@ async fn parse_and_publish(
     // Trim trailing whitespace so the user's editor-supplied final
     // newline doesn't show up as an unparsed-tail ERROR for rules whose
     // pattern stops at `\n` (e.g. `comment` in tree-sitter-c).
-    let input = match text.find('\n') {
-        Some(header_end) => text[header_end + 1..].trim_end(),
-        None => "",
-    };
+    let input = text.trim_end();
 
     // Empty input is a normal state (the user just opened the buffer
     // and hasn't typed anything yet). Parsing `""` produces an error
     // tree for most start rules, which would surface as a misleading
     // "syntax error" diagnostic. Treat empty as "nothing to report".
     if input.is_empty() {
-        clear_repl_diagnostics(&client, &repl_uri).await;
-        update_tree_buffer(&client, &repl_uri, "").await;
+        stash_tree_render(&backend_sessions, &input_uri, String::new(), Vec::new());
+        clear_repl_diagnostics(&client, &input_uri).await;
+        update_tree_buffer(&client, &input_uri, "").await;
         return;
     }
 
@@ -435,49 +604,55 @@ async fn parse_and_publish(
         return;
     };
 
-    let tree_str = render_tree(format, input.as_bytes(), &tree);
-    update_tree_buffer(&client, &repl_uri, &tree_str).await;
+    let (tree_str, tree_spans) = render_tree(format, input.as_bytes(), &tree);
+    stash_tree_render(&backend_sessions, &input_uri, tree_str.clone(), tree_spans);
+    update_tree_buffer(&client, &input_uri, &tree_str).await;
+    // The stashed spans drive `textDocument/semanticTokens/full` for
+    // the tree buffer. Most clients refetch on buffer-change events
+    // (driven by the applyEdit above), but a server-side refresh
+    // request is the explicit signal and works across clients.
+    let _ = client.semantic_tokens_refresh().await;
 
-    // Header is line 0; user input starts at line 1. Tree-sitter row
-    // numbers count from 0 within the input slice, so add 1 to align
-    // with LSP line numbers in the full buffer. Clamp end points to
-    // the buffer's actual line count so neovim's diagnostic handler
-    // doesn't read past EOF (which throws "Index out of bounds").
+    // Clamp end positions to the buffer's actual line count so neovim's
+    // diagnostic handler doesn't read past EOF.
     let total_lines = u32::try_from(text.lines().count().max(1)).unwrap_or(u32::MAX);
-    let diagnostics = collect_error_diagnostics(&tree, input, /* line_offset = */ 1, total_lines);
+    let diagnostics = collect_error_diagnostics(&tree, input, total_lines);
     tracing::info!(
-        "repl: parsed {} bytes, {} diagnostics for {repl_uri}",
+        "repl: parsed {} bytes, {} diagnostics for {}",
         input.len(),
-        diagnostics.len()
+        diagnostics.len(),
+        input_uri.as_url(),
     );
     client
-        .publish_diagnostics(repl_uri, diagnostics, None)
+        .publish_diagnostics(input_uri.as_url().clone(), diagnostics, None)
         .await;
 }
 
-/// Push a fresh parse tree into the side buffer. Writes to disk for
-/// the initial-open case, then sends a `workspace/applyEdit` so any
-/// already-open instance of the buffer in the client refreshes in
-/// place - clients (notably neovim) don't auto-reload on disk change
-/// unless `autoread` + focus events fire, which is unreliable for a
-/// buffer that's been sitting in an unfocused split.
-async fn update_tree_buffer(client: &tower_lsp::Client, repl_uri: &Url, tree_str: &str) {
-    let Ok(repl_path) = repl_uri.to_file_path() else {
-        return;
-    };
-    let tree_path = crate::repl::tree_path_for(&repl_path);
-    let _ = std::fs::write(&tree_path, tree_str);
-    let Ok(tree_uri) = Url::from_file_path(&tree_path) else {
-        return;
-    };
+/// Push a fresh parse tree into the side buffer via `workspace/applyEdit`.
+/// The on-disk file is only stamped once at `tsg.openRepl` time (so the
+/// editor has something to open); after that, the buffer's contents
+/// are exclusively server-driven. Skipping the per-keystroke disk
+/// write lets the user set the buffer `nomodifiable` in their editor
+/// without us racing the file perms, and avoids cache-dir thrash.
+async fn update_tree_buffer(
+    client: &tower_lsp::Client,
+    input_uri: &crate::repl::ReplInputUri,
+    tree_str: &str,
+) {
     let edits = std::collections::HashMap::from([(
-        tree_uri,
+        input_uri.tree_uri().as_url().clone(),
         vec![tower_lsp::lsp_types::TextEdit {
             // Replace the entire buffer. The client clamps `u32::MAX`
             // to the actual end-of-buffer line.
             range: tower_lsp::lsp_types::Range {
-                start: tower_lsp::lsp_types::Position { line: 0, character: 0 },
-                end: tower_lsp::lsp_types::Position { line: u32::MAX, character: 0 },
+                start: tower_lsp::lsp_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: tower_lsp::lsp_types::Position {
+                    line: u32::MAX,
+                    character: 0,
+                },
             },
             new_text: tree_str.to_string(),
         }],
@@ -491,35 +666,61 @@ async fn update_tree_buffer(client: &tower_lsp::Client, repl_uri: &Url, tree_str
         .await;
 }
 
-async fn clear_repl_diagnostics(client: &tower_lsp::Client, repl_uri: &Url) {
+async fn clear_repl_diagnostics(client: &tower_lsp::Client, input_uri: &crate::repl::ReplInputUri) {
     client
-        .publish_diagnostics(repl_uri.clone(), Vec::new(), None)
+        .publish_diagnostics(input_uri.as_url().clone(), Vec::new(), None)
         .await;
+}
+
+/// Persist the latest rendered tree text + spans on the session so the
+/// semantic-tokens handler (which serves the tree URI, a different
+/// buffer) can return styling without re-rendering.
+fn stash_tree_render(
+    sessions: &dashmap::DashMap<crate::repl::ReplInputUri, std::sync::Mutex<ReplSession>>,
+    input_uri: &crate::repl::ReplInputUri,
+    text: String,
+    spans: Vec<crate::cst::CstSpan>,
+) {
+    if let Some(s) = sessions.get(input_uri) {
+        let mut g = s.lock().unwrap();
+        g.last_tree_text = text;
+        g.last_tree_spans = spans;
+    }
 }
 
 /// Render a parse tree for display, picking the format per the
 /// session's `TreeFormat` setting. Sexp is the compact one-line-per-
 /// node structural view; CST is the verbose `tree-sitter parse
 /// --output-cst` format with row ranges + literal text.
-fn render_tree(format: crate::repl::TreeFormat, source: &[u8], tree: &tree_sitter::Tree) -> String {
+///
+/// Returns the rendered text plus, for CST output, the colored span
+/// list so the LSP semantic-tokens handler can turn them into client
+/// highlighting. Sexp output gets no spans (we just format the bare
+/// parenthesized form).
+fn render_tree(
+    format: crate::repl::TreeFormat,
+    source: &[u8],
+    tree: &tree_sitter::Tree,
+) -> (String, Vec<crate::cst::CstSpan>) {
     match format {
-        crate::repl::TreeFormat::Sexp => {
-            tree_sitter::format_sexp(&tree.root_node().to_sexp(), 0)
+        crate::repl::TreeFormat::Sexp => (
+            tree_sitter::format_sexp(&tree.root_node().to_sexp(), 0),
+            Vec::new(),
+        ),
+        crate::repl::TreeFormat::Cst => {
+            let r = crate::cst::render(source, tree);
+            (r.text, r.spans)
         }
-        crate::repl::TreeFormat::Cst => crate::cst::render(source, tree),
     }
 }
 
 /// Collect a flat list of LSP `Diagnostic`s for every ERROR / MISSING
-/// node in the tree. `line_offset` is added to each diagnostic line so
-/// the ranges land in the full REPL buffer's coordinates (accounting
-/// for the header line). `total_lines` is the line count of the full
-/// REPL buffer; we clamp every end position to it so the client's
-/// diagnostic handler doesn't try to look past the buffer.
+/// node in the tree. `total_lines` is the line count of the buffer;
+/// we clamp every end position to it so the client's diagnostic
+/// handler doesn't try to look past the buffer.
 fn collect_error_diagnostics(
     tree: &tree_sitter::Tree,
     input: &str,
-    line_offset: u32,
     total_lines: u32,
 ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
     use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
@@ -537,8 +738,8 @@ fn collect_error_diagnostics(
         let descendant_has_error = any_descendant_has_error(node);
         if (node.is_error() || node.is_missing()) && !descendant_has_error {
             let r = node.range();
-            let start_line = (r.start_point.row as u32 + line_offset).min(max_line);
-            let end_line = (r.end_point.row as u32 + line_offset).min(max_line);
+            let start_line = (r.start_point.row as u32).min(max_line);
+            let end_line = (r.end_point.row as u32).min(max_line);
             let range = Range {
                 start: Position {
                     line: start_line,
@@ -559,9 +760,7 @@ fn collect_error_diagnostics(
             let message = if node.is_missing() {
                 format!("missing `{}`", node.kind())
             } else {
-                let span = input
-                    .get(node.start_byte()..node.end_byte())
-                    .unwrap_or("");
+                let span = input.get(node.start_byte()..node.end_byte()).unwrap_or("");
                 if span.is_empty() {
                     "unexpected end of input".to_string()
                 } else {
@@ -606,4 +805,3 @@ fn any_descendant_has_error(node: tree_sitter::Node<'_>) -> bool {
         }
     }
 }
-

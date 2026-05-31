@@ -59,7 +59,8 @@ pub struct Backend {
     /// Per-REPL-buffer state. Keyed by the REPL input URI. Created when
     /// `tsg.openRepl` fires; the change handler looks the session up by
     /// URI to know which grammar / rule to compile against.
-    pub repl_sessions: Arc<DashMap<Url, std::sync::Mutex<crate::repl::ReplSession>>>,
+    pub repl_sessions:
+        Arc<DashMap<crate::repl::ReplInputUri, std::sync::Mutex<crate::repl::ReplSession>>>,
 }
 
 /// Abort and discard any pending diagnostic-publish task for `uri`.
@@ -339,6 +340,13 @@ impl LanguageServer for Backend {
         &self,
         params: tower_lsp::lsp_types::ExecuteCommandParams,
     ) -> jsonrpc::Result<Option<serde_json::Value>> {
-        Ok(handlers::repl::open_repl(self, &params).await)
+        Ok(handlers::repl::execute_command(self, &params).await)
+    }
+
+    async fn code_lens(
+        &self,
+        params: tower_lsp::lsp_types::CodeLensParams,
+    ) -> jsonrpc::Result<Option<Vec<tower_lsp::lsp_types::CodeLens>>> {
+        Ok(handlers::code_lens::code_lens(self, &params))
     }
 }

@@ -1,6 +1,6 @@
-use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::{fmt::Write as _, path::Path};
 
 use ropey::Rope;
 use tower_lsp::lsp_types::Url;
@@ -160,7 +160,7 @@ impl ScopeIndex {
             }
         }
         // Sort by start descending so inner (narrower) scopes come first.
-        scopes.sort_unstable_by(|a, b| b.start.cmp(&a.start));
+        scopes.sort_unstable_by_key(|b| std::cmp::Reverse(b.start));
         Self { scopes, macro_ids }
     }
 
@@ -386,7 +386,7 @@ enum ExtractKind<'a> {
         /// `let foo` without a type.
         env: Option<&'a nativedsl::typecheck::TypeEnv>,
         /// Cfg state from the loader pass: declared flag names + active set.
-        /// `None` on the manual-parse fallback (apply_cfg never ran).
+        /// `None` on the manual-parse fallback (`apply_cfg` never ran).
         cfg: Option<&'a nativedsl::apply_cfg::CfgState>,
     },
     External {
@@ -454,8 +454,7 @@ fn extract_module(
         .map(|&id| shared.arena.span(id));
 
     let env = match kind {
-        ExtractKind::Root { env, .. } => env,
-        ExtractKind::External { env } => env,
+        ExtractKind::Root { env, .. } | ExtractKind::External { env } => env,
     };
     let shared_ref: &ast::SharedAst = shared;
     let scopes = ScopeIndex::build(shared_ref, ctx);
@@ -627,7 +626,7 @@ fn cfg_flag_list(cfg: &nativedsl::apply_cfg::CfgState) -> Vec<CfgFlag> {
 /// Walk the post-apply-cfg AST for `Node::Cfg` nodes. After `apply_cfg`,
 /// active cfg sites get overwritten in place with their child's data, while
 /// disabled cfg sites are simply skipped (filtered from list ranges, etc.) -
-/// the arena node itself is left intact at its original NodeId with its full
+/// the arena node itself is left intact at its original `NodeId` with its full
 /// `#[cfg(NAME)] ITEM` source span. So every surviving `Node::Cfg` in the
 /// arena is exactly one disabled cfg site, covering both top-level and inline
 /// uses uniformly.
@@ -681,22 +680,20 @@ pub fn uri_to_grammar_path(uri: &Url) -> Option<PathBuf> {
 }
 
 /// Cheap lex+parse to extract the canonical paths of every file the grammar
-/// at `file_path` would inherit or import. Used by the workspace scanner to
-/// build a dep graph for *closed* files (so cross-file rename can reach them
-/// without opening every grammar in the workspace). Resolves relative paths
-/// against `file_path`'s directory and canonicalizes via `dunce`. Files that
-/// don't canonicalize (missing on disk, broken symlinks) are silently
-/// dropped - they'd fail the real loader anyway.
+/// at `file_path` would inherit or import.
 #[must_use]
-pub fn extract_deps(text: &str, file_path: &std::path::Path) -> Vec<PathBuf> {
+pub fn extract_deps(text: &str, file_path: &Path) -> Vec<PathBuf> {
     let Ok(tokens) = nativedsl::lexer::Lexer::new(text).tokenize() else {
         return Vec::new();
     };
     let mut shared = ast::SharedAst::new(text.len() / 30);
-    let Ok(ctx) =
-        nativedsl::parser::Parser::new(&tokens, text.to_owned(), file_path.to_path_buf(), &mut shared)
-            .parse()
-    else {
+    let Ok(ctx) = nativedsl::parser::Parser::new(
+        &tokens,
+        text.to_owned(),
+        file_path.to_path_buf(),
+        &mut shared,
+    )
+    .parse() else {
         return Vec::new();
     };
     let module_dir = file_path
@@ -916,7 +913,6 @@ fn manual_parse_fallback(
         pipeline: pipeline_err.map(Err),
     })
 }
-
 
 #[cfg(test)]
 mod bench {

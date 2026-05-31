@@ -2617,6 +2617,27 @@ async fn code_actions_at(
     .await
 }
 
+/// The "Open grammar REPL" action that the code-action handler offers
+/// on every `.tsg` buffer with at least one rule. Tests include this in
+/// their expected output rather than filtering it from results - that
+/// way any change to the action's shape surfaces as a test diff.
+fn open_grammar_repl_action(uri: &Url) -> CodeActionOrCommand {
+    CodeActionOrCommand::CodeAction(CodeAction {
+        title: "Open grammar REPL".into(),
+        kind: Some(CodeActionKind::EMPTY),
+        command: Some(tower_lsp::lsp_types::Command {
+            title: "Open grammar REPL".into(),
+            command: ts_grammar_ls::handlers::repl::OPEN_REPL_COMMAND.into(),
+            arguments: Some(vec![serde_json::json!({ "uri": uri.to_string() })]),
+        }),
+        edit: None,
+        diagnostics: None,
+        is_preferred: None,
+        disabled: None,
+        data: None,
+    })
+}
+
 /// Build the expected `CodeActionResponse` for a "Convert to raw string" action
 /// with a single text edit on `test_uri()`.
 fn make_raw_string_action(edit_range: Range, new_text: &str) -> CodeActionResponse {
@@ -2654,7 +2675,9 @@ rule program { "hello" }
     let range = Range::new(Position::new(2, 16), Position::new(2, 16));
     let result = code_actions_at(&mut service, test_uri(), range).await;
 
-    assert_eq!(result, None);
+    // The always-available "Open grammar REPL" action is offered; the
+    // raw-string refactor is not.
+    assert_eq!(result, Some(vec![open_grammar_repl_action(&test_uri())]));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2669,13 +2692,12 @@ async fn code_action_convert_escaped_backslash_to_raw() {
     let result = code_actions_at(&mut service, test_uri(), range).await;
 
     // String literal spans line 1, col 22..34.
-    assert_eq!(
-        result,
-        Some(make_raw_string_action(
-            Range::new(Position::new(1, 22), Position::new(1, 34)),
-            "r\"[a-z]+\\s*\"",
-        ))
+    let mut expected = make_raw_string_action(
+        Range::new(Position::new(1, 22), Position::new(1, 34)),
+        "r\"[a-z]+\\s*\"",
     );
+    expected.push(open_grammar_repl_action(&test_uri()));
+    assert_eq!(result, Some(expected));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2689,13 +2711,12 @@ async fn code_action_convert_string_with_quotes_uses_hashes() {
     let result = code_actions_at(&mut service, test_uri(), range).await;
 
     // String literal spans line 1, col 15..31.
-    assert_eq!(
-        result,
-        Some(make_raw_string_action(
-            Range::new(Position::new(1, 15), Position::new(1, 31)),
-            "r#\"he said \"hi\"\"#",
-        ))
+    let mut expected = make_raw_string_action(
+        Range::new(Position::new(1, 15), Position::new(1, 31)),
+        "r#\"he said \"hi\"\"#",
     );
+    expected.push(open_grammar_repl_action(&test_uri()));
+    assert_eq!(result, Some(expected));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2711,7 +2732,7 @@ rule program { "hey\nthere" }
     let range = Range::new(Position::new(2, 16), Position::new(2, 16));
     let result = code_actions_at(&mut service, test_uri(), range).await;
 
-    assert_eq!(result, None);
+    assert_eq!(result, Some(vec![open_grammar_repl_action(&test_uri())]));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2722,7 +2743,7 @@ async fn code_action_not_offered_on_raw_string() {
     let range = Range::new(Position::new(1, 16), Position::new(1, 16));
     let result = code_actions_at(&mut service, test_uri(), range).await;
 
-    assert_eq!(result, None);
+    assert_eq!(result, Some(vec![open_grammar_repl_action(&test_uri())]));
 }
 
 /// Make a real on-disk grammar URI using `tempfile`. Each test gets a
@@ -2761,9 +2782,19 @@ async fn open_repl_creates_input_buffer_with_default_rule() {
     assert_eq!(obj.get("rule").and_then(|v| v.as_str()), Some("program"));
     let repl_uri = Url::parse(obj.get("uri").and_then(|v| v.as_str()).expect("uri field"))
         .expect("valid url");
-    let path = repl_uri.to_file_path().expect("file path");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "# rule: program\n");
+    let input_uri =
+        ts_grammar_ls::repl::ReplInputUri::try_from_uri(&repl_uri).expect("REPL input URI");
+    let path = input_uri.input_path();
+    // Buffer starts empty: rule binding lives in the sibling metadata
+    // file, not in the buffer text. The CodeLens shows the rule.
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    let meta_path = input_uri.meta_path();
+    let meta: ts_grammar_ls::repl::ReplMeta =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta.current_rule, "program");
+    assert_eq!(meta.grammar_uri, uri);
     std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&meta_path).ok();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2807,7 +2838,7 @@ async fn code_action_not_offered_on_identifier() {
     let range = Range::new(Position::new(1, 16), Position::new(1, 16));
     let result = code_actions_at(&mut service, test_uri(), range).await;
 
-    assert_eq!(result, None);
+    assert_eq!(result, Some(vec![open_grammar_repl_action(&test_uri())]));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2834,26 +2865,29 @@ rule program { \"x\" }
     let expected_edit_range = Range::new(Position::new(6, 0), Position::new(6, 18));
     assert_eq!(
         result,
-        Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
-            title: "Inline macro call".into(),
-            kind: Some(CodeActionKind::REFACTOR_REWRITE),
-            edit: Some(WorkspaceEdit {
-                changes: Some(std::collections::HashMap::from([(
-                    test_uri(),
-                    vec![TextEdit {
-                        range: expected_edit_range,
-                        new_text: "rule add { seq(add, \"+\", add) }".into(),
-                    }],
-                )])),
-                document_changes: None,
-                change_annotations: None,
+        Some(vec![
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Inline macro call".into(),
+                kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(std::collections::HashMap::from([(
+                        test_uri(),
+                        vec![TextEdit {
+                            range: expected_edit_range,
+                            new_text: "rule add { seq(add, \"+\", add) }".into(),
+                        }],
+                    )])),
+                    document_changes: None,
+                    change_annotations: None,
+                }),
+                diagnostics: None,
+                command: None,
+                is_preferred: None,
+                disabled: None,
+                data: None,
             }),
-            diagnostics: None,
-            command: None,
-            is_preferred: None,
-            disabled: None,
-            data: None,
-        })])
+            open_grammar_repl_action(&test_uri()),
+        ])
     );
 }
 
@@ -2882,26 +2916,29 @@ rule program { \"x\" }
     let expected_edit_range = Range::new(Position::new(7, 0), Position::new(7, 19));
     assert_eq!(
         result,
-        Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
-            title: "Inline macro call".into(),
-            kind: Some(CodeActionKind::REFACTOR_REWRITE),
-            edit: Some(WorkspaceEdit {
-                changes: Some(std::collections::HashMap::from([(
-                    test_uri(),
-                    vec![TextEdit {
-                        range: expected_edit_range,
-                        new_text: "rule foo { \"x\" }\n\nrule bar { \"y\" }".into(),
-                    }],
-                )])),
-                document_changes: None,
-                change_annotations: None,
+        Some(vec![
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Inline macro call".into(),
+                kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(std::collections::HashMap::from([(
+                        test_uri(),
+                        vec![TextEdit {
+                            range: expected_edit_range,
+                            new_text: "rule foo { \"x\" }\n\nrule bar { \"y\" }".into(),
+                        }],
+                    )])),
+                    document_changes: None,
+                    change_annotations: None,
+                }),
+                diagnostics: None,
+                command: None,
+                is_preferred: None,
+                disabled: None,
+                data: None,
             }),
-            diagnostics: None,
-            command: None,
-            is_preferred: None,
-            disabled: None,
-            data: None,
-        })])
+            open_grammar_repl_action(&test_uri()),
+        ])
     );
 }
 
@@ -2929,26 +2966,29 @@ rule program { greet(\"world\") }
     let expected_edit_range = Range::new(Position::new(6, 15), Position::new(6, 29));
     assert_eq!(
         result,
-        Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
-            title: "Inline macro call".into(),
-            kind: Some(CodeActionKind::REFACTOR_REWRITE),
-            edit: Some(WorkspaceEdit {
-                changes: Some(std::collections::HashMap::from([(
-                    test_uri(),
-                    vec![TextEdit {
-                        range: expected_edit_range,
-                        new_text: "seq(\"hello\", \"world\")".into(),
-                    }],
-                )])),
-                document_changes: None,
-                change_annotations: None,
+        Some(vec![
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Inline macro call".into(),
+                kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(std::collections::HashMap::from([(
+                        test_uri(),
+                        vec![TextEdit {
+                            range: expected_edit_range,
+                            new_text: "seq(\"hello\", \"world\")".into(),
+                        }],
+                    )])),
+                    document_changes: None,
+                    change_annotations: None,
+                }),
+                diagnostics: None,
+                command: None,
+                is_preferred: None,
+                disabled: None,
+                data: None,
             }),
-            diagnostics: None,
-            command: None,
-            is_preferred: None,
-            disabled: None,
-            data: None,
-        })])
+            open_grammar_repl_action(&test_uri()),
+        ])
     );
 }
 
@@ -2986,26 +3026,29 @@ async fn code_action_inlines_cross_module_expression_macro_call() {
     );
     assert_eq!(
         result,
-        Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
-            title: "Inline macro call".into(),
-            kind: Some(CodeActionKind::REFACTOR_REWRITE),
-            edit: Some(WorkspaceEdit {
-                changes: Some(std::collections::HashMap::from([(
-                    grammar_uri,
-                    vec![TextEdit {
-                        range: expected_edit_range,
-                        new_text: "seq(\"x\", repeat(seq(\",\", \"x\")))".into(),
-                    }],
-                )])),
-                document_changes: None,
-                change_annotations: None,
+        Some(vec![
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Inline macro call".into(),
+                kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(std::collections::HashMap::from([(
+                        grammar_uri.clone(),
+                        vec![TextEdit {
+                            range: expected_edit_range,
+                            new_text: "seq(\"x\", repeat(seq(\",\", \"x\")))".into(),
+                        }],
+                    )])),
+                    document_changes: None,
+                    change_annotations: None,
+                }),
+                diagnostics: None,
+                command: None,
+                is_preferred: None,
+                disabled: None,
+                data: None,
             }),
-            diagnostics: None,
-            command: None,
-            is_preferred: None,
-            disabled: None,
-            data: None,
-        })])
+            open_grammar_repl_action(&grammar_uri),
+        ])
     );
 }
 
@@ -3022,7 +3065,7 @@ rule program { seq(\"a\", \"b\") }
     let range = Range::new(Position::new(1, 16), Position::new(1, 16));
     let result = code_actions_at(&mut service, test_uri(), range).await;
 
-    assert_eq!(result, None);
+    assert_eq!(result, Some(vec![open_grammar_repl_action(&test_uri())]));
 }
 
 // ---------------------------------------------------------------------------

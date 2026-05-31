@@ -1,6 +1,8 @@
 use std::io::Read;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use tree_sitter_generate::{
     ALLOC_HEADER, ARRAY_HEADER, PARSER_HEADER, generate_parser_for_grammar,
 };
@@ -21,35 +23,56 @@ use tree_sitter_generate::{
 /// `Err` payload is a human-readable message from the codegen pipeline
 /// (`Codegen`) or an IO failure on the artifact writes (`Io`).
 pub fn generate_to_dir(dir: &Path, grammar_json: &str) -> Result<(), GenerateToDirError> {
-    let (_name, parser_c) = generate_parser_for_grammar(grammar_json, None)
-        .map_err(|e| GenerateToDirError::Codegen(e.to_string()))?;
+    let (_name, parser_c) =
+        generate_parser_for_grammar(grammar_json, None).map_err(GenerateToDirError::Codegen)?;
     let src = dir.join("src");
     let headers = src.join("tree_sitter");
-    std::fs::create_dir_all(&headers).map_err(GenerateToDirError::Io)?;
-    std::fs::write(src.join("grammar.json"), grammar_json).map_err(GenerateToDirError::Io)?;
-    std::fs::write(src.join("parser.c"), parser_c).map_err(GenerateToDirError::Io)?;
-    std::fs::write(headers.join("alloc.h"), ALLOC_HEADER).map_err(GenerateToDirError::Io)?;
-    std::fs::write(headers.join("array.h"), ARRAY_HEADER).map_err(GenerateToDirError::Io)?;
-    std::fs::write(headers.join("parser.h"), PARSER_HEADER).map_err(GenerateToDirError::Io)?;
+    std::fs::create_dir_all(&headers)
+        .map_err(|e| GenerateToDirError::Io(IoError::new(&e, Some(&headers))))?;
+    for (path, content) in &[
+        (src.join("grammar.json"), grammar_json),
+        (src.join("parser.c"), &parser_c),
+        (headers.join("alloc.h"), ALLOC_HEADER),
+        (headers.join("array.h"), ARRAY_HEADER),
+        (headers.join("parser.h"), PARSER_HEADER),
+    ] {
+        std::fs::write(path, content)
+            .map_err(|e| GenerateToDirError::Io(IoError::new(&e, Some(path))))?;
+    }
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, Error)]
+#[error(transparent)]
 pub enum GenerateToDirError {
-    Codegen(String),
-    Io(std::io::Error),
+    Codegen(#[from] tree_sitter_generate::GenerateError),
+    Io(IoError),
 }
 
-impl std::fmt::Display for GenerateToDirError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Codegen(msg) => f.write_str(msg),
-            Self::Io(e) => write!(f, "io: {e}"),
+#[derive(Debug, Error, Serialize, Deserialize)]
+pub struct IoError {
+    pub error: String,
+    pub path: Option<String>,
+}
+
+impl IoError {
+    fn new(error: &std::io::Error, path: Option<&Path>) -> Self {
+        Self {
+            error: error.to_string(),
+            path: path.map(|p| p.to_string_lossy().to_string()),
         }
     }
 }
 
-impl std::error::Error for GenerateToDirError {}
+impl std::fmt::Display for IoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)?;
+        if let Some(ref path) = self.path {
+            write!(f, " ({path})")?;
+        }
+        Ok(())
+    }
+}
 
 /// Subprocess entry point for the generate-check command.
 ///
@@ -72,11 +95,11 @@ pub fn run(write_to: Option<&Path>) {
         // them away. Routes through the same error surface.
         None => generate_parser_for_grammar(&json, None)
             .map(|_| ())
-            .map_err(|e| GenerateToDirError::Codegen(e.to_string())),
+            .map_err(GenerateToDirError::Codegen),
     };
 
     if let Err(e) = result {
-        println!("{e}");
+        println!("{}", serde_json::to_string(&e).unwrap());
         std::process::exit(1);
     }
 }

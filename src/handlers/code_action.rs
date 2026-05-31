@@ -14,21 +14,26 @@
 //!   the caller's args substituted (via `format_macro_expansion`) and
 //!   replaces the call's span with the result.
 
-use tower_lsp::lsp_types::{
-    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
-    TextEdit, WorkspaceEdit, Url,
+use tower_lsp::lsp_types;
+use tree_sitter_generate::nativedsl::ast::{
+    IdentKind, MacroId, MacroKind, Node, NodeId, SharedAst, Span,
 };
-use tree_sitter_generate::nativedsl::ast::{IdentKind, MacroId, MacroKind, Node, NodeId, SharedAst, Span};
 use tree_sitter_generate::nativedsl::lexer::TokenKind;
 
-use crate::config::FormattingConfig;
-use crate::document::Module;
-use crate::formatter;
-use crate::server::Backend;
-use crate::text;
+use crate::repl::{ReplInputUri, ReplMeta, TreeFormat};
+use crate::{
+    config::FormattingConfig,
+    document::{DefKind, Module},
+    formatter,
+    server::Backend,
+    text,
+};
 
 #[must_use]
-pub fn code_action(backend: &Backend, params: &CodeActionParams) -> Option<CodeActionResponse> {
+pub fn code_action(
+    backend: &Backend,
+    params: &lsp_types::CodeActionParams,
+) -> Option<lsp_types::CodeActionResponse> {
     let uri = &params.text_document.uri;
 
     // If the client filtered by `only`, skip if it didn't ask for refactors.
@@ -38,26 +43,70 @@ pub fn code_action(backend: &Backend, params: &CodeActionParams) -> Option<CodeA
         return Some(Vec::new());
     }
 
+    // REPL input buffers aren't grammar source, so they bypass the
+    // analysis-driven actions below. The only action we offer there is
+    // the format toggle (the alternative tree-buffer CodeLens has
+    // unfixable display issues on unfocused buffers in neovim).
+    if let Some(input_uri) = crate::repl::ReplInputUri::try_from_uri(uri) {
+        return build_toggle_repl_format_action(backend, &input_uri)
+            .map(|a| vec![lsp_types::CodeActionOrCommand::CodeAction(a)]);
+    }
+
     let (analysis, start_offset) = backend.resolve_position(uri, params.range.start)?;
 
-    let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+    let mut actions: Vec<lsp_types::CodeActionOrCommand> = Vec::new();
     if let Some(a) = build_raw_string_action(&analysis, start_offset, uri) {
-        actions.push(CodeActionOrCommand::CodeAction(a));
+        actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
     }
     if let Some(a) = build_inline_macro_action(&analysis, start_offset, uri) {
-        actions.push(CodeActionOrCommand::CodeAction(a));
+        actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
     }
     if let Some(a) = build_inline_expression_macro_action(&analysis, start_offset, uri) {
-        actions.push(CodeActionOrCommand::CodeAction(a));
+        actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
     }
     if let Some(a) = build_open_repl_action(&analysis, start_offset, uri, params.range.start) {
-        actions.push(CodeActionOrCommand::CodeAction(a));
+        actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
+    }
+    if let Some(a) = build_open_grammar_repl_action(&analysis, uri) {
+        actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
     }
     if actions.is_empty() {
         None
     } else {
         Some(actions)
     }
+}
+
+/// "Switch to S-expression view" / "Switch to CST view"
+fn build_toggle_repl_format_action(
+    backend: &Backend,
+    input_uri: &ReplInputUri,
+) -> Option<lsp_types::CodeAction> {
+    let format = backend
+        .repl_sessions
+        .get(input_uri)
+        .map(|s| s.lock().unwrap().format)
+        .or_else(|| ReplMeta::read_for(input_uri).map(|m| m.format))?;
+    let title = match format {
+        TreeFormat::Cst => "Switch to S-expression view",
+        TreeFormat::Sexp => "Switch to CST view",
+    };
+    Some(lsp_types::CodeAction {
+        title: title.into(),
+        kind: Some(lsp_types::CodeActionKind::EMPTY),
+        command: Some(lsp_types::Command {
+            title: title.into(),
+            command: crate::handlers::repl::TOGGLE_REPL_FORMAT_COMMAND.into(),
+            arguments: Some(vec![
+                serde_json::json!({ "uri": input_uri.as_url().to_string() }),
+            ]),
+        }),
+        edit: None,
+        diagnostics: None,
+        is_preferred: None,
+        disabled: None,
+        data: None,
+    })
 }
 
 /// "Open REPL for rule `X`" when the cursor sits on the rule's *name*
@@ -70,10 +119,9 @@ pub fn code_action(backend: &Backend, params: &CodeActionParams) -> Option<CodeA
 fn build_open_repl_action(
     analysis: &Module,
     start_offset: u32,
-    uri: &Url,
-    position: tower_lsp::lsp_types::Position,
-) -> Option<CodeAction> {
-    use crate::document::DefKind;
+    uri: &lsp_types::Url,
+    position: lsp_types::Position,
+) -> Option<lsp_types::CodeAction> {
     let defs = analysis.definitions.as_ref()?;
     let def = defs.iter().find(|d| {
         matches!(d.kind, DefKind::Rule | DefKind::OverrideRule)
@@ -84,11 +132,40 @@ fn build_open_repl_action(
         "uri": uri.to_string(),
         "position": { "line": position.line, "character": position.character }
     })];
-    Some(CodeAction {
+    Some(lsp_types::CodeAction {
         title: format!("Open REPL for rule `{}`", def.name),
-        kind: Some(CodeActionKind::EMPTY),
-        command: Some(tower_lsp::lsp_types::Command {
+        kind: Some(lsp_types::CodeActionKind::EMPTY),
+        command: Some(lsp_types::Command {
             title: "Open REPL".into(),
+            command: crate::handlers::repl::OPEN_REPL_COMMAND.into(),
+            arguments: Some(arguments),
+        }),
+        edit: None,
+        diagnostics: None,
+        is_preferred: None,
+        disabled: None,
+        data: None,
+    })
+}
+
+/// "Open grammar REPL" - always available in any `.tsg` buffer that
+/// has at least one rule. Opens a REPL bound to the grammar's first
+/// rule (which `InputGrammar::normalize` treats as the implicit
+/// start).
+fn build_open_grammar_repl_action(
+    analysis: &Module,
+    uri: &lsp_types::Url,
+) -> Option<lsp_types::CodeAction> {
+    // Only offer the action when there's actually a rule to default to.
+    let defs = analysis.definitions.as_ref()?;
+    defs.iter()
+        .find(|d| matches!(d.kind, DefKind::Rule | DefKind::OverrideRule))?;
+    let arguments = vec![serde_json::json!({ "uri": uri.to_string() })];
+    Some(lsp_types::CodeAction {
+        title: "Open grammar REPL".into(),
+        kind: Some(lsp_types::CodeActionKind::EMPTY),
+        command: Some(lsp_types::Command {
+            title: "Open grammar REPL".into(),
             command: crate::handlers::repl::OPEN_REPL_COMMAND.into(),
             arguments: Some(arguments),
         }),
@@ -103,8 +180,8 @@ fn build_open_repl_action(
 fn build_raw_string_action(
     analysis: &Module,
     start_offset: u32,
-    uri: &Url,
-) -> Option<CodeAction> {
+    uri: &lsp_types::Url,
+) -> Option<lsp_types::CodeAction> {
     // Find a StringLit token covering the cursor in the cached tokens. If lex
     // never produced tokens (very early state), bail.
     let tokens = analysis.tokens.as_deref()?;
@@ -144,16 +221,16 @@ fn build_raw_string_action(
     let edit_range = text::span_to_range(&analysis.rope, span);
     let edits = std::collections::HashMap::from([(
         uri.clone(),
-        vec![TextEdit {
+        vec![lsp_types::TextEdit {
             range: edit_range,
             new_text,
         }],
     )]);
 
-    Some(CodeAction {
+    Some(lsp_types::CodeAction {
         title: "Convert to raw string".into(),
-        kind: Some(CodeActionKind::REFACTOR_REWRITE),
-        edit: Some(WorkspaceEdit {
+        kind: Some(lsp_types::CodeActionKind::REFACTOR_REWRITE),
+        edit: Some(lsp_types::WorkspaceEdit {
             changes: Some(edits),
             document_changes: None,
             change_annotations: None,
@@ -172,8 +249,8 @@ fn build_raw_string_action(
 fn build_inline_macro_action(
     analysis: &Module,
     start_offset: u32,
-    uri: &Url,
-) -> Option<CodeAction> {
+    uri: &lsp_types::Url,
+) -> Option<lsp_types::CodeAction> {
     // Only meaningful when the loader actually ran expansion. The manual
     // parse fallback never produces `ExpandedRule` nodes.
     if !analysis.loader_succeeded {
@@ -218,29 +295,23 @@ fn build_inline_macro_action(
     let config = FormattingConfig::default();
     let mut parts: Vec<String> = Vec::with_capacity(rule_ids.len());
     for rid in rule_ids {
-        let rendered = formatter::format_macro_expansion(
-            rid,
-            &[],
-            analysis,
-            analysis,
-            &config,
-        );
+        let rendered = formatter::format_macro_expansion(rid, &[], analysis, analysis, &config);
         parts.push(rendered);
     }
     let new_text = parts.join("\n\n");
     let edit_range = text::span_to_range(&analysis.rope, call_span);
     let edits = std::collections::HashMap::from([(
         uri.clone(),
-        vec![TextEdit {
+        vec![lsp_types::TextEdit {
             range: edit_range,
             new_text,
         }],
     )]);
 
-    Some(CodeAction {
+    Some(lsp_types::CodeAction {
         title: "Inline macro call".into(),
-        kind: Some(CodeActionKind::REFACTOR_REWRITE),
-        edit: Some(WorkspaceEdit {
+        kind: Some(lsp_types::CodeActionKind::REFACTOR_REWRITE),
+        edit: Some(lsp_types::WorkspaceEdit {
             changes: Some(edits),
             document_changes: None,
             change_annotations: None,
@@ -261,8 +332,8 @@ fn build_inline_macro_action(
 fn build_inline_expression_macro_action(
     analysis: &Module,
     start_offset: u32,
-    uri: &Url,
-) -> Option<CodeAction> {
+    uri: &lsp_types::Url,
+) -> Option<lsp_types::CodeAction> {
     if !analysis.loader_succeeded {
         return None;
     }
@@ -280,26 +351,21 @@ fn build_inline_expression_macro_action(
     }
 
     let config = FormattingConfig::default();
-    let new_text = formatter::format_macro_expansion(
-        macro_cfg.body,
-        &args,
-        body_module,
-        analysis,
-        &config,
-    );
+    let new_text =
+        formatter::format_macro_expansion(macro_cfg.body, &args, body_module, analysis, &config);
     let call_span = shared.arena.span(call_id);
     let edit_range = text::span_to_range(&analysis.rope, call_span);
     let edits = std::collections::HashMap::from([(
         uri.clone(),
-        vec![TextEdit {
+        vec![lsp_types::TextEdit {
             range: edit_range,
             new_text,
         }],
     )]);
-    Some(CodeAction {
+    Some(lsp_types::CodeAction {
         title: "Inline macro call".into(),
-        kind: Some(CodeActionKind::REFACTOR_REWRITE),
-        edit: Some(WorkspaceEdit {
+        kind: Some(lsp_types::CodeActionKind::REFACTOR_REWRITE),
+        edit: Some(lsp_types::WorkspaceEdit {
             changes: Some(edits),
             document_changes: None,
             change_annotations: None,
@@ -348,81 +414,74 @@ fn find_macro_call_at(shared: &SharedAst, cursor: u32, id: NodeId) -> Option<Nod
 fn collect_children(shared: &SharedAst, id: NodeId) -> Vec<NodeId> {
     let mut out = Vec::new();
     match *shared.arena.get(id) {
-        Node::Rule { body, .. } => out.push(body),
-        Node::ComputedRule { name_expr, body, .. } => {
-            out.push(name_expr);
-            out.push(body);
-        }
+        #[rustfmt::skip]
+        Node::Rule { body: id, .. } | Node::Let { value: id, .. } | Node::Cfg { child: id, .. }
+        | Node::Field { content: id, .. } | Node::Reserved { content: id, .. } | Node::Repeat { inner: id, .. }
+        | Node::Token { inner: id, .. } | Node::Neg(id) | Node::GrammarConfig { module: id, .. }
+        | Node::FieldAccess { obj: id, .. } | Node::QualifiedAccess { obj: id, .. }
+        | Node::SymRef { expr: id } | Node::ExpandedRule { body: id, .. } => out.push(id),
+        #[rustfmt::skip]
         Node::RuleSet(r) | Node::SeqOrChoice { range: r, .. } | Node::Concat(r)
-        | Node::List(r) | Node::Tuple(r) => {
+        | Node::List(r) | Node::Tuple(r) | Node::QualifiedCall(r) => {
             out.extend(shared.pools.child_slice(r).iter().copied());
         }
-        Node::ExpandedRule { body, .. } => out.push(body),
-        Node::Let { value, .. } => out.push(value),
+        #[rustfmt::skip]
+        Node::ComputedRule { name_expr: a, body: b, .. } | Node::Alias { content: a, target: b, }
+        | Node::Prec { value: a, content: b, .. } | Node::Append { left: a, right: b }
+        | Node::BinOp { lhs: a, rhs: b, .. } => {
+            out.push(a);
+            out.push(b);
+        }
         Node::Macro(macro_id) => out.push(shared.pools.get_macro(macro_id).body),
-        Node::Cfg { child, .. } => out.push(child),
-        Node::FieldAccess { obj, .. } | Node::QualifiedAccess { obj, .. } => out.push(obj),
-        Node::Repeat { inner, .. } | Node::Token { inner, .. } | Node::Neg(inner) => {
-            out.push(inner);
-        }
-        Node::Field { content, .. } | Node::Reserved { content, .. } => out.push(content),
-        Node::Alias { content, target } => {
-            out.push(content);
-            out.push(target);
-        }
-        Node::Prec { value, content, .. } => {
-            out.push(value);
-            out.push(content);
-        }
         Node::DynRegex { pattern, flags } => {
             out.push(pattern);
             if let Some(f) = flags {
                 out.push(f);
             }
         }
-        Node::GrammarConfig { module, .. } => out.push(module),
-        Node::Call { name, args } => {
-            out.push(name);
-            out.extend(shared.pools.child_slice(args).iter().copied());
-        }
-        Node::QualifiedCall(range) => {
-            out.extend(shared.pools.child_slice(range).iter().copied());
-        }
-        Node::Append { left, right } | Node::BinOp { lhs: left, rhs: right, .. } => {
-            out.push(left);
-            out.push(right);
-        }
         Node::For { for_id, body } => {
             let cfg = shared.pools.get_for(for_id);
             out.push(cfg.iterable);
             out.push(body);
         }
-        Node::SymRef { expr } => out.push(expr),
+        Node::Call { name, args } => {
+            out.push(name);
+            out.extend(shared.pools.child_slice(args).iter().copied());
+        }
         Node::Object(range) => {
             for &(_, v) in shared.pools.get_object(range) {
                 out.push(v);
             }
         }
         // Leaves.
-        Node::Grammar | Node::External { .. } | Node::StringLit | Node::RawStringLit { .. }
-        | Node::IntLit(_) | Node::Ident(_) | Node::Blank | Node::SynthRef { .. }
-        | Node::MacroParam { .. } | Node::ForBinding { .. } | Node::ModuleRef { .. }
+        Node::Grammar
+        | Node::External { .. }
+        | Node::StringLit
+        | Node::RawStringLit { .. }
+        | Node::IntLit(_)
+        | Node::Ident(_)
+        | Node::Blank
+        | Node::SynthRef { .. }
+        | Node::MacroParam { .. }
+        | Node::ForBinding { .. }
+        | Node::ModuleRef { .. }
         | Node::Unreachable => {}
     }
     out
 }
 
-/// Resolve a Call or QualifiedCall NodeId to:
+/// Resolve a Call or `QualifiedCall` `NodeId` to:
 ///   - the `MacroId` it invokes,
 ///   - the `Module` whose `StringTable` / source the macro body lives in,
 ///   - the argument `NodeId`s.
+///
 /// For a local `Node::Call`, `body_module` is `caller`. For a
 /// `Node::QualifiedCall`, the obj resolves to a `let h = import("...")`
 /// binding and `body_module` is the imported module.
-fn resolve_call_target<'a>(
-    caller: &'a Module,
+fn resolve_call_target(
+    caller: &Module,
     call_id: NodeId,
-) -> Option<(MacroId, &'a Module, Vec<NodeId>)> {
+) -> Option<(MacroId, &Module, Vec<NodeId>)> {
     let shared = &caller.shared;
     match *shared.arena.get(call_id) {
         Node::Call { name, args } => {
@@ -448,7 +507,7 @@ fn resolve_call_target<'a>(
 
 /// Follow `obj`'s `IdentKind::Var(let_id)` to its `Node::Let`, take the
 /// let's binding name, and look it up in `caller.import_modules`.
-fn resolve_import_obj<'a>(caller: &'a Module, obj: NodeId) -> Option<&'a Module> {
+fn resolve_import_obj(caller: &Module, obj: NodeId) -> Option<&Module> {
     let shared = &caller.shared;
     let Node::Ident(IdentKind::Var(let_id)) = shared.arena.get(obj) else {
         return None;
@@ -464,10 +523,10 @@ fn resolve_import_obj<'a>(caller: &'a Module, obj: NodeId) -> Option<&'a Module>
         .map(|(_, m)| m)
 }
 
-fn is_refactor_kind(k: &CodeActionKind) -> bool {
-    *k == CodeActionKind::REFACTOR_REWRITE
-        || *k == CodeActionKind::REFACTOR
-        || *k == CodeActionKind::EMPTY
+fn is_refactor_kind(k: &lsp_types::CodeActionKind) -> bool {
+    *k == lsp_types::CodeActionKind::REFACTOR_REWRITE
+        || *k == lsp_types::CodeActionKind::REFACTOR
+        || *k == lsp_types::CodeActionKind::EMPTY
 }
 
 /// Returns `true` if `s` has at least one escape sequence and all escapes are

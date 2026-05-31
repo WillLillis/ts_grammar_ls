@@ -1,9 +1,10 @@
 use tower_lsp::lsp_types::{
-    CompletionOptions, DidChangeWatchedFilesRegistrationOptions, ExecuteCommandOptions,
-    FileSystemWatcher, GlobPattern, HoverProviderCapability, InitializeParams, InitializeResult,
-    OneOf, Registration, RenameOptions, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind, WorkDoneProgressOptions,
+    CodeLensOptions, CompletionOptions, DidChangeWatchedFilesRegistrationOptions,
+    ExecuteCommandOptions, FileSystemWatcher, GlobPattern, HoverProviderCapability,
+    InitializeParams, InitializeResult, OneOf, Registration, RenameOptions,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
+    WorkDoneProgressOptions,
 };
 use tracing::warn;
 
@@ -59,8 +60,17 @@ pub async fn initialize(backend: &Backend, params: InitializeParams) -> Initiali
                 }),
             ),
             execute_command_provider: Some(ExecuteCommandOptions {
-                commands: vec![crate::handlers::repl::OPEN_REPL_COMMAND.into()],
+                commands: vec![
+                    crate::handlers::repl::OPEN_REPL_COMMAND.into(),
+                    crate::handlers::repl::SET_REPL_RULE_COMMAND.into(),
+                    crate::handlers::repl::TOGGLE_REPL_FORMAT_COMMAND.into(),
+                ],
                 work_done_progress_options: WorkDoneProgressOptions::default(),
+            }),
+            code_lens_provider: Some(CodeLensOptions {
+                // We compute the title in `code_lens` directly; no
+                // lazy resolution needed.
+                resolve_provider: Some(false),
             }),
             ..Default::default()
         },

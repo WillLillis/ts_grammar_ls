@@ -11,157 +11,190 @@
 //!    pruned to just the rules reachable from the chosen start + the
 //!    usual roots (extras, externals, `word_token`).
 //! 4. Serialize to JSON, hash → cache key.
-//! 5. If cache miss: re-exec ourselves with `generate-check --write-to
-//!    <dir>` to produce `<dir>/src/{parser.c, grammar.json, tree_sitter/*}`.
+//! 5. If cache miss: re-exec ourselves with `generate-check --write-to <dir>`
+//!    to produce `<dir>/src/{parser.c, grammar.json, tree_sitter/*}`.
 //! 6. Hand `<dir>/src/` to `tree_sitter_loader::Loader` to compile +
 //!    `dlopen` into a `Language`. Cache the result.
 
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    ffi::OsStr,
+    hash::{DefaultHasher, Hash, Hasher},
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{io::AsyncWriteExt, sync::Mutex};
+use tower_lsp::lsp_types;
 use tree_sitter::Language;
-use tree_sitter_generate::nativedsl;
-use tree_sitter_generate::nativedsl::serialize::grammar_to_json;
+use tree_sitter_generate::nativedsl::{self, serialize::grammar_to_json};
 use tree_sitter_loader::{CompileConfig, Loader};
 
-/// File-name suffix for the REPL input buffer. Used by `is_repl_uri` to
-/// recognize URIs the LSP should treat as REPL state instead of `.tsg`
-/// source.
-///
-/// Ends in `.tsg` (rather than `.txt`) so neovim's default filetype
-/// detection picks up the buffer as `tsg`, which lspconfig setups
-/// register against - without this the client never attaches the LSP
-/// to the REPL buffer and `did_open` never fires. The `.tsg-repl.`
-/// segment is what `is_repl_uri` actually keys on, so the LSP doesn't
-/// confuse REPL buffers with real grammar files.
+use crate::generate_check::GenerateToDirError;
+
 pub const REPL_INPUT_SUFFIX: &str = ".tsg-repl.tsg";
-
-/// File-name suffix for the sibling metadata file. Each REPL input
-/// buffer has a paired `<basename>.tsg-repl.json` that stores
-/// server-owned state (the grammar URI) so any LSP process can rebuild
-/// its session by reading the buffer + sibling, without depending on
-/// in-memory state surviving a process boundary.
-///
-/// Why this is needed: client frameworks (lspconfig, etc.) compute
-/// `root_dir` per buffer and spawn one LSP process per
-/// `(filetype, root_dir)` pair. The grammar and the REPL buffer have
-/// different roots, so two processes get involved. The process that
-/// handled `tsg.openRepl` registered the session in memory; the process
-/// that receives `did_open` on the REPL buffer is a different one and
-/// has no in-memory state. The sibling file bridges them.
 pub const REPL_META_SUFFIX: &str = ".tsg-repl.json";
+pub const REPL_TREE_SUFFIX: &str = ".tsg-repl-tree.tsg";
 
-/// File-name suffix for the parse-tree side buffer. Plain `.txt` keeps
-/// editors from running our LSP against it (no `.tsg` extension) and
-/// suppresses syntax highlighting; the contents are just a rendered
-/// s-expression refreshed on every keystroke of the input buffer.
-pub const REPL_TREE_SUFFIX: &str = ".tsg-repl-tree.txt";
+/// A URI pointing to a REPL input buffer (`<basename>.tsg-repl.tsg`).
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct ReplInputUri(lsp_types::Url);
 
-/// On-disk path of the tree side buffer paired with a given REPL input
-/// path. Mirrors `ReplMeta::sibling_path`'s naming.
-#[must_use]
-pub fn tree_path_for(repl_input_path: &std::path::Path) -> PathBuf {
-    let parent = repl_input_path.parent().unwrap_or(std::path::Path::new(""));
-    let name = repl_input_path
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or_default();
-    let stem = name.strip_suffix(REPL_INPUT_SUFFIX).unwrap_or(name);
-    parent.join(format!("{stem}{REPL_TREE_SUFFIX}"))
+impl ReplInputUri {
+    #[must_use]
+    pub fn try_from_uri(uri: &lsp_types::Url) -> Option<Self> {
+        uri.as_str()
+            .ends_with(REPL_INPUT_SUFFIX)
+            .then(|| Self(uri.clone()))
+    }
+
+    #[must_use]
+    pub const fn as_url(&self) -> &lsp_types::Url {
+        &self.0
+    }
+
+    #[must_use]
+    #[expect(clippy::missing_panics_doc)]
+    pub fn input_path(&self) -> PathBuf {
+        self.0.to_file_path().unwrap()
+    }
+
+    #[must_use]
+    #[expect(clippy::missing_panics_doc)]
+    pub fn tree_uri(&self) -> ReplTreeUri {
+        let stem = self.0.as_str().strip_suffix(REPL_INPUT_SUFFIX).unwrap();
+        let url = lsp_types::Url::parse(&format!("{stem}{REPL_TREE_SUFFIX}")).unwrap();
+        ReplTreeUri(url)
+    }
+
+    #[must_use]
+    pub fn tree_path(&self) -> PathBuf {
+        sibling_with_suffix(&self.input_path(), REPL_TREE_SUFFIX)
+    }
+
+    #[must_use]
+    pub fn meta_path(&self) -> PathBuf {
+        sibling_with_suffix(&self.input_path(), REPL_META_SUFFIX)
+    }
 }
 
-/// `true` when `uri` points at a REPL input buffer (created by
-/// `tsg.openRepl`). The naming convention is private to the LSP so
-/// false positives on user-owned files are vanishingly unlikely.
-#[must_use]
-pub fn is_repl_uri(uri: &tower_lsp::lsp_types::Url) -> bool {
-    uri.path().ends_with(REPL_INPUT_SUFFIX)
+/// A URI confirmed to point at a REPL tree-side buffer
+/// (`<basename>.tsg-repl-tree.tsg`).
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct ReplTreeUri(lsp_types::Url);
+
+impl ReplTreeUri {
+    #[must_use]
+    pub fn try_from_uri(uri: &lsp_types::Url) -> Option<Self> {
+        uri.as_str()
+            .ends_with(REPL_TREE_SUFFIX)
+            .then(|| Self(uri.clone()))
+    }
+
+    #[must_use]
+    pub const fn as_url(&self) -> &lsp_types::Url {
+        &self.0
+    }
+
+    #[must_use]
+    #[expect(clippy::missing_panics_doc)]
+    pub fn tree_path(&self) -> PathBuf {
+        self.0.to_file_path().unwrap()
+    }
+
+    #[must_use]
+    #[expect(clippy::missing_panics_doc)]
+    pub fn input_uri(&self) -> ReplInputUri {
+        let stem = self.0.as_str().strip_suffix(REPL_TREE_SUFFIX).unwrap();
+        let url = lsp_types::Url::parse(&format!("{stem}{REPL_INPUT_SUFFIX}")).unwrap();
+        ReplInputUri(url)
+    }
 }
 
-/// Server-owned metadata persisted next to each REPL input buffer.
-/// Read on `did_open`/`did_change` when no in-memory session exists,
-/// which happens whenever a client framework spawned a fresh LSP
-/// process for the REPL buffer's `root_dir`.
+/// Replace `<input_path>`'s trailing [`REPL_INPUT_SUFFIX`] with
+/// `new_suffix`. Pre-validation by [`ReplInputUri::try_from_uri`] is
+/// what keeps the `unwrap()`s safe.
+fn sibling_with_suffix(input_path: &Path, new_suffix: &str) -> PathBuf {
+    let name = input_path.file_name().unwrap();
+    let stem = OsStr::from_bytes(
+        name.as_bytes()
+            .strip_suffix(REPL_INPUT_SUFFIX.as_bytes())
+            .unwrap(),
+    );
+    input_path.with_file_name(stem).with_extension(new_suffix)
+}
+
 /// Output format for the tree side buffer. Persisted in the metadata
 /// file so the user's preference survives across LSP restarts.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TreeFormat {
-    /// The structural s-expression. Compact; one line per node when
-    /// pretty-printed. Good for an overview of the parse shape.
     Sexp,
-    /// The full CST (`tree-sitter parse --output-cst` format) with row
-    /// ranges and literal text for each node. More informative; one
-    /// line per node, vertically larger. The default - matches what
-    /// the upstream `tree-sitter` CLI produces.
     #[default]
     Cst,
 }
 
+/// Server-owned metadata persisted next to each REPL input buffer.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ReplMeta {
-    pub grammar_uri: tower_lsp::lsp_types::Url,
-    #[serde(default)]
+    pub grammar_uri: lsp_types::Url,
+    pub current_rule: String,
     pub format: TreeFormat,
 }
 
 impl ReplMeta {
-    /// Path of the sibling metadata file for a given REPL input path.
-    /// E.g. `/...d.tsg-repl.tsg` -> `/...d.tsg-repl.json`.
-    #[must_use]
-    pub fn sibling_path(repl_input_path: &std::path::Path) -> PathBuf {
-        let parent = repl_input_path.parent().unwrap_or(std::path::Path::new(""));
-        let name = repl_input_path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or_default();
-        let stem = name.strip_suffix(REPL_INPUT_SUFFIX).unwrap_or(name);
-        parent.join(format!("{stem}{REPL_META_SUFFIX}"))
+    /// Write `self` to the metadata file paired with `input_uri`.
+    /// Best-effort: failures are logged and swallowed. The file is
+    /// server-internal state used to rebuild a session on a future
+    /// `did_open`; a failed write degrades to the "no session, rebuild
+    /// from scratch" path the LSP already handles.
+    pub fn write_for(&self, input_uri: &ReplInputUri) {
+        let path = input_uri.meta_path();
+        let json = match serde_json::to_string(self) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(?path, error = %e, "repl: failed to serialize meta");
+                return;
+            }
+        };
+        if let Err(e) = std::fs::write(&path, json) {
+            tracing::warn!(?path, error = %e, "repl: failed to write meta");
+        }
     }
 
-    /// Write `self` to its sibling path next to `repl_input_path`. No-op
-    /// on serialization failure (the metadata is best-effort: a missing
-    /// or corrupt file just degrades to the same "no session" path the
-    /// LSP already handles).
-    pub fn write_for(&self, repl_input_path: &std::path::Path) -> std::io::Result<()> {
-        let json = serde_json::to_string(self).map_err(std::io::Error::other)?;
-        std::fs::write(Self::sibling_path(repl_input_path), json)
-    }
-
-    /// Read the metadata file paired with `repl_input_path`. Returns
-    /// `None` if the file is absent or unparseable.
+    /// Read the metadata file paired with `input_uri`. Returns `None`
+    /// if the file is absent or unparseable; both are logged.
     #[must_use]
-    pub fn read_for(repl_input_path: &std::path::Path) -> Option<Self> {
-        let raw = std::fs::read_to_string(Self::sibling_path(repl_input_path)).ok()?;
-        serde_json::from_str(&raw).ok()
+    pub fn read_for(input_uri: &ReplInputUri) -> Option<Self> {
+        let path = input_uri.meta_path();
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(?path, error = %e, "repl: failed to read meta");
+                }
+                return None;
+            }
+        };
+        match serde_json::from_str(&raw) {
+            Ok(meta) => Some(meta),
+            Err(e) => {
+                tracing::warn!(?path, error = %e, "repl: failed to parse meta");
+                None
+            }
+        }
     }
 }
 
-/// Extract the rule name from a REPL input buffer's header line.
-/// Format: `# rule: <name>` on line 0. Returns `None` for buffers
-/// missing the header (e.g. the user blew it away).
-#[must_use]
-pub fn parse_rule_header(text: &str) -> Option<&str> {
-    let first_line = text.lines().next()?;
-    let rest = first_line.strip_prefix("# rule:")?;
-    let name = rest.trim();
-    (!name.is_empty()).then_some(name)
-}
-
-/// Production cache root for REPL artifacts. Matches the path
-/// `handlers::repl::open_repl` writes input buffers to, so the
-/// compiled `.so` and the input buffer live as siblings under
-/// `$XDG_CACHE_HOME/ts_grammar_ls/repl/`.
 #[must_use]
 pub fn default_cache_root() -> PathBuf {
     use etcetera::BaseStrategy as _;
     let base = etcetera::choose_base_strategy()
         .ok()
-        .map(|s| s.cache_dir())
-        .unwrap_or_else(std::env::temp_dir);
+        .map_or_else(std::env::temp_dir, |s| s.cache_dir());
     base.join("ts_grammar_ls").join("repl")
 }
 
@@ -170,8 +203,9 @@ pub fn default_cache_root() -> PathBuf {
 /// don't need to re-compile.
 pub struct ReplSession {
     /// The grammar this REPL parses against.
-    pub grammar_uri: tower_lsp::lsp_types::Url,
-    /// Last rule name parsed from the header. Re-parsed on every change.
+    pub grammar_uri: lsp_types::Url,
+    /// Current start rule. Owned by the server: only `tsg.openRepl` and
+    /// `tsg.setReplRule` change it. Mirrored to `ReplMeta` on disk.
     pub current_rule: String,
     /// Cache key for the most recently compiled language. `None` if no
     /// compile has completed yet. Compared against the next attempt's
@@ -187,45 +221,73 @@ pub struct ReplSession {
     /// here so the async compile-completion path can re-parse against
     /// the current state without going through disk.
     pub current_text: Option<String>,
+    /// Most recently rendered tree-buffer text. Stashed here (vs. read
+    /// off disk in the semantic-tokens handler) because the tree file
+    /// is the editor's view,  driven by `applyEdit`.
+    pub last_tree_text: String,
+    /// Colored byte ranges from the most recent CST render, in source
+    /// order. Indices into `last_tree_text`. Empty when the current
+    /// `TreeFormat` is sexp (sexp output isn't colored).
+    pub last_tree_spans: Vec<crate::cst::CstSpan>,
 }
 
 /// Stable on-disk + in-memory identifier for one compiled REPL parser.
 /// Hex-encoded hash of the post-swap, post-normalize grammar JSON.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CacheKey(String);
+pub struct CacheKey(u64);
 
-impl CacheKey {
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Failure modes for `prepare` / `get_or_compile`.
-#[derive(Debug)]
-pub enum ReplCompileError {
-    /// `rule_name` wasn't found in `grammar.variables`.
-    RuleNotFound,
-    /// `tree-sitter generate` reported a pipeline error.
-    Codegen(String),
-    /// `cc` / `dlopen` failed in the loader step.
-    Compile(String),
-    /// Couldn't spawn the codegen subprocess.
-    Spawn(std::io::Error),
-}
-
-impl std::fmt::Display for ReplCompileError {
+impl std::fmt::Display for CacheKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RuleNotFound => write!(f, "rule not found in grammar"),
-            Self::Codegen(msg) => write!(f, "codegen failed: {msg}"),
-            Self::Compile(msg) => write!(f, "compile/load failed: {msg}"),
-            Self::Spawn(e) => write!(f, "spawn failed: {e}"),
-        }
+        write!(f, "{:016x}", self.0)
     }
 }
 
-impl std::error::Error for ReplCompileError {}
+/// Failure modes for `prepare` / `get_or_compile`. Callers branch on
+/// `RuleNotFound` (transient typing state, logged at debug); the rest
+/// are logged at warn and otherwise lumped together.
+#[derive(Debug, Error)]
+pub enum ReplCompileError {
+    /// The chosen start rule isn't declared in the grammar's
+    /// `variables`. Common transient state while the user types a
+    /// rule name.
+    #[error("rule `{0}` not found in grammar")]
+    RuleNotFound(String),
+
+    /// Failed to prepare the on-disk cache directory for this key.
+    #[error("creating cache dir {path}: {source}")]
+    CacheDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// I/O around the codegen subprocess: locating our own binary,
+    /// spawning it, piping stdin, awaiting it. Distinct from
+    /// [`Self::Generate`] - this means we couldn't run the pipeline;
+    /// that one means the pipeline ran and reported errors.
+    #[error("codegen subprocess: {0}")]
+    Subprocess(#[source] std::io::Error),
+
+    /// The codegen subprocess exited non-zero. The structured error
+    /// crosses the process boundary as JSON on the subprocess's
+    /// stdout; we deserialize it back into the original variant
+    /// (so callers can branch on which generate-stage failed if they
+    /// care to).
+    #[error("tree-sitter generate failed: {0}")]
+    Generate(#[from] GenerateToDirError),
+
+    /// The codegen subprocess exited non-zero but its stdout wasn't
+    /// parseable as a [`GenerateToDirError`] - shouldn't happen in
+    /// practice (our subprocess emits one of those by contract), but
+    /// recorded distinctly so we don't silently drop the message.
+    #[error("codegen subprocess exited with unparseable error: {0}")]
+    GenerateUnparseable(String),
+
+    /// `tree_sitter_loader::Loader` couldn't compile the generated C
+    /// or `dlopen` the resulting shared library.
+    #[error("loading compiled parser: {0}")]
+    LoadLanguage(#[from] tree_sitter_loader::LoaderError),
+}
 
 /// Thread-safe cache of compiled REPL parsers, plus the on-disk root for
 /// their codegen artifacts. One cache per LSP process.
@@ -235,7 +297,16 @@ pub struct ReplCache {
     cache_root: PathBuf,
     /// `key -> Language`. Held behind a tokio Mutex so concurrent REPLs
     /// can share results without racing.
-    entries: Mutex<std::collections::HashMap<CacheKey, Arc<Language>>>,
+    entries: Mutex<HashMap<CacheKey, Arc<Language>>>,
+    /// Per-key serialization gate. While a `(json, key)` compile is in
+    /// flight, holds an `Arc<Mutex<()>>` keyed by that key. Subsequent
+    /// `get_or_compile` calls for the same key acquire the same mutex
+    /// and wait for the in-flight work to finish before re-checking
+    /// `entries`. Without this, multiple `did_change` events fired
+    /// before the first compile completes each spawn their own
+    /// codegen+cc invocation, all writing to the same cache dir and
+    /// racing on the `.so` output.
+    in_flight: Mutex<HashMap<CacheKey, Arc<Mutex<()>>>>,
 }
 
 impl ReplCache {
@@ -243,7 +314,8 @@ impl ReplCache {
     pub fn new(cache_root: PathBuf) -> Self {
         Self {
             cache_root,
-            entries: Mutex::new(std::collections::HashMap::new()),
+            entries: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -259,17 +331,21 @@ impl ReplCache {
     /// Pure preparation: swap → normalize → serialize → hash. No IO.
     /// Returns the JSON payload (to be handed to the codegen subprocess
     /// later) and the cache key derived from it.
+    ///
+    /// # Errors
+    ///
+    ///
+    #[expect(clippy::missing_panics_doc)]
     pub fn prepare(
-        grammar: &nativedsl::InputGrammar,
+        mut grammar: nativedsl::InputGrammar,
         rule_name: &str,
     ) -> Result<(String, CacheKey), ReplCompileError> {
         let idx = grammar
             .variables
             .iter()
             .position(|v| v.name == rule_name)
-            .ok_or(ReplCompileError::RuleNotFound)?;
-        let mut g = grammar.clone();
-        g.variables.swap(0, idx);
+            .ok_or_else(|| ReplCompileError::RuleNotFound(rule_name.to_owned()))?;
+        grammar.variables.swap(0, idx);
 
         // Strip configuration that would conflict with the chosen rule
         // being the start. The REPL is a "what does this rule match?"
@@ -282,25 +358,22 @@ impl ReplCache {
         //     means "treat matches of this rule as background between
         //     tokens" - if rule_name is also start, the parser eats
         //     all input as extras and leaves nothing to match.
-        //   - `supertype_symbols`: harmless to leave alone (only affects
-        //     node-type inheritance, not parsing), but cheap to strip.
-        if g.word_token.as_deref() == Some(rule_name) {
-            g.word_token = None;
+        if grammar.word_token.as_deref() == Some(rule_name) {
+            grammar.word_token = None;
         }
-        g.extra_symbols.retain(|r| match r {
+        grammar.extra_symbols.retain(|r| match r {
             tree_sitter_generate::rules::Rule::NamedSymbol(n) => n != rule_name,
             _ => true,
         });
-        g.supertype_symbols.retain(|s| s != rule_name);
+        let grammar = grammar.normalize();
 
-        let g = g.normalize();
-        let json_value = grammar_to_json(&g);
+        let json_value = grammar_to_json(&grammar);
         let json = serde_json::to_string(&json_value)
             .expect("grammar_to_json produces valid serde_json::Value");
 
         let mut hasher = DefaultHasher::new();
         json.hash(&mut hasher);
-        let key = CacheKey(format!("{:016x}", hasher.finish()));
+        let key = CacheKey(hasher.finish());
         Ok((json, key))
     }
 
@@ -309,26 +382,63 @@ impl ReplCache {
     /// `generate-check --write-to` to produce the codegen artifacts, then
     /// hands the resulting dir to `tree_sitter_loader::Loader` to build
     /// and `dlopen` the shared library.
+    ///
+    /// Concurrent calls for the same `key` serialize on a per-key
+    /// mutex (see [`Self::in_flight`]): the second caller waits for
+    /// the first to finish and then sees the populated `entries` entry
+    /// on its post-lock re-check, so we never run codegen + cc twice
+    /// for the same key. Different keys still proceed in parallel.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the language needs to be compiled and said
+    /// recompilation fails.
     pub async fn get_or_compile(
         &self,
         key: CacheKey,
         grammar_json: String,
     ) -> Result<Arc<Language>, ReplCompileError> {
+        // Fast path: result already cached, no coordination needed.
         if let Some(lang) = self.entries.lock().await.get(&key) {
             return Ok(Arc::clone(lang));
         }
 
-        let dir = self.cache_root.join(key.as_str());
+        // Get-or-insert a per-key serialization gate. Holding the
+        // outer `in_flight` lock briefly is fine; the slow work
+        // (codegen, cc, dlopen) runs under the inner per-key lock so
+        // sibling keys' compiles aren't blocked.
+        let per_key_lock = {
+            let mut in_flight = self.in_flight.lock().await;
+            Arc::clone(
+                in_flight
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let guard = per_key_lock.lock().await;
+
+        // Re-check after taking the per-key lock: an earlier caller
+        // for this key may have just finished and populated `entries`
+        // while we were waiting on the lock.
+        if let Some(lang) = self.entries.lock().await.get(&key) {
+            // Even though we're returning early, leave `in_flight`
+            // cleanup to the caller that originally inserted - they
+            // do it below after dropping their guard.
+            return Ok(Arc::clone(lang));
+        }
+
+        let dir = self.cache_root.join(format!("{key}"));
         let src_dir = dir.join("src");
 
         // Skip codegen if the artifacts are already on disk (LSP restart
         // case: in-memory cache empty but disk cache populated).
-        let needs_codegen = !src_dir.join("parser.c").exists()
-            || !src_dir.join("grammar.json").exists();
+        let needs_codegen =
+            !src_dir.join("parser.c").exists() || !src_dir.join("grammar.json").exists();
         if needs_codegen {
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                return Err(ReplCompileError::Spawn(e));
-            }
+            std::fs::create_dir_all(&dir).map_err(|source| ReplCompileError::CacheDir {
+                path: dir.clone(),
+                source,
+            })?;
             run_codegen_subprocess(&dir, &grammar_json).await?;
         }
 
@@ -339,7 +449,18 @@ impl ReplCache {
         let lib_path = dir.join(format!("parser.{}", std::env::consts::DLL_EXTENSION));
         let language = load_language(&src_dir, lib_path)?;
         let arc = Arc::new(language);
-        self.entries.lock().await.insert(key, Arc::clone(&arc));
+        self.entries
+            .lock()
+            .await
+            .insert(key.clone(), Arc::clone(&arc));
+
+        // Release the per-key lock and remove its `in_flight` entry
+        // now that the result is cached. Any waiters that grabbed an
+        // `Arc` before removal still hold it and will re-check
+        // `entries` on the fast path above; future callers find
+        // nothing in `in_flight` and skip the gate entirely.
+        drop(guard);
+        self.in_flight.lock().await.remove(&key);
         Ok(arc)
     }
 }
@@ -348,7 +469,7 @@ impl ReplCache {
 /// feed `grammar_json` on stdin. Returns the captured stdout (an error
 /// message from the codegen pipeline) when the subprocess exits non-zero.
 async fn run_codegen_subprocess(dir: &Path, grammar_json: &str) -> Result<(), ReplCompileError> {
-    let exe = std::env::current_exe().map_err(ReplCompileError::Spawn)?;
+    let exe = std::env::current_exe().map_err(ReplCompileError::Subprocess)?;
     let mut child = tokio::process::Command::new(exe)
         .arg("generate-check")
         .arg("--write-to")
@@ -358,48 +479,35 @@ async fn run_codegen_subprocess(dir: &Path, grammar_json: &str) -> Result<(), Re
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(ReplCompileError::Spawn)?;
+        .map_err(ReplCompileError::Subprocess)?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(grammar_json.as_bytes())
             .await
-            .map_err(ReplCompileError::Spawn)?;
+            .map_err(ReplCompileError::Subprocess)?;
     }
     let output = child
         .wait_with_output()
         .await
-        .map_err(ReplCompileError::Spawn)?;
+        .map_err(ReplCompileError::Subprocess)?;
     if output.status.success() {
         Ok(())
     } else {
-        let msg = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Err(ReplCompileError::Codegen(msg))
+        let msg = String::from_utf8_lossy(&output.stdout);
+        match serde_json::from_str::<GenerateToDirError>(msg.trim()) {
+            Ok(err) => Err(ReplCompileError::Generate(err)),
+            Err(_) => Err(ReplCompileError::GenerateUnparseable(msg.into_owned())),
+        }
     }
 }
 
 /// Compile `<src_dir>/parser.c` (and any sibling `scanner.c`) into a
-/// shared library and load it as a `tree_sitter::Language`. Uses the
-/// stock `tree_sitter_loader::Loader`; per-grammar `src/tree_sitter/`
-/// headers in the same dir resolve `#include "tree_sitter/parser.h"`.
-///
-/// `output_path` MUST be unique per (grammar, rule). The loader keys
-/// its on-disk `.so` location by the grammar's `name` field, but
-/// every rule-swapped version of one grammar shares the same name -
-/// so without an explicit `output_path`, all rules' compiles would
-/// overwrite the same `<parser_lib_path>/<name>.so`. Switching
-/// between rules would then load the most-recently-written `.so`
-/// regardless of which rule was requested - silently parsing input
-/// with the wrong rule's grammar.
+/// shared library and load it as a `tree_sitter::Language`.
 pub fn load_language(src_dir: &Path, output_path: PathBuf) -> Result<Language, ReplCompileError> {
-    let loader = Loader::new().map_err(|e| ReplCompileError::Compile(e.to_string()))?;
+    let loader = Loader::new()?;
     let config = CompileConfig::new(src_dir, None, Some(output_path));
-    // `load_language_at_path` (vs `_with_name`) reads the `name` field
-    // from `<src_dir>/grammar.json`, which is what the generated parser's
-    // exported `tree_sitter_<name>` symbol matches.
-    loader
-        .load_language_at_path(config)
-        .map_err(|e| ReplCompileError::Compile(e.to_string()))
+    Ok(loader.load_language_at_path(config)?)
 }
 
 #[cfg(test)]
@@ -423,9 +531,9 @@ mod tests {
         let grammar = parse_grammar(json).unwrap();
 
         let (out_json_start, key_start) =
-            ReplCache::prepare(&grammar, "start").expect("start exists");
+            ReplCache::prepare(grammar.clone(), "start").expect("start exists");
         let (out_json_helper, key_helper) =
-            ReplCache::prepare(&grammar, "helper").expect("helper exists");
+            ReplCache::prepare(grammar, "helper").expect("helper exists");
 
         // Distinct rules produce distinct cache keys and distinct JSON.
         assert_ne!(key_start, key_helper);
@@ -442,8 +550,8 @@ mod tests {
         let json = r#"{"name":"tiny","rules":{"start":{"type":"STRING","value":"hi"}}}"#;
         let grammar = parse_grammar(json).unwrap();
         assert!(matches!(
-            ReplCache::prepare(&grammar, "no_such_rule"),
-            Err(ReplCompileError::RuleNotFound)
+            ReplCache::prepare(grammar, "no_such_rule"),
+            Err(ReplCompileError::RuleNotFound(name)) if name == "no_such_rule"
         ));
     }
 
@@ -461,7 +569,7 @@ mod tests {
         }"#;
         let grammar = parse_grammar(json).unwrap();
         let (prepared_json, _) =
-            ReplCache::prepare(&grammar, "identifier").expect("prepare succeeds");
+            ReplCache::prepare(grammar, "identifier").expect("prepare succeeds");
         assert!(
             !prepared_json.contains("\"word\""),
             "word_token should be stripped: {prepared_json}"
@@ -486,8 +594,7 @@ mod tests {
             ]
         }"#;
         let grammar = parse_grammar(json).unwrap();
-        let (prepared_json, _) =
-            ReplCache::prepare(&grammar, "comment").expect("prepare succeeds");
+        let (prepared_json, _) = ReplCache::prepare(grammar, "comment").expect("prepare succeeds");
         // Extras still has the whitespace pattern but not the comment
         // symbol reference.
         let extras_pos = prepared_json.find("\"extras\"").expect("extras present");
@@ -501,29 +608,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_rule_header_basic() {
-        assert_eq!(parse_rule_header("# rule: expression\n1 + 2"), Some("expression"));
-        assert_eq!(parse_rule_header("# rule: program"), Some("program"));
-        // Tolerate extra whitespace around the name.
-        assert_eq!(parse_rule_header("# rule:    spaced   \n"), Some("spaced"));
-    }
-
-    #[test]
-    fn parse_rule_header_missing_or_malformed() {
-        assert_eq!(parse_rule_header(""), None);
-        assert_eq!(parse_rule_header("rule: no_pound"), None);
-        assert_eq!(parse_rule_header("# something else"), None);
-        assert_eq!(parse_rule_header("# rule:"), None);
-        assert_eq!(parse_rule_header("# rule:   "), None);
-    }
-
-    #[test]
     fn prepare_is_deterministic() {
         // Same input → same key + same JSON.
         let json = r#"{"name":"tiny","rules":{"start":{"type":"STRING","value":"hi"}}}"#;
         let grammar = parse_grammar(json).unwrap();
-        let (j1, k1) = ReplCache::prepare(&grammar, "start").unwrap();
-        let (j2, k2) = ReplCache::prepare(&grammar, "start").unwrap();
+        let (j1, k1) = ReplCache::prepare(grammar.clone(), "start").unwrap();
+        let (j2, k2) = ReplCache::prepare(grammar, "start").unwrap();
         assert_eq!(j1, j2);
         assert_eq!(k1, k2);
     }
@@ -566,13 +656,17 @@ mod tests {
         }"#;
         let grammar = parse_grammar(json).unwrap();
 
-        let (prepared_json, _) =
-            ReplCache::prepare(&grammar, "comment").expect("prepare succeeds");
+        let (prepared_json, _) = ReplCache::prepare(grammar, "comment").expect("prepare succeeds");
 
         // Compile in a temp dir + load.
         let tmp = tempfile::TempDir::new().unwrap();
         crate::generate_check::generate_to_dir(tmp.path(), &prepared_json).expect("generate");
-        let language = load_language(&tmp.path().join("src"), tmp.path().join(format!("parser.{}", std::env::consts::DLL_EXTENSION))).expect("loader");
+        let language = load_language(
+            &tmp.path().join("src"),
+            tmp.path()
+                .join(format!("parser.{}", std::env::consts::DLL_EXTENSION)),
+        )
+        .expect("loader");
 
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language).unwrap();
@@ -587,46 +681,6 @@ mod tests {
             "tree contains an ERROR despite matching the start rule: {sexp}"
         );
         assert_eq!(sexp, "(comment)");
-    }
-
-    /// Faithful repro using tree-sitter-c's real grammar.tsg. Runs the
-    /// full analyze -> prepare(rule="comment") -> generate -> compile
-    /// -> parse pipeline; ensures the *actual* C grammar's comment rule
-    /// is usable as a REPL start. The minimal repro above stays as a
-    /// fast regression guard; this one catches anything specific to
-    /// the C grammar's shape (conflicts, inline, supertypes,
-    /// word_token, ...). Marked `#[ignore]` (requires cc + the
-    /// grammars/ checkout). Run with
-    /// `cargo test --lib --ignored repl::tests::tree_sitter_c_comment_as_start`.
-    #[test]
-    #[ignore = "requires cc + ~/projects/grammars/tree-sitter-c"]
-    fn tree_sitter_c_comment_as_start() {
-        let grammar_path = std::path::PathBuf::from(
-            "/home/lillis/projects/grammars/tree-sitter-c/grammar.tsg",
-        );
-        let text = std::fs::read_to_string(&grammar_path).expect("read grammar");
-        let uri = tower_lsp::lsp_types::Url::from_file_path(&grammar_path).unwrap();
-        let outcome = crate::analysis::analyze(text, &uri).expect("analyze");
-        let grammar = outcome
-            .pipeline
-            .expect("pipeline ran")
-            .expect("loader succeeded");
-
-        let (prepared_json, _) =
-            ReplCache::prepare(&grammar, "comment").expect("prepare succeeds");
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        crate::generate_check::generate_to_dir(tmp.path(), &prepared_json).expect("generate");
-        let language = load_language(&tmp.path().join("src"), tmp.path().join(format!("parser.{}", std::env::consts::DLL_EXTENSION))).expect("loader");
-
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&language).unwrap();
-        for input in ["//", "// ", "// h", "// this is a co", "// this is a comment"] {
-            let tree = parser.parse(input, None).unwrap();
-            let sexp = tree.root_node().to_sexp();
-            let has_err = tree.root_node().has_error();
-            eprintln!("input={input:?} has_err={has_err} sexp={sexp}");
-        }
     }
 
     /// End-to-end loader exercise: produce artifacts in-process (skipping
@@ -647,7 +701,12 @@ mod tests {
         }"#;
         let tmp = tempfile::TempDir::new().unwrap();
         crate::generate_check::generate_to_dir(tmp.path(), json).expect("generate");
-        let language = load_language(&tmp.path().join("src"), tmp.path().join(format!("parser.{}", std::env::consts::DLL_EXTENSION))).expect("loader compile + dlopen");
+        let language = load_language(
+            &tmp.path().join("src"),
+            tmp.path()
+                .join(format!("parser.{}", std::env::consts::DLL_EXTENSION)),
+        )
+        .expect("loader compile + dlopen");
 
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language).unwrap();

@@ -11,7 +11,9 @@ pub async fn did_save(backend: &Backend, params: DidSaveTextDocumentParams) {
     // REPL buffers don't go through the `.tsg` diagnostic pipeline.
     // Saves on a REPL buffer are no-ops: the parse state lives in
     // memory on the session and is already refreshed by did_change.
-    if crate::repl::is_repl_uri(&uri) {
+    if crate::repl::ReplInputUri::try_from_uri(&uri).is_some()
+        || crate::repl::ReplTreeUri::try_from_uri(&uri).is_some()
+    {
         return;
     }
 

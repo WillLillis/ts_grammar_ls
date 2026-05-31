@@ -1,32 +1,19 @@
 //! Concrete-syntax-tree renderer for `tree_sitter::Tree`.
 //!
 //! Vendored from `tree_sitter_cli::parse` (the `--output-cst` mode of
-//! the `tree-sitter parse` command). The upstream renderer is bundled
-//! with the CLI binary which carries a heavy dep set; copying the
-//! relevant ~250 lines keeps our dep graph small. The original is at
-//! `tree-sitter/crates/cli/src/parse.rs`; this version is faithful to
-//! upstream's output structure with one substitution:
+//! the `tree-sitter parse` command) with two substitutions:
 //!
-//!   - The `anstyle::Color` type is replaced by a local [`ColorKind`]
-//!     tag enum, and [`paint`] is a stub that writes plain text without
-//!     emitting ANSI escapes. The call structure is preserved so that
-//!     adding LSP semantic tokens later only requires changing the
-//!     `paint` impl to record (range, kind) tuples instead of writing
-//!     the text directly. Each `paint(theme.<field>, ...)` call site
-//!     keeps its color category, which is what the semantic-tokens
-//!     layer will eventually map to LSP token kinds.
-//!
-//! Public surface: [`render`] takes a [`Tree`] + source bytes, returns
-//! the rendered CST as a `String`. Keep in sync with upstream's
-//! renderer if its output format changes.
+//!   - The `anstyle::Color` type is replaced by [`ColorKind`]
+//!   - Instead of writing ANSI escapes, the renderer records each
+//!     colored region as a `(byte_start, byte_end, ColorKind)` span
+//!     alongside the plain text. The LSP semantic-tokens handler
+//!     converts these spans to LSP token deltas to provide highlighting.
 
 use std::fmt::{self, Write as _};
 
 use tree_sitter::{Range, Tree, TreeCursor};
 
 /// Tag for which theme slot a piece of rendered text belongs to.
-/// Mirrors the field names of upstream's `ParseTheme` so semantic-token
-/// mapping (future) can route each kind to a distinct LSP token type.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ColorKind {
     NodeKind,
@@ -43,8 +30,7 @@ pub enum ColorKind {
 }
 
 /// Theme: which color (if any) is associated with each renderable
-/// category. `Default` matches upstream's defaults symbolically;
-/// [`Self::empty`] is no-color (every field `None`).
+/// category.
 #[derive(Copy, Clone, Debug)]
 pub struct ParseTheme {
     pub node_kind: Option<ColorKind>,
@@ -97,41 +83,40 @@ impl Default for ParseTheme {
     }
 }
 
-/// Wrapper that preserves upstream's `paint(color, text)` call shape.
-/// Today it just writes the text. When we add LSP semantic tokens,
-/// the `Display` impl will record the current output offset and the
-/// `ColorKind` so the semantic-tokens handler can return matching
-/// `(range, kind)` tuples; the call sites in [`render_node`] /
-/// [`write_node_text`] won't change.
-pub struct Paint<T>(#[allow(dead_code)] pub Option<ColorKind>, pub T);
-
-#[must_use]
-pub fn paint<T>(color: Option<ColorKind>, text: T) -> Paint<T> {
-    Paint(color, text)
+/// One colored region of the rendered tree text. Half-open byte
+/// range `[start, end)` into [`CstRender::text`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CstSpan {
+    pub start: usize,
+    pub end: usize,
+    pub kind: ColorKind,
 }
 
-impl<T: fmt::Display> fmt::Display for Paint<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.1.fmt(f)
-    }
+/// Output of [`render`]: the plain rendered tree text plus a list of
+/// colored byte ranges into it (in source order).
+#[derive(Debug, Default)]
+pub struct CstRender {
+    pub text: String,
+    pub spans: Vec<CstSpan>,
 }
 
-/// Render `tree` as a CST in `tree-sitter parse --output-cst` format.
-/// Source bytes are needed to recover the text of each leaf node.
+/// Render `tree` as a CST.
 #[must_use]
-pub fn render(source: &[u8], tree: &Tree) -> String {
-    render_with_theme(source, tree, &ParseTheme::empty())
+pub fn render(source: &[u8], tree: &Tree) -> CstRender {
+    render_with_theme(source, tree, &ParseTheme::default())
 }
 
 #[must_use]
-pub fn render_with_theme(source: &[u8], tree: &Tree, theme: &ParseTheme) -> String {
-    let mut out = String::new();
+pub fn render_with_theme(source: &[u8], tree: &Tree, theme: &ParseTheme) -> CstRender {
+    let mut r = Renderer::default();
     let lossy = String::from_utf8_lossy(source);
     let total_width = lossy
         .lines()
         .enumerate()
         .map(|(row, col)| {
-            (row as f64).log10() as usize + (col.len() as f64).log10() as usize + 1
+            row.checked_ilog10().unwrap_or(0) as usize
+                + col.len().checked_ilog10().unwrap_or(0) as usize
+                + 1
         })
         .max()
         .unwrap_or(1);
@@ -157,7 +142,7 @@ pub fn render_with_theme(source: &[u8], tree: &Tree, theme: &ParseTheme) -> Stri
                 theme,
                 &cursor,
                 source,
-                &mut out,
+                &mut r,
                 total_width,
                 indent_level,
                 in_error,
@@ -173,44 +158,123 @@ pub fn render_with_theme(source: &[u8], tree: &Tree, theme: &ParseTheme) -> Stri
             }
         }
     }
-    out
+
+    CstRender {
+        text: r.text,
+        spans: r.spans,
+    }
+}
+
+/// Mutable rendering state.
+#[derive(Default)]
+struct Renderer {
+    text: String,
+    spans: Vec<CstSpan>,
+}
+
+impl Renderer {
+    /// Write plain (uncolored) text. No span is emitted.
+    fn push_str(&mut self, s: &str) {
+        self.text.push_str(s);
+    }
+
+    fn push_char(&mut self, c: char) {
+        self.text.push(c);
+    }
+
+    /// Write `text` and, if `color` is `Some`, record a span covering
+    /// the bytes that were just appended.
+    fn push_styled_str(&mut self, color: Option<ColorKind>, text: &str) {
+        let start = self.text.len();
+        self.text.push_str(text);
+        if let Some(kind) = color {
+            self.spans.push(CstSpan {
+                start,
+                end: self.text.len(),
+                kind,
+            });
+        }
+    }
+
+    /// Write a single colored character.
+    fn push_styled_char(&mut self, color: Option<ColorKind>, c: char) {
+        let start = self.text.len();
+        self.text.push(c);
+        if let Some(kind) = color {
+            self.spans.push(CstSpan {
+                start,
+                end: self.text.len(),
+                kind,
+            });
+        }
+    }
+
+    /// Format the given [`fmt::Display`]/[`fmt::Arguments`] argument
+    /// into the buffer and tag the resulting bytes with `color`.
+    fn push_styled_fmt(&mut self, color: Option<ColorKind>, args: fmt::Arguments<'_>) {
+        let start = self.text.len();
+        let _ = write!(self.text, "{args}");
+        if let Some(kind) = color {
+            self.spans.push(CstSpan {
+                start,
+                end: self.text.len(),
+                kind,
+            });
+        }
+    }
+
+    /// Write text with each character escape-transformed (matching
+    /// upstream's `CstNodeText`) and tag the bytes with `color`.
+    /// Escapes are applied first; the entire resulting region is one
+    /// span (the transform doesn't switch color mid-character).
+    fn push_styled_escaped(&mut self, color: Option<ColorKind>, source: &str) {
+        let start = self.text.len();
+        for c in source.chars() {
+            match escape_invisible(c).or_else(|| escape_delimiter(c)) {
+                Some(esc) => self.text.push_str(esc),
+                None => self.text.push(c),
+            }
+        }
+        if let Some(kind) = color {
+            self.spans.push(CstSpan {
+                start,
+                end: self.text.len(),
+                kind,
+            });
+        }
+    }
 }
 
 fn render_node(
     theme: &ParseTheme,
     cursor: &TreeCursor,
     source_code: &[u8],
-    out: &mut String,
+    r: &mut Renderer,
     total_width: usize,
     indent_level: usize,
     in_error: bool,
 ) {
     let node = cursor.node();
     let is_named = node.is_named();
-    let _ = write!(
-        out,
-        "{}",
-        CstNodeRange {
-            theme,
-            has_field_name: cursor.field_name().is_some(),
-            is_named,
-            is_multiline: false,
-            total_width,
-            range: node.range(),
-        }
+    push_node_range(
+        r,
+        theme,
+        cursor.field_name().is_some(),
+        is_named,
+        false,
+        total_width,
+        node.range(),
     );
-    let _ = write!(
-        out,
-        "{}{}",
-        "  ".repeat(indent_level),
-        if in_error && !node.has_error() { " " } else { "" }
-    );
+    r.push_str(&"  ".repeat(indent_level));
+    if in_error && !node.has_error() {
+        r.push_str(" ");
+    }
     if is_named {
         if let Some(field_name) = cursor.field_name() {
-            let _ = write!(out, "{}", paint(theme.field, format_args!("{field_name}: ")));
+            r.push_styled_fmt(theme.field, format_args!("{field_name}: "));
         }
         if node.has_error() || node.is_error() {
-            let _ = write!(out, "{}", paint(theme.error, "•"));
+            r.push_styled_str(theme.error, "•");
         }
         let kind_color = if node.is_error() {
             theme.error
@@ -219,13 +283,12 @@ fn render_node(
         } else {
             theme.node_kind
         };
-        let _ = write!(out, "{}", paint(kind_color, node.kind()));
+        r.push_styled_str(kind_color, node.kind());
         if node.child_count() == 0 {
-            let text =
-                String::from_utf8_lossy(&source_code[node.start_byte()..node.end_byte()]);
+            let text = String::from_utf8_lossy(&source_code[node.start_byte()..node.end_byte()]);
             write_node_text(
                 theme,
-                out,
+                r,
                 cursor,
                 is_named,
                 &text,
@@ -234,12 +297,14 @@ fn render_node(
             );
         }
     } else if node.is_missing() {
-        let _ = write!(out, "{}: ", paint(theme.missing, "MISSING"));
-        let _ = write!(out, "\"{}\"", paint(theme.missing, node.kind()));
+        r.push_styled_str(theme.missing, "MISSING");
+        r.push_str(": \"");
+        r.push_styled_str(theme.missing, node.kind());
+        r.push_str("\"");
     } else {
         write_node_text(
             theme,
-            out,
+            r,
             cursor,
             is_named,
             node.kind(),
@@ -247,12 +312,12 @@ fn render_node(
             (total_width, indent_level),
         );
     }
-    out.push('\n');
+    r.push_char('\n');
 }
 
 fn write_node_text(
     theme: &ParseTheme,
-    out: &mut String,
+    r: &mut Renderer,
     cursor: &TreeCursor,
     is_named: bool,
     source: &str,
@@ -266,15 +331,7 @@ fn write_node_text(
         ('"', color)
     };
 
-    if !is_named {
-        let _ = write!(
-            out,
-            "{}{}{}",
-            paint(quote_color, quote),
-            paint(color, CstNodeText(source)),
-            paint(quote_color, quote),
-        );
-    } else {
+    if is_named {
         let multiline = source.contains('\n');
         for (i, line) in source.split_inclusive('\n').enumerate() {
             if line.is_empty() {
@@ -292,111 +349,97 @@ fn write_node_text(
                     0
                 };
             if multiline {
-                out.push('\n');
-                let _ = write!(
-                    out,
-                    "{}",
-                    CstNodeRange {
-                        theme,
-                        has_field_name: cursor.field_name().is_some(),
-                        is_named,
-                        is_multiline: true,
-                        total_width,
-                        range: node_range,
-                    }
+                r.push_char('\n');
+                push_node_range(
+                    r,
+                    theme,
+                    cursor.field_name().is_some(),
+                    is_named,
+                    true,
+                    total_width,
+                    node_range,
                 );
                 for _ in 0..=indent_level {
-                    let _ = out.write_str("  ");
+                    r.push_str("  ");
                 }
             } else {
-                let _ = out.write_char(' ');
+                r.push_char(' ');
             }
-            let _ = write!(
-                out,
-                "{}{}{}",
-                paint(quote_color, quote),
-                paint(color, CstLineFeed { source: line, theme }),
-                paint(quote_color, quote),
-            );
+            r.push_styled_char(quote_color, quote);
+            push_line_feed(r, theme, color, line);
+            r.push_styled_char(quote_color, quote);
         }
+    } else {
+        r.push_styled_char(quote_color, quote);
+        r.push_styled_escaped(color, source);
+        r.push_styled_char(quote_color, quote);
     }
 }
 
-struct CstNodeText<'a>(&'a str);
-
-impl fmt::Display for CstNodeText<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for c in self.0.chars() {
-            match escape_invisible(c).or_else(|| escape_delimiter(c)) {
-                Some(esc) => f.write_str(esc)?,
-                None => f.write_char(c)?,
-            }
-        }
-        Ok(())
-    }
-}
-
-struct CstLineFeed<'a> {
-    source: &'a str,
-    theme: &'a ParseTheme,
-}
-
-impl fmt::Display for CstLineFeed<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        #[cfg(windows)]
-        let lf = "\r\n";
-        #[cfg(not(windows))]
-        let lf = "\n";
-        let painted = paint(self.theme.line_feed, CstNodeText(lf));
-        let mut parts = self.source.split(lf);
-        if let Some(first) = parts.next() {
-            write!(f, "{}", CstNodeText(first))?;
-        }
-        for part in parts {
-            write!(f, "{painted}{}", CstNodeText(part))?;
-        }
-        Ok(())
-    }
-}
-
-struct CstNodeRange<'a> {
-    theme: &'a ParseTheme,
+/// Push the row-range prefix
+fn push_node_range(
+    r: &mut Renderer,
+    theme: &ParseTheme,
     has_field_name: bool,
     is_named: bool,
     is_multiline: bool,
     total_width: usize,
     range: Range,
+) {
+    let start = range.start_point;
+    let end = range.end_point;
+    let range_color = if is_named && !is_multiline && !has_field_name {
+        theme.row_color_named
+    } else {
+        theme.row_color
+    };
+    let remaining_width = |row: usize, col: usize| {
+        total_width
+            .saturating_sub(row.checked_ilog10().unwrap_or(0) as usize)
+            .saturating_sub(col.checked_ilog10().unwrap_or(0) as usize)
+            .max(1)
+    };
+    let remaining_width_start = remaining_width(start.row, start.column);
+    let remaining_width_end = remaining_width(end.row, end.column);
+    r.push_styled_fmt(
+        range_color,
+        format_args!(
+            "{}:{}{:remaining_width_start$}- {}:{}{:remaining_width_end$}",
+            start.row, start.column, ' ', end.row, end.column, ' ',
+        ),
+    );
 }
 
-impl fmt::Display for CstNodeRange<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let start = self.range.start_point;
-        let end = self.range.end_point;
-        let range_color = if self.is_named && !self.is_multiline && !self.has_field_name {
-            self.theme.row_color_named
-        } else {
-            self.theme.row_color
-        };
-        let remaining_width = |row: usize, col: usize| {
-            (self
-                .total_width
-                .saturating_sub((row as f64).log10() as usize)
-                .saturating_sub((col as f64).log10() as usize))
-            .max(1)
-        };
-        let remaining_width_start = remaining_width(start.row, start.column);
-        let remaining_width_end = remaining_width(end.row, end.column);
-        write!(
-            f,
-            "{}",
-            paint(
-                range_color,
-                format_args!(
-                    "{}:{}{:remaining_width_start$}- {}:{}{:remaining_width_end$}",
-                    start.row, start.column, ' ', end.row, end.column, ' ',
-                ),
-            )
-        )
+/// Push a line's text with embedded linefeed markers. Replaces
+/// upstream's `CstLineFeed` Display impl: the regular text gets
+/// `text_color`, the linefeed markers get `theme.line_feed`, and the
+/// two alternate.
+fn push_line_feed(
+    r: &mut Renderer,
+    theme: &ParseTheme,
+    text_color: Option<ColorKind>,
+    source: &str,
+) {
+    #[cfg(windows)]
+    let lf = "\r\n";
+    #[cfg(not(windows))]
+    let lf = "\n";
+    // Display form of the linefeed (e.g. "\\n"). Built once because
+    // we emit it between every pair of source segments.
+    let mut lf_escaped = String::new();
+    for c in lf.chars() {
+        match escape_invisible(c).or_else(|| escape_delimiter(c)) {
+            Some(esc) => lf_escaped.push_str(esc),
+            None => lf_escaped.push(c),
+        }
+    }
+    let mut parts = source.split(lf);
+    if let Some(first) = parts.next() {
+        r.push_styled_escaped(text_color, first);
+    }
+    for part in parts {
+        r.push_styled_str(theme.line_feed, &lf_escaped);
+        r.push_styled_escaped(text_color, part);
     }
 }
 

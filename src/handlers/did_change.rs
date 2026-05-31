@@ -20,8 +20,13 @@ pub async fn did_change(backend: &Backend, params: DidChangeTextDocumentParams) 
 
     // REPL buffers don't go through the `.tsg` diagnostic pipeline -
     // they're treated as parse input, not grammar source.
-    if crate::repl::is_repl_uri(&uri) {
-        crate::handlers::repl::handle_repl_change(backend, &uri, &text);
+    if let Some(input_uri) = crate::repl::ReplInputUri::try_from_uri(&uri) {
+        crate::handlers::repl::handle_repl_change(backend, &input_uri, &text);
+        return;
+    }
+    // Tree-side buffers are server-driven via applyEdit; ignore
+    // client-originated change events for them outright.
+    if crate::repl::ReplTreeUri::try_from_uri(&uri).is_some() {
         return;
     }
 

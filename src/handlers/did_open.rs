@@ -12,11 +12,16 @@ pub async fn did_open(backend: &Backend, params: DidOpenTextDocumentParams) {
     let version = params.text_document.version;
     info!("did_open: {uri}");
 
-    // REPL buffers: skip the `.tsg` analysis path, route to the session
-    // handler so it can refresh the rule from the header + trigger a
-    // compile if needed.
-    if crate::repl::is_repl_uri(&uri) {
-        crate::handlers::repl::handle_repl_change(backend, &uri, &text);
+    // REPL input buffers: skip the `.tsg` analysis path, route to the
+    // session handler so it can stash text + kick a compile if needed.
+    if let Some(input_uri) = crate::repl::ReplInputUri::try_from_uri(&uri) {
+        crate::handlers::repl::handle_repl_change(backend, &input_uri, &text);
+        return;
+    }
+    // Tree-side buffers: skip the analysis path. Their content is
+    // rendered CST, not grammar source; the user-facing settings
+    // (rule, format) are surfaced on the input buffer.
+    if crate::repl::ReplTreeUri::try_from_uri(&uri).is_some() {
         return;
     }
 
