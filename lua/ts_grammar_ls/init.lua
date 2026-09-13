@@ -136,12 +136,6 @@ function M.setup()
 		desc = "Close grammar REPL buffers and return to the grammar",
 		force = true,
 	})
-
-	-- Also repair REPL buffers that predate setup(), which is useful when
-	-- developing and reloading this module in an existing Neovim session.
-	for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-		configure_repl_buffer(buf)
-	end
 end
 
 return M
