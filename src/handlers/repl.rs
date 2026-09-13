@@ -18,6 +18,9 @@
 //! - `tsg.setReplRule { uri }` - changes the start rule for the REPL
 //!   bound to `uri`. Picks the new rule via `window/showMessageRequest`
 //!   populated from the grammar's analysis.
+//! - `tsg.returnToGrammar { uri }` - asks the client to focus the grammar
+//!   bound to a REPL input/tree URI. LSP has no close-window request, so a
+//!   client plugin may override this command to also close the REPL windows.
 //!
 //! ## Process model
 //!
@@ -57,6 +60,7 @@ use crate::server::Backend;
 pub const OPEN_REPL_COMMAND: &str = "tsg.openRepl";
 pub const SET_REPL_RULE_COMMAND: &str = "tsg.setReplRule";
 pub const TOGGLE_REPL_FORMAT_COMMAND: &str = "tsg.toggleReplFormat";
+pub const RETURN_TO_GRAMMAR_COMMAND: &str = "tsg.returnToGrammar";
 
 /// Top-level dispatch for `workspace/executeCommand`. Routes to the
 /// per-command handler based on `params.command`; unknown commands
@@ -69,6 +73,7 @@ pub async fn execute_command(
         OPEN_REPL_COMMAND => open_repl(backend, params),
         SET_REPL_RULE_COMMAND => set_repl_rule(backend, params).await,
         TOGGLE_REPL_FORMAT_COMMAND => toggle_repl_format(backend, params).await,
+        RETURN_TO_GRAMMAR_COMMAND => return_to_grammar(backend, params),
         _ => None,
     }
 }
@@ -112,15 +117,25 @@ fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Option<serde_j
     // when we ask it to open one, rather than racing the first compile.
     let _ = std::fs::write(tree_uri.tree_path(), "");
 
-    // Fire `window/showDocument` as detached tasks for both buffers.
+    // Fire `window/showDocument` as a detached task for both buffers.
     // The request awaits a client response, and we don't want our
-    // `executeCommand` reply gated on that round trip. Open the tree
-    // buffer first (so it's the unfocused split) then the input (so
-    // it ends up focused).
+    // `executeCommand` reply gated on that round trip. Show both without
+    // focus first, then focus the already-visible input. In clients such as
+    // Neovim, a focused show reuses the current window while an unfocused
+    // show creates another one; this sequence preserves the grammar window
+    // instead of replacing it with the input buffer.
     let client = backend.client.clone();
     let input_url = input_uri.as_url().clone();
     let tree_url = tree_uri.as_url().clone();
     tokio::spawn(async move {
+        let _ = client
+            .show_document(ShowDocumentParams {
+                uri: input_url.clone(),
+                external: Some(false),
+                take_focus: Some(false),
+                selection: None,
+            })
+            .await;
         let _ = client
             .show_document(ShowDocumentParams {
                 uri: tree_url,
@@ -143,6 +158,48 @@ fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Option<serde_j
         "uri": input_uri.as_url().to_string(),
         "tree_uri": tree_uri.as_url().to_string(),
         "rule": rule_name,
+    }))
+}
+
+/// Focus the grammar associated with a REPL buffer.
+///
+/// The LSP protocol can show/focus documents but cannot close editor windows.
+/// Preserving the original grammar window in [`open_repl`] makes this useful
+/// without client integration; a plugin can override the same command and use
+/// the supplied input/tree URIs to close those windows as well.
+fn return_to_grammar(
+    backend: &Backend,
+    params: &ExecuteCommandParams,
+) -> Option<serde_json::Value> {
+    #[derive(Deserialize)]
+    struct Args {
+        uri: Url,
+    }
+
+    let args: Args = serde_json::from_value(params.arguments.first()?.clone()).ok()?;
+    let input_uri = crate::repl::ReplInputUri::try_from_uri(&args.uri).or_else(|| {
+        crate::repl::ReplTreeUri::try_from_uri(&args.uri).map(|tree| tree.input_uri())
+    })?;
+    let meta = ReplMeta::read_for(&input_uri)?;
+    let grammar_uri = meta.grammar_uri;
+
+    let client = backend.client.clone();
+    let focus_uri = grammar_uri.clone();
+    tokio::spawn(async move {
+        let _ = client
+            .show_document(ShowDocumentParams {
+                uri: focus_uri,
+                external: Some(false),
+                take_focus: Some(true),
+                selection: None,
+            })
+            .await;
+    });
+
+    Some(serde_json::json!({
+        "uri": grammar_uri.to_string(),
+        "input_uri": input_uri.as_url().to_string(),
+        "tree_uri": input_uri.tree_uri().as_url().to_string(),
     }))
 }
 

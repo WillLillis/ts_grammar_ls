@@ -64,6 +64,7 @@ pub async fn initialize(backend: &Backend, params: InitializeParams) -> Initiali
                     crate::handlers::repl::OPEN_REPL_COMMAND.into(),
                     crate::handlers::repl::SET_REPL_RULE_COMMAND.into(),
                     crate::handlers::repl::TOGGLE_REPL_FORMAT_COMMAND.into(),
+                    crate::handlers::repl::RETURN_TO_GRAMMAR_COMMAND.into(),
                 ],
                 work_done_progress_options: WorkDoneProgressOptions::default(),
             }),

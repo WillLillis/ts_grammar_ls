@@ -9,9 +9,9 @@ use tower_lsp::lsp_types::notification::{
     DidOpenTextDocument, DidSaveTextDocument, Initialized,
 };
 use tower_lsp::lsp_types::request::{
-    CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest, ExecuteCommand,
-    Formatting, GotoDefinition, HoverRequest, Initialize, PrepareRenameRequest, References, Rename,
-    SemanticTokensFullRequest,
+    CodeActionRequest, CodeLensRequest, Completion, DocumentHighlightRequest,
+    DocumentSymbolRequest, ExecuteCommand, Formatting, GotoDefinition, HoverRequest, Initialize,
+    PrepareRenameRequest, References, Rename, SemanticTokensFullRequest,
 };
 use tower_lsp::lsp_types::*;
 
@@ -2812,8 +2812,46 @@ async fn open_repl_creates_input_buffer_with_default_rule() {
         serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
     assert_eq!(meta.current_rule, "program");
     assert_eq!(meta.grammar_uri, uri);
+
+    let lenses = lsp_request::<CodeLensRequest>(
+        &mut service,
+        CodeLensParams {
+            text_document: TextDocumentIdentifier {
+                uri: repl_uri.clone(),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        },
+    )
+    .await
+    .expect("REPL input has code lenses");
+    assert_eq!(lenses.len(), 2);
+    assert_eq!(
+        lenses[1]
+            .command
+            .as_ref()
+            .map(|command| command.title.as_str()),
+        Some("Return to grammar")
+    );
+
+    let returned = lsp_request::<ExecuteCommand>(
+        &mut service,
+        ExecuteCommandParams {
+            command: ts_grammar_ls::handlers::repl::RETURN_TO_GRAMMAR_COMMAND.into(),
+            arguments: vec![serde_json::json!({ "uri": repl_uri.to_string() })],
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        },
+    )
+    .await
+    .expect("return command returned URI metadata");
+    assert_eq!(
+        returned.get("uri").and_then(serde_json::Value::as_str),
+        Some(uri.as_str())
+    );
+
     std::fs::remove_file(&path).ok();
     std::fs::remove_file(&meta_path).ok();
+    std::fs::remove_file(input_uri.tree_path()).ok();
 }
 
 /// A derived grammar whose own first declaration is a hidden `override rule`

@@ -1,8 +1,7 @@
 //! `textDocument/codeLens` for REPL input buffers.
 //!
-//! Returns a single lens at line 0 showing the current rule
-//! (`Rule: <name>`). Click runs `tsg.setReplRule`. Tree-side buffers
-//! don't get a lens - the tree format toggle is exposed as a code
+//! Returns lenses at line 0 for changing the current rule and returning to the
+//! owning grammar. Tree-side buffers don't get a lens; the tree format toggle is exposed as a code
 //! action on the input buffer instead (see
 //! `handlers::code_action::build_toggle_repl_format_action`), because
 //! neovim's codelens auto-fetch doesn't fire for unfocused buffers
@@ -29,17 +28,18 @@ fn input_buffer_lenses(backend: &Backend, input_uri: &ReplInputUri) -> Option<Ve
         .map(|s| s.lock().unwrap().current_rule.clone())
         .or_else(|| ReplMeta::read_for(input_uri).map(|m| m.current_rule))?;
 
-    Some(vec![CodeLens {
-        range: Range {
-            start: Position {
-                line: 0,
-                character: 0,
-            },
-            end: Position {
-                line: 0,
-                character: 0,
-            },
+    let range = Range {
+        start: Position {
+            line: 0,
+            character: 0,
         },
+        end: Position {
+            line: 0,
+            character: 0,
+        },
+    };
+    let mut lenses = vec![CodeLens {
+        range,
         command: Some(Command {
             title: format!("Rule: {rule}"),
             command: crate::handlers::repl::SET_REPL_RULE_COMMAND.into(),
@@ -48,5 +48,27 @@ fn input_buffer_lenses(backend: &Backend, input_uri: &ReplInputUri) -> Option<Ve
             ]),
         }),
         data: None,
-    }])
+    }];
+
+    if let Some(meta) = ReplMeta::read_for(input_uri) {
+        lenses.push(CodeLens {
+            range,
+            command: Some(Command {
+                title: "Return to grammar".into(),
+                command: crate::handlers::repl::RETURN_TO_GRAMMAR_COMMAND.into(),
+                // Include every URI a client override needs to focus the
+                // grammar and close the two REPL windows without another
+                // server round trip. The server fallback only reads `uri`.
+                arguments: Some(vec![serde_json::json!({
+                    "uri": input_uri.as_url().to_string(),
+                    "input_uri": input_uri.as_url().to_string(),
+                    "tree_uri": input_uri.tree_uri().as_url().to_string(),
+                    "grammar_uri": meta.grammar_uri.to_string(),
+                })]),
+            }),
+            data: None,
+        });
+    }
+
+    Some(lenses)
 }
