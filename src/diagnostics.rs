@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use ropey::Rope;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use tower_lsp::{
     Client,
@@ -29,14 +29,60 @@ fn merge_diagnostics(doc: &Document) -> Vec<Diagnostic> {
     out
 }
 
+/// Convert core's structured codegen diagnostics into LSP diagnostics. Only
+/// `UnnecessaryConflicts` is surfaced here: it needs the full LR table build,
+/// which the AST lints can't do. The enum's other variants overlap with the
+/// AST lints L002-L004 (which give precise spans), so they're left to those -
+/// the match is exhaustive so a new core variant forces a decision here.
+fn codegen_diagnostics_to_lsp(
+    diags: &[tree_sitter_generate::Diagnostic],
+    module: &Module,
+    uri: &Url,
+) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for d in diags {
+        match d {
+            tree_sitter_generate::Diagnostic::UnnecessaryConflicts(groups) => {
+                for finding in
+                    crate::lints::unnecessary_conflicts::findings_from_conflicts(groups, module)
+                {
+                    out.push(crate::lints::finding_to_diagnostic(
+                        &finding,
+                        &module.rope,
+                        uri,
+                    ));
+                }
+            }
+            // Each of these has a dedicated AST lint that reports it with a
+            // precise source span, so the codegen-side copy is dropped here
+            // rather than double-reported at the grammar's coarse span.
+            tree_sitter_generate::Diagnostic::UnaryChoice { .. }
+            | tree_sitter_generate::Diagnostic::UnarySeq { .. }
+            | tree_sitter_generate::Diagnostic::EmptyStringMatch(_)
+            | tree_sitter_generate::Diagnostic::UnsupportedRegexFlag { .. } => {}
+            // TODO: no AST lint for this one yet ("rule is both a supertype
+            // and inlined; the supertype is ignored"). Dropped for now so it
+            // isn't reported without a usable span - it wants its own lint
+            // that can point at the `supertypes:` / `inline:` entry.
+            tree_sitter_generate::Diagnostic::SupertypeInlined { .. } => {}
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Error conversion
 // ---------------------------------------------------------------------------
 
-fn dsl_error_to_diagnostics(error: &DslError, rope: &Rope) -> Vec<Diagnostic> {
+fn dsl_error_to_diagnostics(
+    error: &DslError,
+    documents: &nativedsl::DocumentMap,
+) -> Vec<Diagnostic> {
+    let primary = documents.document(error.document());
+    let rope = Rope::from_str(primary.text());
     let range = error
         .span()
-        .map(|s| text::span_to_range(rope, s))
+        .map(|s| text::span_to_range(&rope, s))
         .unwrap_or_default();
     let source = Some("ts_grammar_ls".into());
 
@@ -52,9 +98,10 @@ fn dsl_error_to_diagnostics(error: &DslError, rope: &Rope) -> Vec<Diagnostic> {
         .notes()
         .iter()
         .filter_map(|note| {
-            let note_uri = Url::from_file_path(&note.path).ok()?;
-            let note_rope = Rope::from_str(&note.source);
-            let note_range = text::span_to_range(&note_rope, note.span);
+            let document = documents.document(note.location.document);
+            let note_uri = Url::from_file_path(document.path()).ok()?;
+            let note_rope = Rope::from_str(document.text());
+            let note_range = text::span_to_range(&note_rope, note.location.span);
             Some(DiagnosticRelatedInformation {
                 location: Location {
                     uri: note_uri,
@@ -74,7 +121,6 @@ fn dsl_error_to_diagnostics(error: &DslError, rope: &Rope) -> Vec<Diagnostic> {
 // ---------------------------------------------------------------------------
 // Pipeline runner
 // ---------------------------------------------------------------------------
-
 
 // ---------------------------------------------------------------------------
 // Publishing
@@ -129,18 +175,12 @@ pub async fn run_and_publish(
             // Dependent files: republish their diagnostics; the parsed
             // grammar isn't needed (generate-check fires only for the
             // originating URI).
-            let _ = publish_dsl_diagnostics(
-                client,
-                document_map,
-                &dep_uri,
-                &dep_text,
-                dep_version,
-            )
-            .await;
+            let _ = publish_dsl_diagnostics(client, document_map, &dep_uri, &dep_text, dep_version)
+                .await;
         }
     }
 
-    if let Ok(grammar) = grammar
+    if let Ok(grammar_json) = grammar
         && include_generate_check
     {
         spawn_generate_check(
@@ -148,7 +188,7 @@ pub async fn run_and_publish(
             Arc::clone(document_map),
             Arc::clone(generate_child),
             uri,
-            grammar,
+            grammar_json,
             version,
         );
     }
@@ -163,22 +203,16 @@ async fn publish_dsl_diagnostics(
     uri: &Url,
     text: &str,
     version: i32,
-) -> Result<nativedsl::InputGrammar, ()> {
-    // One loader pass yields the Module (for cfg hints) and the pipeline
-    // outcome (errors and parsed grammar) together.
-    let Some(outcome) = crate::analysis::analyze(text.to_owned(), uri) else {
+) -> Result<String, ()> {
+    let Some(DslPass {
+        module,
+        diagnostics: new_diagnostics,
+        helper_lint_diags,
+        grammar_json: grammar,
+    }) = run_dsl_pass(text, uri)
+    else {
         return Err(());
     };
-    let mut new_diagnostics = match &outcome.pipeline {
-        Some(Err(e)) => dsl_error_to_diagnostics(e, &outcome.module.rope),
-        _ => Vec::new(),
-    };
-    new_diagnostics.extend(outcome.module.cfg_hint_diagnostics());
-    if let Some(Ok(ref grammar)) = outcome.pipeline {
-        new_diagnostics.extend(dead_rule_diagnostics(grammar, &outcome.module));
-    }
-
-    let grammar = outcome.pipeline.and_then(Result::ok);
     {
         let Some(mut doc) = document_map.get_mut(uri) else {
             return grammar.ok_or(());
@@ -190,7 +224,169 @@ async fn publish_dsl_diagnostics(
             .publish_diagnostics(uri.clone(), all, Some(version))
             .await;
     }
+
+    // Helper URIs that the grammar reached but had no findings for: we
+    // still need to publish (an empty set) so stale findings from a
+    // previous run get cleared on the client.
+    publish_helper_lint_diags(client, document_map, &module, uri, helper_lint_diags).await;
+
     grammar.ok_or(())
+}
+
+/// Publish lint findings to each helper URI the grammar pulled in.
+/// Helpers that exist in `document_map` get their existing
+/// `dsl_diagnostics` + `generate_diagnostics` merged with the new lint
+/// findings; closed helpers publish lint findings alone (any stale
+/// state from when they were open is overwritten). Reached-but-clean
+/// helpers publish an empty diagnostic list so stale findings clear.
+///
+/// NOTE: if two grammars both import the same helper, this races - the
+/// last grammar to publish wins. Acceptable pre-release with a single
+/// grammar; proper fix is keying lint diagnostics by
+/// `(originating_grammar_uri, helper_uri)` on the Document.
+async fn publish_helper_lint_diags(
+    client: &Client,
+    document_map: &Arc<DashMap<Url, Document>>,
+    root: &Module,
+    root_uri: &Url,
+    mut findings_by_uri: FxHashMap<Url, Vec<Diagnostic>>,
+) {
+    let mut targets: FxHashSet<Url> = findings_by_uri.keys().cloned().collect();
+    for module in root.reachable_modules() {
+        if module.path == root.path {
+            continue;
+        }
+        if let Ok(u) = Url::from_file_path(&module.path) {
+            if u != *root_uri {
+                targets.insert(u);
+            }
+        }
+    }
+
+    for target_uri in targets {
+        let lint_diags = findings_by_uri.remove(&target_uri).unwrap_or_default();
+        let merged = if let Some(doc) = document_map.get(&target_uri) {
+            let mut m = doc.dsl_diagnostics.clone();
+            m.extend(doc.generate_diagnostics.iter().cloned());
+            m.extend(lint_diags);
+            m
+        } else {
+            lint_diags
+        };
+        client.publish_diagnostics(target_uri, merged, None).await;
+    }
+}
+
+/// Run every enabled lint and group findings by the URI of the file
+/// they belong to. Findings in helper files (inherited / imported)
+/// get their own URI so the LSP publisher can place them on the
+/// correct document. CLI `--allow` flags / per-buffer suppression
+/// comments would feed into the `LintSet` here in the future; for now
+/// every lint runs unconditionally.
+///
+/// Rope lookup: each finding's span needs to be converted against the
+/// rope of *its* source file, not the root's. We build a path → rope
+/// index once over the reachable modules and use it during conversion.
+fn lint_diagnostics_grouped(
+    grammar: &nativedsl::InputGrammar,
+    root: &Module,
+) -> FxHashMap<Url, Vec<Diagnostic>> {
+    let ctx = crate::lints::LintContext {
+        module: root,
+        grammar: Some(grammar),
+    };
+    let disabled = crate::lints::LintSet::default();
+    let findings = crate::lints::run_all(&ctx, &disabled);
+
+    let modules = root.reachable_modules();
+    let mut out: FxHashMap<Url, Vec<Diagnostic>> = FxHashMap::default();
+    for finding in &findings {
+        let Some(module) = modules.iter().find(|m| m.path == finding.path) else {
+            continue;
+        };
+        let Ok(uri) = Url::from_file_path(&finding.path) else {
+            continue;
+        };
+        let diag = crate::lints::finding_to_diagnostic(finding, &module.rope, &uri);
+        out.entry(uri).or_default().push(diag);
+    }
+    out
+}
+
+/// Everything one analyze pass produces that the async publisher needs. Every
+/// field is `Send`.
+struct DslPass {
+    module: Module,
+    /// Diagnostics belonging to the analyzed file itself.
+    diagnostics: Vec<Diagnostic>,
+    /// Lint findings belonging to inherited / imported files, by URI.
+    helper_lint_diags: FxHashMap<Url, Vec<Diagnostic>>,
+    /// Normalized grammar JSON for generate-check, if the pipeline succeeded.
+    grammar_json: Option<String>,
+}
+
+/// Run the analyze pass and reduce it to `Send` data.
+///
+/// Deliberately **not** `async`: all grammar work is synchronous, and reducing
+/// the pipeline result to diagnostics plus JSON before the caller awaits keeps
+/// the larger AST and grammar values out of the async task state.
+///
+/// `normalize` consumes the grammar and `InputGrammar` isn't `Clone`, so
+/// everything needing the un-normalized form runs first; the single normalize
+/// then feeds both the dead-rule diff and the JSON.
+fn run_dsl_pass(text: &str, uri: &Url) -> Option<DslPass> {
+    // One loader pass yields the Module (for cfg hints) and the pipeline
+    // outcome (errors and parsed grammar) together.
+    let outcome = crate::analysis::analyze(text.to_owned(), uri)?;
+    let module = outcome.module;
+    let mut diagnostics = match &outcome.pipeline {
+        Some(Err(e)) => dsl_error_to_diagnostics(e, &outcome.documents),
+        _ => Vec::new(),
+    };
+    diagnostics.extend(module.cfg_hint_diagnostics());
+
+    // Group lint findings by their source URI: the root's get merged with the
+    // per-file diagnostics above; helper findings get published under each
+    // helper's own URI so the client renders them on the right file.
+    let mut helper_lint_diags: FxHashMap<Url, Vec<Diagnostic>> = FxHashMap::default();
+    let mut grammar_json = None;
+
+    if let Some(Ok(grammar)) = outcome.pipeline {
+        for (finding_uri, diags) in lint_diagnostics_grouped(&grammar, &module) {
+            if finding_uri == *uri {
+                diagnostics.extend(diags);
+            } else {
+                helper_lint_diags
+                    .entry(finding_uri)
+                    .or_default()
+                    .extend(diags);
+            }
+        }
+        let before = rule_names(&grammar);
+        let normalized = grammar.normalize(&mut Vec::new());
+        diagnostics.extend(dead_rule_diagnostics(
+            &before,
+            &rule_names(&normalized),
+            &module,
+        ));
+        grammar_json = serde_json::to_string(&grammar_to_json(&normalized)).ok();
+    }
+
+    Some(DslPass {
+        module,
+        diagnostics,
+        helper_lint_diags,
+        grammar_json,
+    })
+}
+
+/// The grammar's rule names, resolved out of its own pool.
+fn rule_names(grammar: &nativedsl::InputGrammar) -> FxHashSet<String> {
+    grammar
+        .variables
+        .iter()
+        .map(|v| grammar.pool.resolve(v.name).to_owned())
+        .collect()
 }
 
 /// Diff the variable set before and after `InputGrammar::normalize()` to
@@ -205,20 +401,16 @@ async fn publish_dsl_diagnostics(
 /// rules that get dropped are skipped: their definition lives in another
 /// file, and the diagnostic belongs there (that file's own analyze run
 /// will surface it).
-fn dead_rule_diagnostics(grammar: &nativedsl::InputGrammar, module: &Module) -> Vec<Diagnostic> {
-    let before: FxHashSet<String> = grammar.variables.iter().map(|v| v.name.clone()).collect();
-    let after: FxHashSet<String> = grammar
-        .clone()
-        .normalize()
-        .variables
-        .into_iter()
-        .map(|v| v.name)
-        .collect();
+fn dead_rule_diagnostics(
+    before: &FxHashSet<String>,
+    after: &FxHashSet<String>,
+    module: &Module,
+) -> Vec<Diagnostic> {
     let Some(defs) = module.definitions.as_ref() else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for name in before.difference(&after) {
+    for name in before.difference(after) {
         let Some(def) = defs
             .iter()
             .find(|d| d.name == *name && matches!(d.kind, DefKind::Rule | DefKind::OverrideRule))
@@ -259,14 +451,12 @@ fn spawn_generate_check(
     document_map: Arc<DashMap<Url, Document>>,
     generate_child: Arc<GenerateChildSlot>,
     uri: Url,
-    grammar: nativedsl::InputGrammar,
+    json: String,
     version: i32,
 ) {
+    // The caller serializes the grammar first, so this task only carries the
+    // JSON needed by the generate-check subprocess.
     tokio::spawn(async move {
-        let Some(json) = prepare_grammar_json(grammar) else {
-            return;
-        };
-
         // Kill any previous generate-check for this URI; concurrent saves of
         // other files run in parallel.
         kill_generate_child(&generate_child, &uri);
@@ -348,46 +538,38 @@ fn spawn_generate_check(
             () = cancel.cancelled() => None,
         };
 
-        let generate_diagnostics = match &output {
-            Some(output) if output.status.success() => vec![],
-            Some(output) => {
-                // Log stderr for debugging; user-facing message uses stdout.
-                if !output.stderr.is_empty() {
-                    tracing::warn!(
-                        "generate-check stderr: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
-                }
-                let error_msg = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                vec![Diagnostic {
-                    range: Range::default(),
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    source: Some("ts_grammar_ls (generate)".into()),
-                    message: error_msg,
-                    ..Default::default()
-                }]
+        // Killed mid-flight: end progress quietly and bail.
+        let Some(output) = output else {
+            if progress_ok {
+                client
+                    .send_notification::<Progress>(ProgressParams {
+                        token,
+                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                            WorkDoneProgressEnd { message: None },
+                        )),
+                    })
+                    .await;
             }
-            None => {
-                // Killed - end progress with no message and bail.
-                if progress_ok {
-                    client
-                        .send_notification::<Progress>(ProgressParams {
-                            token,
-                            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
-                                WorkDoneProgressEnd { message: None },
-                            )),
-                        })
-                        .await;
-                }
-                return;
-            }
+            return;
         };
+        if !output.stderr.is_empty() {
+            tracing::warn!(
+                "generate-check stderr: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        // The validation subprocess prints a `GenerateCheckOutput` JSON line on
+        // stdout for both success and failure (success still carries warnings
+        // like unnecessary conflicts).
+        let envelope: crate::generate_check::GenerateCheckOutput =
+            serde_json::from_slice(&output.stdout).unwrap_or_default();
+        let failed = !output.status.success();
 
         if progress_ok {
-            let msg = if generate_diagnostics.is_empty() {
-                "Parser generation successful"
-            } else {
+            let msg = if failed {
                 "Parser generation failed"
+            } else {
+                "Parser generation successful"
             };
             client
                 .send_notification::<Progress>(ProgressParams {
@@ -402,6 +584,27 @@ fn spawn_generate_check(
         }
 
         let all = document_map.get_mut(&uri).map(|mut doc| {
+            let module = doc.last_good_analysis.clone();
+            let mut generate_diagnostics = Vec::new();
+            // Fatal codegen error, rendered from the structured error (clean
+            // message rather than the raw serialized payload).
+            if let Some(err) = &envelope.error {
+                generate_diagnostics.push(Diagnostic {
+                    range: Range::default(),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("ts_grammar_ls (generate)".into()),
+                    message: err.to_string(),
+                    ..Default::default()
+                });
+            }
+            // Structured codegen warnings. Needs the AST to anchor conflicts.
+            if let Some(module) = module.as_deref() {
+                generate_diagnostics.extend(codegen_diagnostics_to_lsp(
+                    &envelope.diagnostics,
+                    module,
+                    &uri,
+                ));
+            }
             doc.generate_diagnostics = generate_diagnostics;
             merge_diagnostics(&doc)
         });
@@ -416,18 +619,10 @@ fn spawn_generate_check(
     });
 }
 
-/// Normalize the parsed grammar and serialize it to JSON for the generate
-/// subprocess. Takes the grammar by value: the DSL pipeline has already run
-/// on this snapshot in `run_dsl_pipeline`, so no reparsing here.
-fn prepare_grammar_json(grammar: nativedsl::InputGrammar) -> Option<String> {
-    let grammar = grammar.normalize();
-    let json_value = grammar_to_json(&grammar);
-    serde_json::to_string(&json_value).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tree_sitter_generate::OptLevel;
 
     /// Write grammar text to a temp file and return the path.
     /// `parse_native_dsl` requires a canonicalizable path.
@@ -438,11 +633,12 @@ mod tests {
         (dir, path)
     }
 
-    /// Parse + serialize - the test-only equivalent of the production
-    /// `run_dsl_pipeline` -> `prepare_grammar_json` path.
+    /// Parse + normalize + serialize: the same shape as the tail of the
+    /// production `run_dsl_pass`, minus the diagnostics it also collects.
     fn parse_and_serialize(text: &str, path: &std::path::Path) -> Option<String> {
         let grammar = nativedsl::parse_native_dsl(text, path).ok()?;
-        prepare_grammar_json(grammar)
+        let normalized = grammar.normalize(&mut Vec::new());
+        serde_json::to_string(&grammar_to_json(&normalized)).ok()
     }
 
     #[test]
@@ -473,7 +669,12 @@ mod tests {
         "#;
         let (_dir, path) = temp_grammar(text);
         let json = parse_and_serialize(text, &path).unwrap();
-        let result = tree_sitter_generate::generate_parser_for_grammar(&json, None);
+        let result = tree_sitter_generate::generate_parser_for_grammar(
+            &json,
+            None,
+            OptLevel::default(),
+            &mut Vec::new(),
+        );
         assert!(
             result.is_ok(),
             "valid grammar should generate: {:?}",
@@ -496,7 +697,12 @@ mod tests {
         // It should also be valid at the generate level (no actual conflict).
         // A real conflict would need ambiguous rules, which is hard to
         // construct minimally. Just verify the pipeline doesn't panic.
-        let result = tree_sitter_generate::generate_parser_for_grammar(&json.unwrap(), None);
+        let result = tree_sitter_generate::generate_parser_for_grammar(
+            &json.unwrap(),
+            None,
+            OptLevel::default(),
+            &mut Vec::new(),
+        );
         assert!(result.is_ok());
     }
 }

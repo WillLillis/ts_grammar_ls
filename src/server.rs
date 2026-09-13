@@ -11,13 +11,12 @@ use tower_lsp::{
         CodeActionParams, CodeActionResponse, CompletionParams, CompletionResponse,
         DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
         DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-        DocumentFormattingParams, DocumentRangeFormattingParams,
-        DocumentHighlight, DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse,
+        DocumentFormattingParams, DocumentHighlight, DocumentHighlightParams,
+        DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse,
         GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
         InitializeResult, InitializedParams, Location, PrepareRenameResponse, ReferenceParams,
-        RenameParams,
-        SemanticTokensParams, SemanticTokensResult, TextDocumentPositionParams, TextEdit, Url,
-        WorkspaceEdit,
+        RenameParams, SemanticTokensParams, SemanticTokensResult, TextDocumentPositionParams,
+        TextEdit, Url, WorkspaceEdit,
     },
 };
 
@@ -115,11 +114,7 @@ fn update_dependents(
 }
 
 /// Drop a URI's entries from the reverse index; called from `did_close`.
-pub fn drop_dependents(
-    dependents: &DashMap<PathBuf, FxHashSet<Url>>,
-    deps: &[PathBuf],
-    uri: &Url,
-) {
+pub fn drop_dependents(dependents: &DashMap<PathBuf, FxHashSet<Url>>, deps: &[PathBuf], uri: &Url) {
     for path in deps {
         if let Some(mut entry) = dependents.get_mut(path) {
             entry.remove(uri);

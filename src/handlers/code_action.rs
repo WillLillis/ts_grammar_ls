@@ -9,14 +9,14 @@
 //!   handler finds those `ExpandedRule`s (they share the original call's
 //!   span) and replaces the call span with the rendered rule decls.
 //! - **Inline expression macro call**: cursor on a nested `Node::Call` or
-//!   `Node::QualifiedCall` (cross-module) whose name resolves to an
+//!   qualified `Node::Call` (cross-module) whose name resolves to an
 //!   expression-flavor macro. The handler renders the macro's body with
 //!   the caller's args substituted (via `format_macro_expansion`) and
 //!   replaces the call's span with the result.
 
 use tower_lsp::lsp_types;
 use tree_sitter_generate::nativedsl::ast::{
-    IdentKind, MacroId, MacroKind, Node, NodeId, SharedAst, Span,
+    IdentKind, MacroId, MacroKind, Node, NodeId, ObjectField, SharedAst, Span,
 };
 use tree_sitter_generate::nativedsl::lexer::TokenKind;
 
@@ -36,45 +36,87 @@ pub fn code_action(
 ) -> Option<lsp_types::CodeActionResponse> {
     let uri = &params.text_document.uri;
 
-    // If the client filtered by `only`, skip if it didn't ask for refactors.
-    if let Some(kinds) = &params.context.only
-        && !kinds.iter().any(is_refactor_kind)
-    {
-        return Some(Vec::new());
-    }
+    // Honor the client's `only` filter per action group.
+    let only = &params.context.only;
+    let wants_refactor = only
+        .as_ref()
+        .is_none_or(|kinds| kinds.iter().any(is_refactor_kind));
+    let wants_quickfix = only
+        .as_ref()
+        .is_none_or(|kinds| kinds.iter().any(is_quickfix_kind));
 
     // REPL input buffers aren't grammar source, so they bypass the
     // analysis-driven actions below. The only action we offer there is
     // the format toggle (the alternative tree-buffer CodeLens has
     // unfixable display issues on unfocused buffers in neovim).
     if let Some(input_uri) = crate::repl::ReplInputUri::try_from_uri(uri) {
+        if !wants_refactor {
+            return Some(Vec::new());
+        }
         return build_toggle_repl_format_action(backend, &input_uri)
             .map(|a| vec![lsp_types::CodeActionOrCommand::CodeAction(a)]);
     }
 
-    let (analysis, start_offset) = backend.resolve_position(uri, params.range.start)?;
-
     let mut actions: Vec<lsp_types::CodeActionOrCommand> = Vec::new();
-    if let Some(a) = build_raw_string_action(&analysis, start_offset, uri) {
-        actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
+
+    // Quick-fixes ride along on lint diagnostics (their `LintFix` is stashed in
+    // `Diagnostic.data`). Self-contained edits, so they work even when the
+    // current text fails to re-analyze.
+    if wants_quickfix {
+        for diag in &params.context.diagnostics {
+            if let Some(a) = build_lint_fix_action(diag, uri) {
+                actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
+            }
+        }
     }
-    if let Some(a) = build_inline_macro_action(&analysis, start_offset, uri) {
-        actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
+
+    // Refactor actions need a successful analysis of the current text.
+    if wants_refactor
+        && let Some((analysis, start_offset)) = backend.resolve_position(uri, params.range.start)
+    {
+        if let Some(a) = build_raw_string_action(&analysis, start_offset, uri) {
+            actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
+        }
+        if let Some(a) = build_inline_macro_action(&analysis, start_offset, uri) {
+            actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
+        }
+        if let Some(a) = build_inline_expression_macro_action(&analysis, start_offset, uri) {
+            actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
+        }
+        if let Some(a) = build_open_repl_action(&analysis, start_offset, uri, params.range.start) {
+            actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
+        }
+        if let Some(a) = build_open_grammar_repl_action(&analysis, uri) {
+            actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
+        }
     }
-    if let Some(a) = build_inline_expression_macro_action(&analysis, start_offset, uri) {
-        actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
-    }
-    if let Some(a) = build_open_repl_action(&analysis, start_offset, uri, params.range.start) {
-        actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
-    }
-    if let Some(a) = build_open_grammar_repl_action(&analysis, uri) {
-        actions.push(lsp_types::CodeActionOrCommand::CodeAction(a));
-    }
+
     if actions.is_empty() {
         None
     } else {
         Some(actions)
     }
+}
+
+/// Build a quick-fix from a lint diagnostic that carries a `LintFix` in its
+/// `data` field. Returns `None` for diagnostics without a (decodable) fix.
+fn build_lint_fix_action(
+    diag: &lsp_types::Diagnostic,
+    uri: &lsp_types::Url,
+) -> Option<lsp_types::CodeAction> {
+    let fix: crate::lints::LintFix = serde_json::from_value(diag.data.clone()?).ok()?;
+    let changes = std::collections::HashMap::from([(uri.clone(), fix.edits)]);
+    Some(lsp_types::CodeAction {
+        title: fix.title,
+        kind: Some(lsp_types::CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diag.clone()]),
+        edit: Some(lsp_types::WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        is_preferred: Some(true),
+        ..Default::default()
+    })
 }
 
 /// "Switch to S-expression view" / "Switch to CST view"
@@ -326,7 +368,7 @@ fn build_inline_macro_action(
 
 /// "Inline macro call" for an expression-flavor macro. Walks the AST
 /// top-down from `root_items`, finds the innermost `Node::Call` /
-/// `Node::QualifiedCall` whose name resolves to an expression-flavor
+/// qualified `Node::Call` whose name resolves to an expression-flavor
 /// macro and whose span contains the cursor, then replaces the call
 /// span with the rendered expansion.
 fn build_inline_expression_macro_action(
@@ -378,7 +420,7 @@ fn build_inline_expression_macro_action(
     })
 }
 
-/// Top-down search: smallest-span `Call`/`QualifiedCall` to a macro that
+/// Top-down search: smallest-span `Call` to a macro that
 /// contains `cursor`. Descend through children first so an inner call
 /// wins over an enclosing one.
 fn find_macro_call_at(shared: &SharedAst, cursor: u32, id: NodeId) -> Option<NodeId> {
@@ -398,12 +440,6 @@ fn find_macro_call_at(shared: &SharedAst, cursor: u32, id: NodeId) -> Option<Nod
                 return Some(id);
             }
         }
-        Node::QualifiedCall(range) => {
-            let (_, name, _) = shared.pools.get_qualified_call(range);
-            if matches!(shared.arena.get(name), Node::Ident(IdentKind::Macro(_))) {
-                return Some(id);
-            }
-        }
         _ => {}
     }
     None
@@ -419,10 +455,12 @@ fn collect_children(shared: &SharedAst, id: NodeId) -> Vec<NodeId> {
         | Node::Field { content: id, .. } | Node::Reserved { content: id, .. } | Node::Repeat { inner: id, .. }
         | Node::Token { inner: id, .. } | Node::Neg(id) | Node::GrammarConfig { module: id, .. }
         | Node::FieldAccess { obj: id, .. } | Node::QualifiedAccess { obj: id, .. }
-        | Node::SymRef { expr: id } | Node::ExpandedRule { body: id, .. } => out.push(id),
+        | Node::SymRef { expr: id } => out.push(id),
+        // `ExpandedRule` carries its body out-of-line in the expansion table.
+        Node::ExpandedRule(expand_id) => out.push(shared.pools.get_expansion(expand_id).body),
         #[rustfmt::skip]
         Node::RuleSet(r) | Node::SeqOrChoice { range: r, .. } | Node::Concat(r)
-        | Node::List(r) | Node::Tuple(r) | Node::QualifiedCall(r) => {
+        | Node::List(r) | Node::Tuple(r) => {
             out.extend(shared.pools.child_slice(r).iter().copied());
         }
         #[rustfmt::skip]
@@ -449,34 +487,36 @@ fn collect_children(shared: &SharedAst, id: NodeId) -> Vec<NodeId> {
             out.extend(shared.pools.child_slice(args).iter().copied());
         }
         Node::Object(range) => {
-            for &(_, v) in shared.pools.get_object(range) {
-                out.push(v);
+            for &ObjectField { value, .. } in shared.pools.get_object(range) {
+                out.push(value);
             }
         }
         // Leaves.
         Node::Grammar
-        | Node::External { .. }
-        | Node::StringLit
-        | Node::RawStringLit { .. }
+        | Node::Forward { .. }
+        | Node::StringLit(_)
         | Node::IntLit(_)
         | Node::Ident(_)
         | Node::Blank
-        | Node::SynthRef { .. }
+        | Node::Eof
         | Node::MacroParam { .. }
         | Node::ForBinding { .. }
-        | Node::ModuleRef { .. }
+        | Node::Import { .. }
+        | Node::Inherit { .. }
+        // Resolved cross-module rule reference; carries indices, not child nodes.
+        | Node::ModuleRule { .. }
         | Node::Unreachable => {}
     }
     out
 }
 
-/// Resolve a Call or `QualifiedCall` `NodeId` to:
+/// Resolve a `Call` `NodeId` to:
 ///   - the `MacroId` it invokes,
 ///   - the `Module` whose `StringTable` / source the macro body lives in,
 ///   - the argument `NodeId`s.
 ///
 /// For a local `Node::Call`, `body_module` is `caller`. For a
-/// `Node::QualifiedCall`, the obj resolves to a `let h = import("...")`
+/// For a qualified call, the object resolves to a `let h = import("...")`
 /// binding and `body_module` is the imported module.
 fn resolve_call_target(
     caller: &Module,
@@ -490,43 +530,29 @@ fn resolve_call_target(
                 _ => return None,
             };
             let args = shared.pools.child_slice(args).to_vec();
-            Some((macro_id, caller, args))
-        }
-        Node::QualifiedCall(range) => {
-            let (obj, name, args) = shared.pools.get_qualified_call(range);
-            let macro_id = match shared.arena.get(name) {
-                Node::Ident(IdentKind::Macro(m)) => *m,
-                _ => return None,
-            };
-            let body_module = resolve_import_obj(caller, obj)?;
-            Some((macro_id, body_module, args.to_vec()))
+            let body_module = caller
+                .reachable_modules()
+                .into_iter()
+                .find(|module| {
+                    module.root_items.iter().any(|&item| {
+                        matches!(shared.arena.get(item), Node::Macro(id) if *id == macro_id)
+                    })
+                })
+                .unwrap_or(caller);
+            Some((macro_id, body_module, args))
         }
         _ => None,
     }
-}
-
-/// Follow `obj`'s `IdentKind::Var(let_id)` to its `Node::Let`, take the
-/// let's binding name, and look it up in `caller.import_modules`.
-fn resolve_import_obj(caller: &Module, obj: NodeId) -> Option<&Module> {
-    let shared = &caller.shared;
-    let Node::Ident(IdentKind::Var(let_id)) = shared.arena.get(obj) else {
-        return None;
-    };
-    let Node::Let { name, .. } = shared.arena.get(*let_id) else {
-        return None;
-    };
-    let binding_name = &caller.source[name.start as usize..name.end as usize];
-    caller
-        .import_modules
-        .iter()
-        .find(|(n, _)| n == binding_name)
-        .map(|(_, m)| m)
 }
 
 fn is_refactor_kind(k: &lsp_types::CodeActionKind) -> bool {
     *k == lsp_types::CodeActionKind::REFACTOR_REWRITE
         || *k == lsp_types::CodeActionKind::REFACTOR
         || *k == lsp_types::CodeActionKind::EMPTY
+}
+
+fn is_quickfix_kind(k: &lsp_types::CodeActionKind) -> bool {
+    *k == lsp_types::CodeActionKind::QUICKFIX || *k == lsp_types::CodeActionKind::EMPTY
 }
 
 /// Returns `true` if `s` has at least one escape sequence and all escapes are

@@ -48,17 +48,11 @@ pub enum DocNode {
     /// Render child with indent depth increased by one level.
     Indent(DocId),
     /// Sequence: children stored in `arena.children[start..start+len]`.
-    Concat {
-        start: u32,
-        len: u32,
-    },
+    Concat { start: u32, len: u32 },
     /// Conditional emission keyed off the enclosing `Group`'s break state:
     /// emit `broken` if the group is broken, otherwise `flat`. Common use is
     /// trailing-comma-when-wrapped: `if_broken(text(","), nil())`.
-    IfBroken {
-        broken: DocId,
-        flat: DocId,
-    },
+    IfBroken { broken: DocId, flat: DocId },
 }
 
 /// Owning storage for a built Doc. Construct with `DocArena::new()`, build

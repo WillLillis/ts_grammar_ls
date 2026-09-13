@@ -129,7 +129,13 @@ fn tree_tokens(text: &str, spans: &[crate::cst::CstSpan]) -> Vec<SemanticToken> 
         // Skip zero-length or cross-line spans. The renderer doesn't
         // emit cross-line styled regions today (newlines are pushed
         // plain by render_node), so this is a defensive guard.
-        if length == 0 || span.end > line_start + (text[line_start..].find('\n').unwrap_or(text.len() - line_start)) {
+        if length == 0
+            || span.end
+                > line_start
+                    + (text[line_start..]
+                        .find('\n')
+                        .unwrap_or(text.len() - line_start))
+        {
             continue;
         }
         let delta_line = line - prev_line;
@@ -194,7 +200,7 @@ fn compute_semantic_tokens(text: &str, rope: &Rope, analysis: &Module) -> Vec<Se
             DefKind::Let { .. }
             | DefKind::Import
             | DefKind::Inherit
-            | DefKind::External
+            | DefKind::Forward
             | DefKind::Parameter { .. } => (TYPE_VARIABLE, MOD_DECLARATION),
             DefKind::ObjectKey { .. } => continue,
         };

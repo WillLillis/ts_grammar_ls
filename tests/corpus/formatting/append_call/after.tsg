@@ -3,10 +3,10 @@ grammar {
     externals: append([_a, _b], [_c]),
 }
 
-external _a
+expect _a
 
-external _b
+expect _b
 
-external _c
+expect _c
 
 rule program { "x" }

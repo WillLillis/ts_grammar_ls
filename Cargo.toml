@@ -55,13 +55,14 @@ tokio-util = "0.7"
 tower-lsp = "0.20"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tree-sitter-generate = { path = "../tree-sitter/crates/generate", features = [
+tree-sitter-generate = { path = "../tree-shitter/crates/generate", features = [
     "nativedsl",
 ] }
-tree-sitter = { path = "../tree-sitter/lib" }
-tree-sitter-loader = { path = "../tree-sitter/crates/loader" }
+tree-sitter = { path = "../tree-shitter/lib" }
+tree-sitter-loader = { path = "../tree-shitter/crates/loader" }
 rustc-hash = "2.1.2"
 memchr = "2.8.0"
+regex = "1"
 
 [dev-dependencies]
 futures-util = "0.3.32"

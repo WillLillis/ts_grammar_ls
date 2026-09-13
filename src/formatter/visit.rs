@@ -10,11 +10,12 @@
 //! pass is emitted at the start of each node's first token and at the end
 //! of each node's last token (trailing-on-same-line case).
 
-use tree_sitter_generate::nativedsl::ast::{
-    ConfigField, IdentKind, MacroKind, ModuleContext, Node, NodeId, RepeatKind, SharedAst, Span,
-};
-use tree_sitter_generate::nativedsl::string_pool::Str;
 use tree_sitter_generate::nativedsl::Ty;
+use tree_sitter_generate::nativedsl::ast::{
+    ConfigField, IdentKind, MacroKind, ModuleContext, Node, NodeId, ObjectField, RepeatKind,
+    SharedAst, Span,
+};
+use tree_sitter_generate::nativedsl::{StrId, StrPool};
 
 use super::doc::{DocArena, DocId};
 use super::trivia::{TriviaItem, TriviaMap};
@@ -41,7 +42,7 @@ pub struct Frame<'a> {
 ///     `grammar_block()`. Macro calls render verbatim.
 ///   - `Expansion`: inline a macro call. Walks expressions only - never
 ///     enters `module()` / `grammar_block()` - and tracks the current
-///     module so cross-file `QualifiedCall`s can resolve their import
+///     module so cross-file qualified calls can resolve their import
 ///     binding and swap source for the body traversal.
 pub enum Mode<'a> {
     File(&'a ModuleContext),
@@ -59,6 +60,10 @@ pub struct Printer<'a> {
     /// constructor from whichever `Mode` we're in.
     pub source: &'a str,
     pub mode: Mode<'a>,
+    /// Interned-name source for `Mode::File`: the pool the parse just filled.
+    /// `None` in `Mode::Expansion`, which resolves through the module's owned
+    /// `StringTable` instead (its pool is long gone by then).
+    pub strs: Option<&'a StrPool>,
     /// Stack of currently-active expansion frames. Always empty outside
     /// `Mode::Expansion`. Top is innermost.
     pub frame_stack: Vec<Frame<'a>>,
@@ -72,14 +77,17 @@ impl<'a> Printer<'a> {
         arena: &'a mut DocArena,
         shared: &'a SharedAst,
         ctx: &'a ModuleContext,
+        source: &'a str,
         trivia: &'a TriviaMap,
+        strs: &'a StrPool,
     ) -> Self {
         Self {
             arena,
             shared,
             trivia,
-            source: ctx.source.as_str(),
+            source,
             mode: Mode::File(ctx),
+            strs: Some(strs),
             frame_stack: Vec::new(),
         }
     }
@@ -99,6 +107,7 @@ impl<'a> Printer<'a> {
             trivia,
             source: current_module.source.as_str(),
             mode: Mode::Expansion { current_module },
+            strs: None,
             frame_stack: Vec::new(),
         }
     }
@@ -106,13 +115,8 @@ impl<'a> Printer<'a> {
     /// Render `body` with `args` substituted for the body's `MacroParam`
     /// references. `caller_module` is the module the args were captured
     /// in; for a `Node::Call` it equals the body's module (a local
-    /// expansion), for a `Node::QualifiedCall` it's the importer.
-    pub fn expand(
-        &mut self,
-        body: NodeId,
-        args: &'a [NodeId],
-        caller_module: &'a Module,
-    ) -> DocId {
+    /// expansion), for a qualified `Node::Call` it's the importer.
+    pub fn expand(&mut self, body: NodeId, args: &'a [NodeId], caller_module: &'a Module) -> DocId {
         self.frame_stack.push(Frame {
             args,
             source: caller_module.source.as_str(),
@@ -207,15 +211,27 @@ impl<'a> Printer<'a> {
                 name,
                 body,
             } => self.rule_doc(is_override, name, body),
-            Node::Let { name, ty, value } => self.let_doc(name, ty, value),
+            Node::Let { name, value } => {
+                // The optional `: ty` annotation moved out-of-line into
+                // `ModuleContext::let_types`, keyed by this Let node's id.
+                let ty = match self.mode {
+                    Mode::File(ctx) => ctx.let_types.get(&id).copied(),
+                    Mode::Expansion { .. } => None,
+                };
+                self.let_doc(name, ty, value)
+            }
             Node::Macro(macro_id) => self.macro_doc(macro_id),
-            Node::External { name } => {
-                let kw = self.arena.text("external");
+            Node::Forward { name } => {
+                let kw = self.arena.text("expect");
                 let space = self.arena.text(" ");
-                let n = self.arena.text(self.span_text(name));
+                let n = self.arena.text(self.str_text(name));
                 self.arena.concat(&[kw, space, n])
             }
-            Node::Cfg { name, child } => self.cfg_doc(name, child),
+            Node::Cfg {
+                name,
+                name_offset: _,
+                child,
+            } => self.cfg_doc(name, child),
             // Sentinel marker - the actual fields live on `ctx.grammar_config`.
             Node::Grammar => self.grammar_block(),
             // `@NAME(args)` at top level: a rule-set macro invocation.
@@ -232,13 +248,13 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn rule_doc(&mut self, is_override: bool, name: Span, body: NodeId) -> DocId {
+    fn rule_doc(&mut self, is_override: bool, name: StrId, body: NodeId) -> DocId {
         let mut parts = Vec::new();
         if is_override {
             parts.push(self.arena.text("override "));
         }
         parts.push(self.arena.text("rule "));
-        parts.push(self.arena.text(self.span_text(name)));
+        parts.push(self.arena.text(self.str_text(name)));
         parts.push(self.arena.text(" { "));
         parts.push(self.expr(body));
         parts.push(self.arena.text(" }"));
@@ -256,13 +272,13 @@ impl<'a> Printer<'a> {
     /// body across lines if it doesn't fit flat. Returns `None` if the
     /// caller should fall back to the flat layout (currently always returns
     /// `Some` - kept as `Option` for future fast paths).
-    fn group_rule_body(&mut self, name: Span, is_override: bool, body: NodeId) -> Option<DocId> {
+    fn group_rule_body(&mut self, name: StrId, is_override: bool, body: NodeId) -> Option<DocId> {
         let mut head = Vec::new();
         if is_override {
             head.push(self.arena.text("override "));
         }
         head.push(self.arena.text("rule "));
-        head.push(self.arena.text(self.span_text(name)));
+        head.push(self.arena.text(self.str_text(name)));
         head.push(self.arena.text(" {"));
         let head_doc = self.arena.concat(&head);
 
@@ -278,15 +294,10 @@ impl<'a> Printer<'a> {
         Some(self.arena.group(full))
     }
 
-    fn let_doc(
-        &mut self,
-        name: Span,
-        ty: Option<Ty>,
-        value: NodeId,
-    ) -> DocId {
+    fn let_doc(&mut self, name: StrId, ty: Option<Ty>, value: NodeId) -> DocId {
         let mut parts = Vec::new();
         parts.push(self.arena.text("let "));
-        parts.push(self.arena.text(self.span_text(name)));
+        parts.push(self.arena.text(self.str_text(name)));
         if let Some(ty) = ty {
             parts.push(self.arena.text(": "));
             parts.push(self.arena.text(ty.to_string()));
@@ -307,18 +318,24 @@ impl<'a> Printer<'a> {
         // inside the braces, decided by the macro's outer group.
         let config = self.shared.pools.get_macro(macro_id);
 
-        let params_doc = if config.params.is_empty() {
+        let params_doc = if self.shared.pools.param_slice(config.params).is_empty() {
             self.arena.text("()")
         } else {
             let mut param_parts = Vec::new();
-            for (i, param) in config.params.iter().enumerate() {
+            for (i, param) in self
+                .shared
+                .pools
+                .param_slice(config.params)
+                .iter()
+                .enumerate()
+            {
                 if i > 0 {
                     let comma = self.arena.text(",");
                     let sl = self.arena.softline();
                     param_parts.push(comma);
                     param_parts.push(sl);
                 }
-                let pname = self.arena.text(self.span_text(param.name));
+                let pname = self.arena.text(self.span_text(param.name.span));
                 let colon = self.arena.text(": ");
                 let pty = self.arena.text(param.ty.to_string());
                 param_parts.push(self.arena.concat(&[pname, colon, pty]));
@@ -342,7 +359,7 @@ impl<'a> Printer<'a> {
                 MacroKind::Expression(_) => "macro ",
                 MacroKind::RuleSet => "rules ",
             });
-            let name = self.arena.text(self.span_text(config.name));
+            let name = self.arena.text(self.span_text(config.name.span));
             // Expression macro: `macro f(...) ret_t {`.
             // Rule-set macro:   `rules f(...) {` (no return type; body is a
             //   sequence of rule decls).
@@ -366,8 +383,8 @@ impl<'a> Printer<'a> {
         self.arena.group(full)
     }
 
-    fn cfg_doc(&mut self, name: Span, child: NodeId) -> DocId {
-        let attr = self.arena.text(format!("#[cfg({})]", self.span_text(name)));
+    fn cfg_doc(&mut self, name: StrId, child: NodeId) -> DocId {
+        let attr = self.arena.text(format!("#[cfg({})]", self.str_text(name)));
         let line = self.arena.line();
         let inner = self.item_body(child);
         self.arena.concat(&[attr, line, inner])
@@ -388,7 +405,7 @@ impl<'a> Printer<'a> {
             let leading = self.arena.nil(); // TODO: leading on `language` (uncommon).
             let key = self.arena.text("language");
             let colon = self.arena.text(": \"");
-            let val = self.arena.text(lang.clone());
+            let val = self.arena.text(self.str_text(*lang));
             let close = self.arena.text("\"");
             field_parts.push(self.arena.concat(&[leading, key, colon, val, close]));
         }
@@ -449,18 +466,21 @@ impl<'a> Printer<'a> {
 
     fn expr(&mut self, id: NodeId) -> DocId {
         match *self.shared.arena.get(id) {
-            Node::StringLit => {
-                // Parser strips quotes from the span (start.strip_quotes()).
-                // Re-emit them around the content text.
-                let content = self.span_text(self.shared.arena.span(id));
-                self.arena.text(format!("\"{content}\""))
-            }
-            Node::RawStringLit { .. } => {
-                self.arena.text(self.span_text(self.shared.arena.span(id)))
+            Node::StringLit(_) => {
+                let span = self.shared.arena.span(id);
+                let literal = self.span_text(span);
+                if span.start > 0 && self.source.as_bytes()[span.start as usize - 1] == b'"' {
+                    self.arena.text(format!("\"{literal}\""))
+                } else {
+                    self.arena.text(literal)
+                }
             }
             Node::IntLit(n) => self.arena.text(n.to_string()),
             Node::Ident(_) => self.arena.text(self.span_text(self.shared.arena.span(id))),
-            Node::Blank => self.arena.text("blank"),
+            // Both parse as zero-arg calls, so the parens are required for
+            // the output to reparse.
+            Node::Blank => self.arena.text("blank()"),
+            Node::Eof => self.arena.text("eof()"),
             Node::Neg(inner) => {
                 let neg = self.arena.text("-");
                 let body = self.expr(inner);
@@ -473,29 +493,16 @@ impl<'a> Printer<'a> {
                 }
                 self.call_doc(name, args, parent_end)
             }
-            Node::QualifiedCall(range) => {
-                let (obj, name, args) = self.shared.pools.get_qualified_call(range);
-                if let Some(doc) = self.try_inline_qualified_macro_call(obj, name, args) {
-                    return doc;
-                }
-                let obj_doc = self.expr(obj);
-                let cc = self.arena.text("::");
-                let name_doc = self.expr(name);
-                let args_ids: Vec<NodeId> = args.to_vec();
-                let parent_end = self.shared.arena.span(id).end;
-                let args_doc = self.args_doc(&args_ids, parent_end);
-                self.arena.concat(&[obj_doc, cc, name_doc, args_doc])
-            }
             Node::FieldAccess { obj, field } => {
                 let obj_doc = self.expr(obj);
                 let dot = self.arena.text(".");
-                let f = self.arena.text(self.span_text(field));
+                let f = self.arena.text(self.str_text(field));
                 self.arena.concat(&[obj_doc, dot, f])
             }
-            Node::QualifiedAccess { obj, member } => {
+            Node::QualifiedAccess { obj, member, .. } => {
                 let obj_doc = self.expr(obj);
                 let cc = self.arena.text("::");
-                let m = self.arena.text(self.span_text(member));
+                let m = self.arena.text(self.str_text(member));
                 self.arena.concat(&[obj_doc, cc, m])
             }
             Node::SeqOrChoice { seq, range } => {
@@ -520,7 +527,7 @@ impl<'a> Printer<'a> {
             }
             Node::Field { name, content } => {
                 let head = self.arena.text("field(");
-                let n = self.arena.text(self.span_text(name));
+                let n = self.arena.text(self.str_text(name));
                 let comma = self.arena.text(", ");
                 let c = self.expr(content);
                 let close = self.arena.text(")");
@@ -531,7 +538,11 @@ impl<'a> Printer<'a> {
                 self.named_args_doc("alias", &[content, target], parent_end)
             }
             Node::Token { immediate, inner } => {
-                let name = if immediate { "token_immediate" } else { "token" };
+                let name = if immediate {
+                    "token_immediate"
+                } else {
+                    "token"
+                };
                 let parent_end = self.shared.arena.span(id).end;
                 self.named_args_doc(name, &[inner], parent_end)
             }
@@ -554,7 +565,7 @@ impl<'a> Printer<'a> {
                 // Parser strips the surrounding quotes from `context` (it's a
                 // string literal). Re-emit them.
                 let head = self.arena.text("reserved(");
-                let ctx = self.arena.text(format!("\"{}\"", self.span_text(context)));
+                let ctx = self.arena.text(format!("\"{}\"", self.str_text(context)));
                 let comma = self.arena.text(", ");
                 let c = self.expr(content);
                 let close = self.arena.text(")");
@@ -568,10 +579,12 @@ impl<'a> Printer<'a> {
                     self.named_args_doc("regexp", &[pattern], parent_end)
                 }
             }
-            Node::ModuleRef { import, path, .. } => {
-                // Parser strips the surrounding quotes from `path` (same as
-                // StringLit). Re-emit the path as a string literal.
-                let name = if import { "import" } else { "inherit" };
+            Node::Import { path, .. } | Node::Inherit { path, .. } => {
+                let name = if matches!(self.shared.arena.get(id), Node::Import { .. }) {
+                    "import"
+                } else {
+                    "inherit"
+                };
                 let head = self.arena.text(format!("{name}("));
                 let p = self.arena.text(format!("\"{}\"", self.span_text(path)));
                 let close = self.arena.text(")");
@@ -627,7 +640,9 @@ impl<'a> Printer<'a> {
                     let saved_source = self.source;
                     let saved_mode = std::mem::replace(
                         &mut self.mode,
-                        Mode::Expansion { current_module: top.module },
+                        Mode::Expansion {
+                            current_module: top.module,
+                        },
                     );
                     self.source = top.source;
                     let result = self.expr(target);
@@ -651,31 +666,65 @@ impl<'a> Printer<'a> {
             // `rule @<name_expr> { body }` - computed-name rule inside a
             // RuleSet body. Shape matches `Rule` with an `@`-prefixed
             // expression in place of the bare identifier.
-            Node::ComputedRule { is_override, name_expr, body } => {
-                self.computed_rule_doc(is_override, name_expr, body)
-            }
+            Node::ComputedRule {
+                is_override,
+                name_expr,
+                body,
+            } => self.computed_rule_doc(is_override, name_expr, body),
             // `@<expr>` - computed-name rule reference inside a rule body.
+            // In an active expansion the expr resolves to a concrete name, so
+            // render it as the bare rule identifier (as a written reference
+            // looks); in file mode it's literal source, kept as `@<expr>`.
             Node::SymRef { expr } => {
-                let at = self.arena.text("@");
-                let inner = self.expr(expr);
-                self.arena.concat(&[at, inner])
+                let resolved = match self.mode {
+                    Mode::Expansion { .. } => self.eval_sym_name(expr, self.source),
+                    Mode::File(_) => None,
+                };
+                if let Some(name) = resolved {
+                    self.arena.text(name)
+                } else {
+                    let at = self.arena.text("@");
+                    let inner = self.expr(expr);
+                    self.arena.concat(&[at, inner])
+                }
             }
             // Post-`expand_macro_calls` rule decl. Same shape as `Node::Rule`
             // but the name is interned: look it up in the module's
             // `StringTable`. Reachable when the code action handler walks a
             // loader-derived AST to render the expansion of a top-level
             // rule-set macro call.
-            Node::ExpandedRule { is_override, name, body } => {
+            Node::ExpandedRule(expand_id) => {
+                let exp = self.shared.pools.get_expansion(expand_id);
+                let (is_override, name, body, args_range) =
+                    (exp.is_override, exp.name, exp.body, exp.args);
                 let name_text = self.lookup_str(name).unwrap_or("").to_owned();
-                self.expanded_rule_doc(is_override, name_text, body)
+                // `body` is the macro's shared template; its `MacroParam`s
+                // resolve against this expansion's captured args, so push a
+                // frame around the body render exactly as a macro call does.
+                let args = self.shared.pools.child_slice(args_range);
+                let framed = if let Mode::Expansion { current_module } = self.mode {
+                    self.frame_stack.push(Frame {
+                        args,
+                        source: self.source,
+                        module: current_module,
+                    });
+                    true
+                } else {
+                    false
+                };
+                let doc = self.expanded_rule_doc(is_override, name_text, body);
+                if framed {
+                    self.frame_stack.pop();
+                }
+                doc
             }
-            // Post-`expand_macro_calls` rule reference. Source-level form
-            // was `@<expr>`; the resolved name is now a concrete rule
-            // identifier, so render it bare.
-            Node::SynthRef { name } => {
-                let s = self.lookup_str(name).unwrap_or("").to_owned();
-                self.arena.text(s)
-            }
+            // `mod::name` cross-module reference, rewritten in place from a
+            // `QualifiedAccess` during resolve. It carries only target indices,
+            // but `arena.set` preserved the original span, so emit it verbatim.
+            // Reachable when the code action handler formats a loader-derived
+            // (resolved) AST; plain document formatting parses fresh and never
+            // produces this node.
+            Node::ModuleRule { .. } => self.arena.text(self.span_text(self.shared.arena.span(id))),
             // Top-level shapes encountered in expression position shouldn't
             // happen but fall back to source. Use `raw` (not `text`) because
             // the source span may legitimately contain newlines.
@@ -683,7 +732,7 @@ impl<'a> Printer<'a> {
             | Node::Rule { .. }
             | Node::Let { .. }
             | Node::Macro(_)
-            | Node::External { .. }
+            | Node::Forward { .. }
             | Node::Cfg { .. } => self.arena.raw(self.span_text(self.shared.arena.span(id))),
             Node::Unreachable => self.arena.text(""),
         }
@@ -733,14 +782,47 @@ impl<'a> Printer<'a> {
         self.arena.group(full)
     }
 
-    /// Look up a `Str` interned by the loader. Only meaningful in
-    /// `Mode::Expansion` where we have a `&Module` to reach the
-    /// `StringTable` through. Returns `None` in `Mode::File` since the
-    /// freshly-parsed AST in file mode never contains post-expand `Str`s.
-    fn lookup_str(&self, s: Str) -> Option<&'a str> {
+    /// Resolve a computed-rule reference's name expression (`@<expr>`) to its
+    /// concrete string under the active expansion frame, mirroring the core's
+    /// `eval_name`: a string literal, a macro param (substituted from the
+    /// caller's args), or a `concat(...)` of those. `source` is the buffer the
+    /// expr's spans index into - the current frame's, swapping to the caller's
+    /// for a substituted `MacroParam`. Returns `None` for shapes outside that
+    /// subset (the caller then falls back to source `@<expr>`).
+    fn eval_sym_name(&self, expr: NodeId, source: &str) -> Option<String> {
+        match self.shared.arena.get(expr) {
+            // The parser strips the quotes from a `StringLit` span, so the
+            // span already covers just the name content.
+            Node::StringLit(value) => self.lookup_str(*value).map(str::to_owned),
+            Node::MacroParam { index, .. } => {
+                let top = self.frame_stack.last()?;
+                let arg = *top.args.get(*index as usize)?;
+                self.eval_sym_name(arg, top.source)
+            }
+            Node::Concat(range) => {
+                let mut out = String::new();
+                for &part in self.shared.pools.child_slice(*range) {
+                    out.push_str(&self.eval_sym_name(part, source)?);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve an interned name. In `Mode::File` that's the pool the parse
+    /// filled; in `Mode::Expansion` the pool is gone, so it goes through the
+    /// module's owned `StringTable`.
+    /// Interned name for rendering. Empty when the id can't be resolved,
+    /// which shouldn't happen for ids the parser produced.
+    fn str_text(&self, s: StrId) -> &'a str {
+        self.lookup_str(s).unwrap_or("")
+    }
+
+    fn lookup_str(&self, s: StrId) -> Option<&'a str> {
         match self.mode {
-            Mode::Expansion { current_module } => current_module.strings.get(s),
-            Mode::File(_) => None,
+            Mode::Expansion { current_module } => Some(current_module.strings.get(s)),
+            Mode::File(_) => self.strs.map(|p| p.resolve(s)),
         }
     }
 
@@ -810,92 +892,41 @@ impl<'a> Printer<'a> {
             Node::Ident(IdentKind::Macro(m)) => *m,
             _ => return None,
         };
+        let target = current_module
+            .reachable_modules()
+            .into_iter()
+            .find(|module| {
+                module.root_items.iter().any(|&item| {
+                    matches!(self.shared.arena.get(item), Node::Macro(id) if *id == macro_id)
+                })
+            })
+            .unwrap_or(current_module);
         let body = self.shared.pools.get_macro(macro_id).body;
         let arg_slice = self.shared.pools.child_slice(args);
-        // Same-module call: args' source and body's source are both
-        // self.source (== current_module.source).
+        let caller_source = self.source;
         self.frame_stack.push(Frame {
             args: arg_slice,
-            source: self.source,
+            source: caller_source,
             module: current_module,
         });
-        let doc = self.expr(body);
-        self.frame_stack.pop();
-        Some(doc)
-    }
-
-    /// Cross-module macro call (`Node::QualifiedCall`). The `obj` resolves
-    /// to an `import(...)` binding in the current module; look up the
-    /// imported `Module` by binding name, swap `current_module`/`source`
-    /// to it, walk the body, then restore.
-    fn try_inline_qualified_macro_call(
-        &mut self,
-        obj: NodeId,
-        name: NodeId,
-        args: &'a [NodeId],
-    ) -> Option<DocId> {
-        let Mode::Expansion { current_module } = self.mode else {
-            return None;
-        };
-        let macro_id = match self.shared.arena.get(name) {
-            Node::Ident(IdentKind::Macro(m)) => *m,
-            _ => return None,
-        };
-        // Resolve obj -> let-binding -> binding name -> import_modules.
-        let target = self.resolve_qualified_target(obj, current_module)?;
-
-        let body = self.shared.pools.get_macro(macro_id).body;
-        let caller_source = self.source;
-        let caller_module = current_module;
-        // Push the caller's frame so MacroParam pop-restore can swap back.
-        self.frame_stack.push(Frame {
-            args,
-            source: caller_source,
-            module: caller_module,
-        });
-        // Swap to the imported module for the body traversal.
         self.source = target.source.as_str();
-        self.mode = Mode::Expansion { current_module: target };
+        self.mode = Mode::Expansion {
+            current_module: target,
+        };
         let doc = self.expr(body);
-        // Restore the caller's mode/source.
         self.source = caller_source;
-        self.mode = Mode::Expansion { current_module: caller_module };
+        self.mode = Mode::Expansion { current_module };
         self.frame_stack.pop();
         Some(doc)
-    }
-
-    /// Given the `obj` NodeId of a `QualifiedCall` (`helpers::macro_name`),
-    /// follow the resolved `IdentKind::Var(let_id)` to its `Node::Let`,
-    /// pull the binding name from the let's name span, and look that name
-    /// up in `current_module.import_modules`. Returns the imported Module.
-    fn resolve_qualified_target(
-        &self,
-        obj: NodeId,
-        current_module: &'a Module,
-    ) -> Option<&'a Module> {
-        let Node::Ident(IdentKind::Var(let_id)) = self.shared.arena.get(obj) else {
-            return None;
-        };
-        let Node::Let { name, .. } = self.shared.arena.get(*let_id) else {
-            return None;
-        };
-        // The let was declared in self.source (the current rendering
-        // context's source), so its name span indexes there.
-        let binding_name = &self.source[name.start as usize..name.end as usize];
-        current_module
-            .import_modules
-            .iter()
-            .find(|(n, _)| n == binding_name)
-            .map(|(_, m)| m)
     }
 
     fn is_atom(&self, id: NodeId) -> bool {
         match *self.shared.arena.get(id) {
             Node::Ident(_)
             | Node::IntLit(_)
-            | Node::StringLit
-            | Node::RawStringLit { .. }
+            | Node::StringLit(_)
             | Node::Blank
+            | Node::Eof
             | Node::MacroParam { .. }
             | Node::ForBinding { .. } => true,
             Node::Neg(inner) => self.is_atom(inner),
@@ -944,10 +975,7 @@ impl<'a> Printer<'a> {
             let no_trailing = self.trivia.trailing_in(span.end, parent_end).is_none();
             if no_leading && no_trailing {
                 let arg = self.expr(args[0]);
-                let is_long_leaf = matches!(
-                    *self.shared.arena.get(args[0]),
-                    Node::StringLit | Node::RawStringLit { .. }
-                );
+                let is_long_leaf = matches!(*self.shared.arena.get(args[0]), Node::StringLit(_));
                 if !is_long_leaf {
                     return arg;
                 }
@@ -991,7 +1019,10 @@ impl<'a> Printer<'a> {
         // the comma unconditionally + the comment, then a hard line OUTSIDE
         // the indent so the close punctuation lands at the outer column.
         let last_end = self.shared.arena.span(*args.last().unwrap()).end;
-        let last_trail = self.trivia.trailing_in(last_end, parent_end).map(str::to_owned);
+        let last_trail = self
+            .trivia
+            .trailing_in(last_end, parent_end)
+            .map(str::to_owned);
         if let Some(c) = last_trail {
             let comma = self.arena.text(",");
             let cmt = self.arena.text(format!(" {c}"));
@@ -1052,7 +1083,10 @@ impl<'a> Printer<'a> {
         let entries = self.arena.concat(&entry_parts);
 
         let last_end = self.shared.arena.span(*items.last().unwrap()).end;
-        let last_trail = self.trivia.trailing_in(last_end, parent_end).map(str::to_owned);
+        let last_trail = self
+            .trivia
+            .trailing_in(last_end, parent_end)
+            .map(str::to_owned);
 
         let flat_body = entries;
         let broken_body = {
@@ -1080,7 +1114,7 @@ impl<'a> Printer<'a> {
         range: tree_sitter_generate::nativedsl::ast::ChildRange,
         parent_end: u32,
     ) -> DocId {
-        let fields: Vec<(Span, NodeId)> = self.shared.pools.get_object(range).to_vec();
+        let fields: Vec<ObjectField> = self.shared.pools.get_object(range).to_vec();
         if fields.is_empty() {
             return self.arena.text("{}");
         }
@@ -1088,11 +1122,11 @@ impl<'a> Printer<'a> {
         // Each separator is a softline so Fill packs entries per line. The
         // trailing comma is gated on the surrounding Group's break state.
         let mut entry_parts: Vec<DocId> = Vec::new();
-        for (i, (key, value)) in fields.iter().enumerate() {
+        for (i, &ObjectField { name: key, value }) in fields.iter().enumerate() {
             if i > 0 {
                 entry_parts.push(self.arena.text(","));
-                let prev_end = self.shared.arena.span(fields[i - 1].1).end;
-                if let Some(c) = self.trivia.trailing_in(prev_end, key.start) {
+                let prev_end = self.shared.arena.span(fields[i - 1].value).end;
+                if let Some(c) = self.trivia.trailing_in(prev_end, key.span.start) {
                     let s = c.to_owned();
                     entry_parts.push(self.arena.text(format!(" {s}")));
                     entry_parts.push(self.arena.line());
@@ -1100,11 +1134,11 @@ impl<'a> Printer<'a> {
                     entry_parts.push(self.arena.softline());
                 }
             }
-            let leading = self.emit_leading(key.start);
+            let leading = self.emit_leading(key.span.start);
             entry_parts.push(leading);
-            let k = self.arena.text(self.span_text(*key));
+            let k = self.arena.text(self.span_text(key.span));
             let colon = self.arena.text(": ");
-            let v = self.expr(*value);
+            let v = self.expr(value);
             entry_parts.push(self.arena.concat(&[k, colon, v]));
         }
         let nil = self.arena.nil();
@@ -1116,8 +1150,11 @@ impl<'a> Printer<'a> {
         // Flat: `{ e1, e2 }`. Broken: `{<indent \n Fill(entries)> \n }`. A
         // same-line comment trailing the final entry forces break and adds
         // ` // comment` between Fill and the closing line.
-        let last_end = self.shared.arena.span(fields.last().unwrap().1).end;
-        let last_trail = self.trivia.trailing_in(last_end, parent_end).map(str::to_owned);
+        let last_end = self.shared.arena.span(fields.last().unwrap().value).end;
+        let last_trail = self
+            .trivia
+            .trailing_in(last_end, parent_end)
+            .map(str::to_owned);
 
         let flat_body = {
             let sp1 = self.arena.text(" ");
@@ -1144,19 +1181,28 @@ impl<'a> Printer<'a> {
         self.arena.group(doc)
     }
 
-
-    fn for_doc(&mut self, for_id: tree_sitter_generate::nativedsl::ast::ForId, body: NodeId) -> DocId {
+    fn for_doc(
+        &mut self,
+        for_id: tree_sitter_generate::nativedsl::ast::ForId,
+        body: NodeId,
+    ) -> DocId {
         let cfg = self.shared.pools.get_for(for_id);
         // `for (b1, b2, ...) in iterable { body }`. Parens around the
         // bindings are required by the parser (even for a single binding).
         let head = self.arena.text("for (");
         let mut binding_parts = Vec::new();
-        for (i, b) in cfg.bindings.iter().enumerate() {
+        for (i, b) in self
+            .shared
+            .pools
+            .param_slice(cfg.bindings)
+            .iter()
+            .enumerate()
+        {
             if i > 0 {
                 let comma = self.arena.text(", ");
                 binding_parts.push(comma);
             }
-            let name = self.arena.text(self.span_text(b.name));
+            let name = self.arena.text(self.span_text(b.name.span));
             let colon = self.arena.text(": ");
             let ty = self.arena.text(b.ty.to_string());
             binding_parts.push(self.arena.concat(&[name, colon, ty]));
@@ -1167,7 +1213,15 @@ impl<'a> Printer<'a> {
         let space_brace = self.arena.text(" { ");
         let body_doc = self.expr(body);
         let close = self.arena.text(" }");
-        let doc = self.arena.concat(&[head, bindings, kw_in, iterable, space_brace, body_doc, close]);
+        let doc = self.arena.concat(&[
+            head,
+            bindings,
+            kw_in,
+            iterable,
+            space_brace,
+            body_doc,
+            close,
+        ]);
         self.arena.group(doc)
     }
 

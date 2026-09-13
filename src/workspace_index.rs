@@ -51,9 +51,7 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
                 continue;
             }
             walk(&path, depth + 1, out);
-        } else if file_type.is_file()
-            && path.extension().and_then(|e| e.to_str()) == Some("tsg")
-        {
+        } else if file_type.is_file() && path.extension().and_then(|e| e.to_str()) == Some("tsg") {
             out.push(path);
         }
     }

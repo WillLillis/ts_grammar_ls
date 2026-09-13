@@ -6,9 +6,9 @@ use tower_lsp::lsp_types::Diagnostic;
 use std::sync::Arc;
 
 use tree_sitter_generate::nativedsl::ast::{NodeId, SharedAst, Span};
-use tree_sitter_generate::nativedsl::string_pool::Str;
 use tree_sitter_generate::nativedsl::lexer::Token;
 use tree_sitter_generate::nativedsl::typecheck::Ty;
+use tree_sitter_generate::nativedsl::{StrId, StrPool};
 
 /// A definition extracted from the AST.
 #[derive(Clone, Debug)]
@@ -38,13 +38,15 @@ pub enum DefKind {
     Import,
     /// An inherit binding (e.g. `base` in `let base = inherit("base.tsg")`).
     Inherit,
-    /// An `external <name>` declaration: forward-declares an externally-
-    /// provided symbol (typically scanner-emitted) accessible via qualified
-    /// access from importers.
-    External,
+    /// An `expect <name>` forward-declaration: names a symbol defined
+    /// elsewhere (a rule, an `externals:` token, or an inherited rule) so
+    /// the file can reference it before/without defining it here.
+    Forward,
     /// A key in an object literal (e.g. `ADD` in `{ ADD: 1 }`). `value_span`
     /// covers the right-hand side of the field for source-text display.
-    ObjectKey { value_span: Span },
+    ObjectKey {
+        value_span: Span,
+    },
     /// A function parameter or for-loop binding. `scope` is the span of the
     /// owning macro / for-loop. `ty` is the declared type (parameters always
     /// have an explicit annotation; for-loop bindings inherit from the
@@ -65,7 +67,7 @@ impl DefKind {
             Self::Let { .. } => "let",
             Self::Import => "import",
             Self::Inherit => "inherit",
-            Self::External => "external",
+            Self::Forward => "expect",
             Self::ObjectKey { .. } => "field",
             Self::Parameter { .. } => "parameter",
         }
@@ -81,7 +83,7 @@ impl DefKind {
             | Self::Function { .. }
             | Self::Import
             | Self::Inherit
-            | Self::External
+            | Self::Forward
             | Self::ObjectKey { .. } => None,
         }
     }
@@ -263,6 +265,15 @@ pub struct Module {
     /// resolved enabled/disabled state. Used for hover and completion inside
     /// `#[cfg(...)]` attributes.
     pub declared_cfg_flags: Vec<CfgFlag>,
+    /// Entries of this grammar's `conflicts:` config, each with its source
+    /// span. Empty for helper / inherited modules and grammars without a
+    /// `conflicts:` list. Used to anchor the `UnnecessaryConflicts` codegen
+    /// diagnostic on the offending declaration.
+    pub conflict_decls: Vec<ConflictDecl>,
+    /// Span of the `conflicts:` value (the `[...]` list), when present. Lets
+    /// the fix for the last unnecessary conflict drop the whole field rather
+    /// than leave an empty `conflicts: []`.
+    pub conflicts_value_span: Option<Span>,
     /// AST arena + pools shared across this module and any externals it
     /// references. Retained on the analysis so showcase features
     /// (macro expansion preview, lowered grammar dump, ...) can re-walk
@@ -270,12 +281,11 @@ pub struct Module {
     /// nested `base_module` / `import_modules` cheaply point at the same
     /// arena they were built from.
     pub shared: Arc<SharedAst>,
-    /// Eagerly-resolved table of interned strings produced by the loader.
-    /// `Node::ExpandedRule.name` and `Node::SynthRef.name` (a `Str`)
+    /// Durable copy of the interned strings produced by the loader.
+    /// `Node::ExpandedRule.name` and `Node::SynthRef.name` (a `StrId`)
     /// index into this. Required to render post-expand AST as source.
-    /// We resolve at analyze time instead of storing the upstream
-    /// `StringPool` directly because the pool uses `Rc<str>` (`!Send`)
-    /// and our Module crosses thread boundaries via the document map.
+    /// Core's `StrPool` is `Send + Sync`; this wrapper keeps the resolver
+    /// available after the original pool moves into `InputGrammar`.
     pub strings: Arc<StringTable>,
     /// Top-level items of this module, in source order. Snapshot of
     /// `ModuleContext.root_items` after the loader's `expand_macro_calls`
@@ -285,26 +295,27 @@ pub struct Module {
     pub root_items: Vec<NodeId>,
 }
 
-/// Owned, thread-safe resolution of the loader's `StringPool`. Indexed by
-/// the inner `u32` of `Str` (so entry 0 is the unreachable sentinel,
-/// entries 1.. are real). Built once per `analyze()`; cheap clone via
-/// `Arc` for nested modules.
+/// Owned, thread-safe copy of the loader's string pool. Built once per
+/// `analyze()` and shared by the root and all reachable modules.
+///
+/// Core's current `StrPool` owns a contiguous `String` and is `Send + Sync`,
+/// so retaining a clone is both simpler and cheaper than materializing a
+/// second `Vec<String>`.
 #[derive(Debug, Default)]
 pub struct StringTable {
-    entries: Vec<String>,
+    pool: StrPool,
 }
 
 impl StringTable {
     #[must_use]
-    pub fn from_entries(entries: Vec<String>) -> Self {
-        Self { entries }
+    pub fn from_pool(pool: &StrPool) -> Self {
+        Self { pool: pool.clone() }
     }
 
-    /// Resolve a `Str` to its text, or `None` if the index is out of range
-    /// (shouldn't happen for AST-produced `Str`s).
+    /// Resolve a `StrId` produced by the pool this table mirrors.
     #[must_use]
-    pub fn get(&self, s: Str) -> Option<&str> {
-        self.entries.get(s.0.get() as usize).map(String::as_str)
+    pub fn get(&self, s: StrId) -> &str {
+        self.pool.resolve(s)
     }
 }
 
@@ -326,6 +337,18 @@ pub struct CfgFlag {
     pub enabled: bool,
 }
 
+/// One entry in the grammar's `conflicts: [[a, b], ...]` config.
+///
+/// Carries the span of the `[a, b]` group and the rule names it lists.
+/// Recorded at analysis time (when the grammar config is in scope) so the
+/// `UnnecessaryConflicts` codegen diagnostic can be anchored on the exact
+/// declaration it refers to.
+#[derive(Clone, Debug)]
+pub struct ConflictDecl {
+    pub span: Span,
+    pub names: Vec<String>,
+}
+
 impl Module {
     /// Construct a shell `Module` with only the source/rope populated. Used
     /// when lex or parse fails before we can produce any analysis data. The
@@ -345,6 +368,8 @@ impl Module {
             loader_succeeded: false,
             disabled_regions: Vec::new(),
             declared_cfg_flags: Vec::new(),
+            conflict_decls: Vec::new(),
+            conflicts_value_span: None,
             shared: Arc::new(SharedAst::new(0)),
             strings: Arc::new(StringTable::default()),
             root_items: Vec::new(),
@@ -369,6 +394,26 @@ impl Module {
                 ..Default::default()
             })
             .collect()
+    }
+
+    /// Depth-first walk of self + every transitively-reachable inherit /
+    /// import. Used by the CLI lint runner, the alias-over-supertype
+    /// lint's pass-1 walk, and tests - any consumer that needs to visit
+    /// every source file the grammar pulls in.
+    #[must_use]
+    pub fn reachable_modules(&self) -> Vec<&Self> {
+        fn push<'a>(m: &'a Module, out: &mut Vec<&'a Module>) {
+            out.push(m);
+            if let Some(base) = m.base_module.as_deref() {
+                push(base, out);
+            }
+            for (_, sub) in &m.import_modules {
+                push(sub, out);
+            }
+        }
+        let mut out = Vec::new();
+        push(self, &mut out);
+        out
     }
 
     /// Look up a direct sub-import by binding name.
@@ -400,9 +445,9 @@ impl Module {
             .references
             .iter()
             .flatten()
-            .filter(move |r| {
-                matches!(&r.kind, RefKind::Rule(n) | RefKind::Variable(n) if n == word)
-            })
+            .filter(
+                move |r| matches!(&r.kind, RefKind::Rule(n) | RefKind::Variable(n) if n == word),
+            )
             .map(|r| (r.span, false));
         defs.chain(refs)
     }

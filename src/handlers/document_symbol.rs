@@ -42,7 +42,7 @@ fn top_level_symbol(
         DefKind::Function { .. } => SymbolKind::FUNCTION,
         DefKind::Let { .. } => SymbolKind::VARIABLE,
         DefKind::Import | DefKind::Inherit => SymbolKind::MODULE,
-        DefKind::External => SymbolKind::CONSTANT,
+        DefKind::Forward => SymbolKind::CONSTANT,
         DefKind::ObjectKey { .. } | DefKind::Parameter { .. } => return None,
     };
     let detail = if let DefKind::Function { signature } = &def.kind {
@@ -56,9 +56,11 @@ fn top_level_symbol(
                 && d.name_span.start >= def.full_span.start
                 && d.name_span.end <= def.full_span.end
         }),
-        DefKind::Function { .. } => collect_children(defs, rope, |d| {
-            matches!(d.kind, DefKind::Parameter { scope, .. } if scope == def.full_span)
-        }),
+        DefKind::Function { .. } => collect_children(
+            defs,
+            rope,
+            |d| matches!(d.kind, DefKind::Parameter { scope, .. } if scope == def.full_span),
+        ),
         _ => None,
     };
     Some(DocumentSymbol {

@@ -25,9 +25,7 @@ pub fn hover(backend: &Backend, params: &HoverParams) -> Option<Hover> {
             .and_then(|m| m.definitions.iter().flatten().find(|d| d.name == word))
             .map(|def| make_hover(format!("```\n{} {}\n```", def.kind.label(), def.name))),
         // On a member accessed through an imported module (`mod::fn_name`).
-        CursorContext::ImportModuleAccess { .. } => {
-            imported_member_hover(&analysis, &word, offset)
-        }
+        CursorContext::ImportModuleAccess { .. } => imported_member_hover(&analysis, &word, offset),
         CursorContext::Identifier { .. } => {
             identifier_hover(&analysis, &analysis.source, &word, offset)
         }
@@ -55,7 +53,10 @@ fn identifier_hover(
             .declared_cfg_flags
             .iter()
             .find(|f| f.name == name)
-            .map_or("undeclared", |f| if f.enabled { "enabled" } else { "disabled" });
+            .map_or(
+                "undeclared",
+                |f| if f.enabled { "enabled" } else { "disabled" },
+            );
         return Some(make_hover(format!("```\ncfg flag `{name}` ({state})\n```")));
     }
 

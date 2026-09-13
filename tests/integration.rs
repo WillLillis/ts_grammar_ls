@@ -752,6 +752,26 @@ rule program { prec(PREC.ADD, "x") }
     assert_eq!(result, make_hover("```\nlet PREC: obj_t<int_t>\n```"));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn hover_let_binding_recovers_annotation_and_reference_types() {
+    let grammar = r#"
+grammar { language: "test" }
+let words: list_t<str_t> = []
+let copy = words
+rule program { "x" }
+"#;
+    let mut service = init(&[(test_uri(), grammar)]).await;
+
+    assert_eq!(
+        hover_at(&mut service, test_uri(), Position::new(2, 5)).await,
+        make_hover("```\nlet words: list_t<str_t>\n```")
+    );
+    assert_eq!(
+        hover_at(&mut service, test_uri(), Position::new(3, 5)).await,
+        make_hover("```\nlet copy: list_t<str_t>\n```")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Go-to-definition: object fields
 // ---------------------------------------------------------------------------
@@ -2532,7 +2552,6 @@ async fn format_request(service: &mut LspService<Backend>, uri: Url) -> Option<V
     .await
 }
 
-#[ignore = "formatter stubbed pending rewrite"]
 #[tokio::test(flavor = "current_thread")]
 async fn formatting_reformats_messy_source() {
     // Messy input with no padding around braces/colons; expect a single edit
@@ -2552,7 +2571,6 @@ async fn formatting_reformats_messy_source() {
     );
 }
 
-#[ignore = "formatter stubbed pending rewrite"]
 #[tokio::test(flavor = "current_thread")]
 async fn formatting_already_clean_returns_empty_edits() {
     // If the document is already formatted, return an empty edit list rather
@@ -2762,7 +2780,8 @@ fn temp_grammar_uri(grammar: &str) -> (tempfile::NamedTempFile, Url) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn open_repl_creates_input_buffer_with_default_rule() {
-    let grammar = "grammar { language: \"test\" }\nrule program { \"x\" }\nrule expression { \"y\" }\n";
+    let grammar =
+        "grammar { language: \"test\" }\nrule program { \"x\" }\nrule expression { \"y\" }\n";
     let (_keep_alive, uri) = temp_grammar_uri(grammar);
     let mut service = init(&[(uri.clone(), grammar)]).await;
 
@@ -2780,8 +2799,8 @@ async fn open_repl_creates_input_buffer_with_default_rule() {
 
     let obj = result.as_object().expect("object response");
     assert_eq!(obj.get("rule").and_then(|v| v.as_str()), Some("program"));
-    let repl_uri = Url::parse(obj.get("uri").and_then(|v| v.as_str()).expect("uri field"))
-        .expect("valid url");
+    let repl_uri =
+        Url::parse(obj.get("uri").and_then(|v| v.as_str()).expect("uri field")).expect("valid url");
     let input_uri =
         ts_grammar_ls::repl::ReplInputUri::try_from_uri(&repl_uri).expect("REPL input URI");
     let path = input_uri.input_path();
@@ -2797,9 +2816,66 @@ async fn open_repl_creates_input_buffer_with_default_rule() {
     std::fs::remove_file(&meta_path).ok();
 }
 
+/// A derived grammar whose own first declaration is a hidden `override rule`
+/// must fall back to the *base's* start rule, not that hidden one.
+///
+/// `InputGrammar::normalize` treats `variables[0]` as the implicit start, and
+/// variables are ordered base-first, so for an inheriting grammar the start
+/// lives upstream. Picking a `_`-prefixed rule instead makes codegen fail with
+/// `HiddenStartRule`, which the REPL could only report as a `warn!`.
+/// tree-sitter-cpp inheriting tree-sitter-c is the real-world shape: cpp never
+/// declares `translation_unit`, and its first declaration is
+/// `override rule _top_level_item`.
+#[tokio::test(flavor = "current_thread")]
+async fn open_repl_skips_hidden_rule_in_inheriting_grammar() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("base.tsg"),
+        "grammar { language: \"base\" }\n\
+         rule translation_unit { repeat(_item) }\n\
+         rule _item { \"x\" }\n",
+    )
+    .unwrap();
+    let derived = "let b = inherit(\"base.tsg\")\n\
+                   grammar { language: \"derived\", inherits: b }\n\
+                   override rule _item { \"y\" }\n\
+                   rule extra_thing { \"z\" }\n";
+    let derived_path = dir.path().join("derived.tsg");
+    std::fs::write(&derived_path, derived).unwrap();
+    let uri = Url::from_file_path(&derived_path).unwrap();
+    let mut service = init(&[(uri.clone(), derived)]).await;
+
+    let result = lsp_request::<ExecuteCommand>(
+        &mut service,
+        ExecuteCommandParams {
+            command: "tsg.openRepl".into(),
+            arguments: vec![serde_json::json!({ "uri": uri.to_string() })],
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        },
+    )
+    .await
+    .expect("command returned a value");
+
+    let obj = result.as_object().expect("object response");
+    // Not `_item` (hidden, and first in source order), and not the derived
+    // file's own `extra_thing` - the base's start rule.
+    assert_eq!(
+        obj.get("rule").and_then(|v| v.as_str()),
+        Some("translation_unit"),
+    );
+
+    let repl_uri =
+        Url::parse(obj.get("uri").and_then(|v| v.as_str()).expect("uri field")).expect("valid url");
+    let input_uri =
+        ts_grammar_ls::repl::ReplInputUri::try_from_uri(&repl_uri).expect("REPL input URI");
+    std::fs::remove_file(input_uri.input_path()).ok();
+    std::fs::remove_file(input_uri.meta_path()).ok();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn open_repl_picks_rule_from_cursor_position() {
-    let grammar = "grammar { language: \"test\" }\nrule program { \"x\" }\nrule expression { \"y\" }\n";
+    let grammar =
+        "grammar { language: \"test\" }\nrule program { \"x\" }\nrule expression { \"y\" }\n";
     let (_keep_alive, uri) = temp_grammar_uri(grammar);
     let mut service = init(&[(uri.clone(), grammar)]).await;
 
@@ -2819,11 +2895,18 @@ async fn open_repl_picks_rule_from_cursor_position() {
     .expect("command returned a value");
 
     assert_eq!(
-        result.as_object().and_then(|o| o.get("rule")).and_then(|v| v.as_str()),
+        result
+            .as_object()
+            .and_then(|o| o.get("rule"))
+            .and_then(|v| v.as_str()),
         Some("expression")
     );
     let repl_uri = Url::parse(
-        result.as_object().and_then(|o| o.get("uri")).and_then(|v| v.as_str()).unwrap(),
+        result
+            .as_object()
+            .and_then(|o| o.get("uri"))
+            .and_then(|v| v.as_str())
+            .unwrap(),
     )
     .unwrap();
     std::fs::remove_file(repl_uri.to_file_path().unwrap()).ok();
@@ -3002,10 +3085,7 @@ async fn code_action_inlines_cross_module_expression_macro_call() {
     let mut service = init(&[(grammar_uri.clone(), &fix.grammar_text)]).await;
 
     // Locate `commaSep` in the qualified call inside grammar.tsg.
-    let call_offset = fix
-        .grammar_text
-        .find("helpers::commaSep")
-        .unwrap();
+    let call_offset = fix.grammar_text.find("helpers::commaSep").unwrap();
     let rope = ropey::Rope::from_str(&fix.grammar_text);
     let pos = ts_grammar_ls::text::offset_to_position(
         &rope,
@@ -3015,10 +3095,7 @@ async fn code_action_inlines_cross_module_expression_macro_call() {
     let result = code_actions_at(&mut service, grammar_uri.clone(), range).await;
 
     // The full `helpers::commaSep("x")` span gets replaced.
-    let call_start = fix
-        .grammar_text
-        .find("helpers::commaSep")
-        .unwrap();
+    let call_start = fix.grammar_text.find("helpers::commaSep").unwrap();
     let call_end = call_start + "helpers::commaSep(\"x\")".len();
     let expected_edit_range = Range::new(
         ts_grammar_ls::text::offset_to_position(&rope, call_start as u32),
@@ -3162,6 +3239,49 @@ async fn goto_def_import_function() {
         Some(GotoDefinitionResponse::Scalar(Location {
             uri: helper_uri,
             range: Range::new(Position::new(1, 6), Position::new(1, 14)),
+        }))
+    );
+}
+
+// Referencing an imported helper's plain *rule* via `mod::rule` (a bare
+// qualified access, not a macro call) resolves in the core to `Node::ModuleRule`
+// during the cross-module resolve pass, replacing the `QualifiedAccess` in place.
+// Reference extraction must reconstruct the member reference from the preserved
+// span or goto-definition silently breaks. Exercises the `is_import` (import)
+// branch; `references_base_rule_excludes_override` covers the inherit branch.
+#[tokio::test(flavor = "current_thread")]
+async fn goto_def_imported_rule_via_qualified_access() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Helper exports a plain rule. "shared_token" is at line 1, col 5
+    // (after `rule `), ending col 17.
+    let helper_text = "\nrule shared_token { \"kw\" }\n";
+    let helper_path = dir.path().join("helpers.tsg");
+    std::fs::write(&helper_path, helper_text).unwrap();
+
+    let grammar_text = format!(
+        "\nlet helpers = import(\"{}\")\ngrammar {{ language: \"test\" }}\nrule program {{ helpers::shared_token }}\n",
+        helper_path.display()
+    );
+    let grammar_path = dir.path().join("grammar.tsg");
+    std::fs::write(&grammar_path, &grammar_text).unwrap();
+
+    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
+    let helper_uri = Url::from_file_path(&helper_path).unwrap();
+
+    let mut service = init(&[(grammar_uri.clone(), &grammar_text)]).await;
+
+    // Cursor on "shared_token" in `helpers::shared_token`.
+    let offset = grammar_text.find("helpers::shared_token").unwrap() + "helpers::".len();
+    let rope = ropey::Rope::from_str(&grammar_text);
+    let pos = ts_grammar_ls::text::offset_to_position(&rope, offset as u32);
+
+    let result = goto_def_at(&mut service, grammar_uri, pos).await;
+    assert_eq!(
+        result,
+        Some(GotoDefinitionResponse::Scalar(Location {
+            uri: helper_uri,
+            range: Range::new(Position::new(1, 5), Position::new(1, 17)),
         }))
     );
 }
@@ -4217,7 +4337,9 @@ rule program { "x" }
     ] {
         let edit = rename_at(&mut service, uri.clone(), pos, kw)
             .await
-            .unwrap_or_else(|| panic!("rename to keyword `{kw}` should auto-escape, not be rejected"));
+            .unwrap_or_else(|| {
+                panic!("rename to keyword `{kw}` should auto-escape, not be rejected")
+            });
         let edits = &edit.changes.unwrap()[&uri];
         for e in edits {
             assert_eq!(
@@ -4286,12 +4408,7 @@ async fn dependent_diagnostics_republish_on_helper_change() {
 
     // Force the grammar's analysis to run so the dependents index is populated
     // (analysis is lazy; otherwise no-one has loaded helpers as a dep yet).
-    let _ = hover_at(
-        &mut service,
-        grammar_uri.clone(),
-        Position::new(2, 17),
-    )
-    .await;
+    let _ = hover_at(&mut service, grammar_uri.clone(), Position::new(2, 17)).await;
 
     publish_log.lock().await.clear();
 
@@ -4482,12 +4599,7 @@ async fn watched_files_change_republishes_open_dependents() {
         init_with_capture(&[(grammar_uri.clone(), &grammar_text)], None).await;
 
     // Force grammar.tsg's analysis so the dependents index records helpers.
-    let _ = hover_at(
-        &mut service,
-        grammar_uri.clone(),
-        Position::new(2, 17),
-    )
-    .await;
+    let _ = hover_at(&mut service, grammar_uri.clone(), Position::new(2, 17)).await;
 
     publish_log.lock().await.clear();
 
@@ -4550,19 +4662,11 @@ async fn rename_includes_closed_workspace_dependents() {
     let parser_c_uri = Url::from_file_path(&parser_c_path).unwrap();
 
     // Only parser_a is open. Workspace scan should pick up b and c.
-    let (mut service, _log) = init_with_capture(
-        &[(parser_a_uri.clone(), &parser_a_text)],
-        Some(dir.path()),
-    )
-    .await;
+    let (mut service, _log) =
+        init_with_capture(&[(parser_a_uri.clone(), &parser_a_text)], Some(dir.path())).await;
 
     // Force parser_a's analysis so dependents picks up its open-file deps too.
-    let _ = hover_at(
-        &mut service,
-        parser_a_uri.clone(),
-        Position::new(2, 17),
-    )
-    .await;
+    let _ = hover_at(&mut service, parser_a_uri.clone(), Position::new(2, 17)).await;
 
     let offset = parser_a_text.find("h::foo").unwrap() + "h::".len();
     let rope = ropey::Rope::from_str(&parser_a_text);
@@ -4683,8 +4787,8 @@ async fn rename_raw_ident_rule_to_normal_name() {
     sorted.sort_by(|a, b| b.range.start.cmp(&a.range.start));
     let after_rope = ropey::Rope::from_str(grammar);
     for e in &sorted {
-        let s = ts_grammar_ls::text::position_to_offset(&after_rope, e.range.start).unwrap()
-            as usize;
+        let s =
+            ts_grammar_ls::text::position_to_offset(&after_rope, e.range.start).unwrap() as usize;
         let n = ts_grammar_ls::text::position_to_offset(&after_rope, e.range.end).unwrap() as usize;
         after.replace_range(s..n, &e.new_text);
     }
@@ -4776,7 +4880,9 @@ async fn cross_file_features_survive_unresolved_name_mid_edit() {
     let rope = ropey::Rope::from_str(&original);
     let pos = ts_grammar_ls::text::offset_to_position(&rope, body_offset as u32);
     assert!(
-        hover_at(&mut service, grammar_uri.clone(), pos).await.is_some(),
+        hover_at(&mut service, grammar_uri.clone(), pos)
+            .await
+            .is_some(),
         "baseline hover should work"
     );
 
@@ -4927,7 +5033,9 @@ async fn references_helper_rule_via_bare_name() {
 
     let uris: Vec<&Url> = result.iter().map(|l| &l.uri).collect();
     assert!(
-        uris.contains(&&helpers_uri) && uris.contains(&&grammar_a_uri) && uris.contains(&&grammar_b_uri),
+        uris.contains(&&helpers_uri)
+            && uris.contains(&&grammar_a_uri)
+            && uris.contains(&&grammar_b_uri),
         "refs should span helper + both importers, got {uris:?}"
     );
 }
@@ -4985,53 +5093,17 @@ async fn rename_helper_rule_via_bare_name() {
 }
 
 // ---------------------------------------------------------------------------
-// `external` decls
+// `expect` forward-decls
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "current_thread")]
-async fn goto_def_external_from_qualified_access() {
-    // Helper declares an `external _foo`. Grammar references it as `h::_foo`.
-    // Goto-def on `_foo` should land on the external decl in the helper.
-    let dir = tempfile::tempdir().unwrap();
-
-    let helpers_text = "external _foo\n";
-    let helpers_path = dir.path().join("helpers.tsg");
-    std::fs::write(&helpers_path, helpers_text).unwrap();
-
-    let grammar_text = format!(
-        "let h = import(\"{}\")\ngrammar {{ language: \"test\", externals: [h::_foo] }}\nrule program {{ h::_foo }}\n",
-        helpers_path.display()
-    );
-    let grammar_path = dir.path().join("grammar.tsg");
-    std::fs::write(&grammar_path, &grammar_text).unwrap();
-
-    let helpers_uri = Url::from_file_path(&helpers_path).unwrap();
-    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
-
-    let mut service = init(&[(grammar_uri.clone(), &grammar_text)]).await;
-
-    // Cursor on `_foo` in the rule body's `h::_foo`.
-    let body_offset = grammar_text.rfind("h::_foo").unwrap() + "h::".len();
-    let rope = ropey::Rope::from_str(&grammar_text);
-    let pos = ts_grammar_ls::text::offset_to_position(&rope, body_offset as u32);
-
-    assert_eq!(
-        goto_def_at(&mut service, grammar_uri, pos).await,
-        Some(GotoDefinitionResponse::Scalar(Location {
-            uri: helpers_uri,
-            // `_foo` after `external `, line 0 col 9.
-            range: Range::new(Position::new(0, 9), Position::new(0, 13)),
-        }))
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn goto_def_external_via_inherit() {
-    // Same shape as the import test but the external is in an inherited
-    // base grammar instead of an imported helper.
+    // An external token declared in an inherited base grammar (via `expect`
+    // plus the grammar's `externals:` list) resolves through `base::_ws`.
     let dir = tempfile::tempdir().unwrap();
 
-    let base_text = "external _ws\ngrammar { language: \"base\", externals: [_ws] }\nrule program { _ws }\n";
+    let base_text =
+        "expect _ws\ngrammar { language: \"base\", externals: [_ws] }\nrule program { _ws }\n";
     let base_path = dir.path().join("base.tsg");
     std::fs::write(&base_path, base_text).unwrap();
 
@@ -5055,55 +5127,9 @@ async fn goto_def_external_via_inherit() {
         goto_def_at(&mut service, derived_uri, pos).await,
         Some(GotoDefinitionResponse::Scalar(Location {
             uri: base_uri,
-            range: Range::new(Position::new(0, 9), Position::new(0, 12)),
+            range: Range::new(Position::new(0, 7), Position::new(0, 10)),
         }))
     );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn rename_external_propagates_across_files() {
-    let dir = tempfile::tempdir().unwrap();
-
-    let helpers_text = "external _foo\n";
-    let helpers_path = dir.path().join("helpers.tsg");
-    std::fs::write(&helpers_path, helpers_text).unwrap();
-
-    let grammar_text = format!(
-        "let h = import(\"{}\")\ngrammar {{ language: \"test\", externals: [h::_foo] }}\nrule program {{ h::_foo }}\n",
-        helpers_path.display()
-    );
-    let grammar_path = dir.path().join("grammar.tsg");
-    std::fs::write(&grammar_path, &grammar_text).unwrap();
-
-    let helpers_uri = Url::from_file_path(&helpers_path).unwrap();
-    let grammar_uri = Url::from_file_path(&grammar_path).unwrap();
-
-    let mut service = init(&[(grammar_uri.clone(), &grammar_text)]).await;
-
-    let body_offset = grammar_text.rfind("h::_foo").unwrap() + "h::".len();
-    let rope = ropey::Rope::from_str(&grammar_text);
-    let pos = ts_grammar_ls::text::offset_to_position(&rope, body_offset as u32);
-
-    let edit = rename_at(&mut service, grammar_uri.clone(), pos, "_bar")
-        .await
-        .expect("rename should succeed on external access");
-    let changes = edit.changes.expect("changes present");
-
-    let mut keys: Vec<&Url> = changes.keys().collect();
-    keys.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-    assert_eq!(
-        keys,
-        vec![&grammar_uri, &helpers_uri],
-        "external rename must edit both the decl site and call sites"
-    );
-    // grammar.tsg has 2 references (externals: [h::_foo] + body), helpers.tsg has 1 (decl).
-    assert_eq!(changes[&helpers_uri].len(), 1);
-    assert_eq!(changes[&grammar_uri].len(), 2);
-    for edits in changes.values() {
-        for e in edits {
-            assert_eq!(e.new_text, "_bar");
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5274,7 +5300,6 @@ async fn bench_hover_cpp_end_to_end() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // Cfg attribute support (#[cfg(NAME)]) - dim/hint diagnostics, hover,
 // completion. Matches the rust-analyzer treatment for conditionally compiled
@@ -5359,11 +5384,13 @@ rule helper { "y" }
         .dsl_diagnostics
         .iter()
         .filter(|d| {
-            d.severity == Some(DiagnosticSeverity::HINT)
-                && d.message.starts_with("unused rule")
+            d.severity == Some(DiagnosticSeverity::HINT) && d.message.starts_with("unused rule")
         })
         .collect();
-    assert!(unused_hints.is_empty(), "unexpected hints: {unused_hints:?}");
+    assert!(
+        unused_hints.is_empty(),
+        "unexpected hints: {unused_hints:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

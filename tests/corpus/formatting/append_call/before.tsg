@@ -2,7 +2,7 @@ grammar{
   language:"test",
   externals:append([_a,_b],[_c]),
 }
-external _a
-external _b
-external _c
+expect _a
+expect _b
+expect _c
 rule program{"x"}

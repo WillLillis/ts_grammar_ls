@@ -52,11 +52,7 @@ pub async fn did_change_watched_files(backend: &Backend, params: DidChangeWatche
     }
 }
 
-fn update_closed_index(
-    backend: &Backend,
-    path: &std::path::Path,
-    change_type: FileChangeType,
-) {
+fn update_closed_index(backend: &Backend, path: &std::path::Path, change_type: FileChangeType) {
     let prev = backend
         .closed_file_deps
         .get(path)

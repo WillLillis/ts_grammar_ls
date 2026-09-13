@@ -105,7 +105,6 @@ mod tests {
     const DIRTY: &str = "grammar{ language:\"test\" }\nrule program{\"x\"}\n";
 
     #[test]
-    #[ignore = "formatter stubbed pending rewrite"]
     fn format_writes_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grammar.tsg");
@@ -118,7 +117,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "formatter stubbed pending rewrite"]
     fn check_clean_file_exits_zero() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grammar.tsg");
@@ -132,7 +130,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "formatter stubbed pending rewrite"]
     fn check_dirty_file_exits_one() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grammar.tsg");
@@ -160,7 +157,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "formatter stubbed pending rewrite"]
     fn directory_collects_tsg_files_recursively() {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("nested");
@@ -205,7 +201,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "formatter stubbed pending rewrite"]
     fn check_dirty_in_directory_exits_one() {
         let dir = tempfile::tempdir().unwrap();
         let clean_path = dir.path().join("clean.tsg");

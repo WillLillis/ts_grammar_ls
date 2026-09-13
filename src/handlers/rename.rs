@@ -28,11 +28,7 @@ pub fn prepare_rename(
             // Cursor is on the member part of `base::rule_name`.
             // Find the definition in the base module.
             let base = analysis.base_module.as_deref()?;
-            let def = base
-                .definitions
-                .iter()
-                .flatten()
-                .find(|d| d.name == word)?;
+            let def = base.definitions.iter().flatten().find(|d| d.name == word)?;
             let range = text::span_to_range(&base.rope, def.name_span);
             Some(PrepareRenameResponse::Range(range))
         }
@@ -58,7 +54,7 @@ pub fn prepare_rename(
                 | DefKind::Function { .. }
                 | DefKind::Let { .. }
                 | DefKind::Parameter { .. }
-                | DefKind::External => {}
+                | DefKind::Forward => {}
                 DefKind::Import | DefKind::Inherit | DefKind::ObjectKey { .. } => return None,
             }
             let range = text::span_to_range(&analysis.rope, def.name_span);
@@ -218,7 +214,7 @@ fn add_cross_refs_in_file(
     word: &str,
     new_name: &str,
 ) {
-    // A `QualifiedCall` like `h::foo` produces two overlapping references at
+    // A qualified call like `h::foo` produces two overlapping references at
     // the `foo` span: an inner `Variable("foo")` (the resolved Ident) and an
     // outer `ImportedMember`. Both can match the target binding. Track which
     // spans we've already emitted so we don't double-edit.
@@ -332,7 +328,9 @@ fn rename_local(
 /// doesn't lex cleanly to a single ident-or-keyword token.
 fn parse_rename_target(name: &str) -> Option<String> {
     use tree_sitter_generate::nativedsl::lexer::{Lexer, TokenKind};
-    let tokens = Lexer::new(name).tokenize().ok()?;
+    let (documents, id) =
+        crate::analysis::document_map_for_source(std::path::Path::new("/tmp/rename.tsg"), name);
+    let tokens = Lexer::new(documents.document(id)).tokenize().ok()?;
     let [t, eof] = tokens.as_slice() else {
         return None;
     };
@@ -353,7 +351,9 @@ fn parse_rename_target(name: &str) -> Option<String> {
 /// in source requires an `r#` prefix).
 fn name_is_keyword(name: &str) -> bool {
     use tree_sitter_generate::nativedsl::lexer::Lexer;
-    Lexer::new(name)
+    let (documents, id) =
+        crate::analysis::document_map_for_source(std::path::Path::new("/tmp/rename.tsg"), name);
+    Lexer::new(documents.document(id))
         .tokenize()
         .ok()
         .and_then(|tokens| tokens.first().map(|t| t.kind.is_keyword()))

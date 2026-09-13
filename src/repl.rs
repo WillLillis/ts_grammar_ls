@@ -340,10 +340,17 @@ impl ReplCache {
         mut grammar: nativedsl::InputGrammar,
         rule_name: &str,
     ) -> Result<(String, CacheKey), ReplCompileError> {
+        // Names are interned, so resolve `rule_name` to its id once and
+        // compare ids. A name absent from the pool can't match any rule.
+        let target = grammar
+            .pool
+            .strs()
+            .get(rule_name)
+            .ok_or_else(|| ReplCompileError::RuleNotFound(rule_name.to_owned()))?;
         let idx = grammar
             .variables
             .iter()
-            .position(|v| v.name == rule_name)
+            .position(|v| v.name == target)
             .ok_or_else(|| ReplCompileError::RuleNotFound(rule_name.to_owned()))?;
         grammar.variables.swap(0, idx);
 
@@ -358,14 +365,16 @@ impl ReplCache {
         //     means "treat matches of this rule as background between
         //     tokens" - if rule_name is also start, the parser eats
         //     all input as extras and leaves nothing to match.
-        if grammar.word_token.as_deref() == Some(rule_name) {
-            grammar.word_token = None;
+        if grammar.word_name == Some(target) {
+            grammar.word_name = None;
         }
-        grammar.extra_symbols.retain(|r| match r {
-            tree_sitter_generate::rules::Rule::NamedSymbol(n) => n != rule_name,
-            _ => true,
+        grammar.extra_roots.retain(|&r| {
+            !matches!(
+                grammar.pool.node(r),
+                nativedsl::Rule::NamedSymbol(n) if n == target
+            )
         });
-        let grammar = grammar.normalize();
+        let grammar = grammar.normalize(&mut Vec::new());
 
         let json_value = grammar_to_json(&grammar);
         let json = serde_json::to_string(&json_value)
@@ -397,6 +406,7 @@ impl ReplCache {
         &self,
         key: CacheKey,
         grammar_json: String,
+        scanner: Option<PathBuf>,
     ) -> Result<Arc<Language>, ReplCompileError> {
         // Fast path: result already cached, no coordination needed.
         if let Some(lang) = self.entries.lock().await.get(&key) {
@@ -440,6 +450,12 @@ impl ReplCache {
                 source,
             })?;
             run_codegen_subprocess(&dir, &grammar_json).await?;
+        }
+
+        // Outside the `needs_codegen` guard: a warm disk cache from before the
+        // grammar grew a scanner (or from an LSP restart) still needs it.
+        if let Some(scanner) = scanner.as_deref() {
+            sync_scanner(scanner, &src_dir)?;
         }
 
         // Put the compiled `.so` inside this cache entry's own dir so
@@ -502,6 +518,45 @@ async fn run_codegen_subprocess(dir: &Path, grammar_json: &str) -> Result<(), Re
     }
 }
 
+/// Locate a grammar's external-scanner source, if it has one.
+///
+/// Mirrors the tree-sitter CLI's layout: `<grammar_dir>/src/scanner.c`.
+/// Scanners are C only - there's deliberately no `.cc` / `.cpp` fallback.
+/// A grammar that declares `externals:` backed by a custom scanner generates a
+/// `parser.c` referencing `tree_sitter_<lang>_external_scanner_*`, so the
+/// scanner has to be compiled alongside it or the link fails.
+#[must_use]
+pub fn find_scanner(grammar_path: &Path) -> Option<PathBuf> {
+    let scanner = grammar_path.parent()?.join("src").join("scanner.c");
+    scanner.is_file().then_some(scanner)
+}
+
+/// Copy the grammar's scanner into the REPL build dir next to the generated
+/// `parser.c`, so `tree_sitter_loader` picks it up as a sibling source.
+///
+/// Copies only when the destination is missing or older than the source, so a
+/// warm cache doesn't get its mtime bumped on every compile (which would make
+/// the loader relink each time).
+fn sync_scanner(scanner: &Path, src_dir: &Path) -> Result<(), ReplCompileError> {
+    let Some(name) = scanner.file_name() else {
+        return Ok(());
+    };
+    let dest = src_dir.join(name);
+    let stale = match (std::fs::metadata(&dest), std::fs::metadata(scanner)) {
+        (Ok(d), Ok(s)) => match (d.modified(), s.modified()) {
+            (Ok(dm), Ok(sm)) => sm > dm,
+            // Platform without mtime: copy rather than risk a stale scanner.
+            _ => true,
+        },
+        _ => true,
+    };
+    if stale {
+        std::fs::copy(scanner, &dest)
+            .map_err(|source| ReplCompileError::CacheDir { path: dest, source })?;
+    }
+    Ok(())
+}
+
 /// Compile `<src_dir>/parser.c` (and any sibling `scanner.c`) into a
 /// shared library and load it as a `tree_sitter::Language`.
 pub fn load_language(src_dir: &Path, output_path: PathBuf) -> Result<Language, ReplCompileError> {
@@ -513,7 +568,22 @@ pub fn load_language(src_dir: &Path, output_path: PathBuf) -> Result<Language, R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tree_sitter_generate::parse_grammar::parse_grammar;
+
+    /// Build an `InputGrammar` from native-DSL source - the same front end the
+    /// LSP actually runs. `parse_native_dsl` needs a canonicalizable path, so
+    /// the source round-trips through a temp file; the `TempDir` is returned so
+    /// the caller keeps it alive for the duration of the test.
+    ///
+    /// `InputGrammar` is neither `Clone` nor cheap to share, and
+    /// `ReplCache::prepare` consumes it, so a test needing two grammars calls
+    /// this twice.
+    fn dsl_grammar(src: &str) -> (tempfile::TempDir, nativedsl::InputGrammar) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grammar.tsg");
+        std::fs::write(&path, src).unwrap();
+        let grammar = nativedsl::parse_native_dsl(src, &path).expect("grammar parses");
+        (dir, grammar)
+    }
 
     /// Two rules: `start` references `helper` (so both survive the initial
     /// normalize). After swapping `helper` to position 0 and normalizing,
@@ -521,19 +591,16 @@ mod tests {
     /// JSON should differ from the swap-of-start version.
     #[test]
     fn prepare_swaps_target_rule_to_first() {
-        let json = r#"{
-            "name":"tiny",
-            "rules":{
-                "start":{"type":"SYMBOL","name":"helper"},
-                "helper":{"type":"STRING","value":"hi"}
-            }
-        }"#;
-        let grammar = parse_grammar(json).unwrap();
+        let src = r#"grammar { language: "tiny" }
+rule start { helper }
+rule helper { "hi" }
+"#;
+        let (_d1, g1) = dsl_grammar(src);
+        let (_d2, g2) = dsl_grammar(src);
 
-        let (out_json_start, key_start) =
-            ReplCache::prepare(grammar.clone(), "start").expect("start exists");
+        let (out_json_start, key_start) = ReplCache::prepare(g1, "start").expect("start exists");
         let (out_json_helper, key_helper) =
-            ReplCache::prepare(grammar, "helper").expect("helper exists");
+            ReplCache::prepare(g2, "helper").expect("helper exists");
 
         // Distinct rules produce distinct cache keys and distinct JSON.
         assert_ne!(key_start, key_helper);
@@ -547,8 +614,11 @@ mod tests {
 
     #[test]
     fn prepare_rejects_unknown_rule() {
-        let json = r#"{"name":"tiny","rules":{"start":{"type":"STRING","value":"hi"}}}"#;
-        let grammar = parse_grammar(json).unwrap();
+        let (_dir, grammar) = dsl_grammar(
+            r#"grammar { language: "tiny" }
+rule start { "hi" }
+"#,
+        );
         assert!(matches!(
             ReplCache::prepare(grammar, "no_such_rule"),
             Err(ReplCompileError::RuleNotFound(name)) if name == "no_such_rule"
@@ -559,15 +629,15 @@ mod tests {
     fn prepare_strips_word_token_when_used_as_start() {
         // `identifier` is declared as the grammar's `word`. The REPL
         // strips it so codegen accepts the rule as a start.
-        let json = r#"{
-            "name":"tiny",
-            "rules":{
-                "source_file":{"type":"SYMBOL","name":"identifier"},
-                "identifier":{"type":"PATTERN","value":"[a-z]+"}
-            },
-            "word":"identifier"
-        }"#;
-        let grammar = parse_grammar(json).unwrap();
+        let (_dir, grammar) = dsl_grammar(
+            r#"grammar {
+    language: "tiny",
+    word: identifier,
+}
+rule source_file { identifier }
+rule identifier { regexp(r"[a-z]+") }
+"#,
+        );
         let (prepared_json, _) =
             ReplCache::prepare(grammar, "identifier").expect("prepare succeeds");
         assert!(
@@ -581,19 +651,16 @@ mod tests {
         // `comment` is in extras. Picking it as start would make the
         // parser eat all input as extras, leaving the start rule
         // nothing to match. REPL prepare strips it from extras.
-        let json = r#"{
-            "name":"tiny",
-            "rules":{
-                "source_file":{"type":"SYMBOL","name":"word"},
-                "word":{"type":"PATTERN","value":"[a-z]+"},
-                "comment":{"type":"PATTERN","value":"//[^\\n]*"}
-            },
-            "extras":[
-                {"type":"PATTERN","value":"\\s"},
-                {"type":"SYMBOL","name":"comment"}
-            ]
-        }"#;
-        let grammar = parse_grammar(json).unwrap();
+        let (_dir, grammar) = dsl_grammar(
+            r#"grammar {
+    language: "tiny",
+    extras: [regexp(r"\s"), comment],
+}
+rule source_file { ident }
+rule ident { regexp(r"[a-z]+") }
+rule comment { regexp(r"//[^\n]*") }
+"#,
+        );
         let (prepared_json, _) = ReplCache::prepare(grammar, "comment").expect("prepare succeeds");
         // Extras still has the whitespace pattern but not the comment
         // symbol reference.
@@ -610,10 +677,13 @@ mod tests {
     #[test]
     fn prepare_is_deterministic() {
         // Same input → same key + same JSON.
-        let json = r#"{"name":"tiny","rules":{"start":{"type":"STRING","value":"hi"}}}"#;
-        let grammar = parse_grammar(json).unwrap();
-        let (j1, k1) = ReplCache::prepare(grammar.clone(), "start").unwrap();
-        let (j2, k2) = ReplCache::prepare(grammar, "start").unwrap();
+        let src = r#"grammar { language: "tiny" }
+rule start { "hi" }
+"#;
+        let (_d1, g1) = dsl_grammar(src);
+        let (_d2, g2) = dsl_grammar(src);
+        let (j1, k1) = ReplCache::prepare(g1, "start").unwrap();
+        let (j2, k2) = ReplCache::prepare(g2, "start").unwrap();
         assert_eq!(j1, j2);
         assert_eq!(k1, k2);
     }
@@ -629,32 +699,24 @@ mod tests {
         //   - comment is in extras AND defined as a token-wrapped rule.
         //   - comment's regex is escape-aware like the real C grammar.
         //   - source_file is the original start, references everything.
-        let json = r#"{
-            "name":"tinyc",
-            "rules":{
-                "source_file":{"type":"REPEAT","content":{"type":"SYMBOL","name":"statement"}},
-                "statement":{"type":"SEQ","members":[
-                    {"type":"STRING","value":"x"},
-                    {"type":"STRING","value":";"}
-                ]},
-                "comment":{"type":"TOKEN","content":{"type":"CHOICE","members":[
-                    {"type":"SEQ","members":[
-                        {"type":"STRING","value":"//"},
-                        {"type":"PATTERN","value":"(\\\\+(.|\\r?\\n)|[^\\\\\\n])*"}
-                    ]},
-                    {"type":"SEQ","members":[
-                        {"type":"STRING","value":"/*"},
-                        {"type":"PATTERN","value":"[^*]*\\*+([^/*][^*]*\\*+)*"},
-                        {"type":"STRING","value":"/"}
-                    ]}
-                ]}}
-            },
-            "extras":[
-                {"type":"PATTERN","value":"\\s|\\\\\\r?\\n"},
-                {"type":"SYMBOL","name":"comment"}
-            ]
-        }"#;
-        let grammar = parse_grammar(json).unwrap();
+        let (_dir, grammar) = dsl_grammar(
+            r#"grammar {
+    language: "tinyc",
+    extras: [regexp(r"\s|\\\r?\n"), comment],
+}
+
+rule source_file { repeat(statement) }
+
+rule statement { seq("x", ";") }
+
+rule comment {
+    token(choice(
+        seq("//", regexp(r"(\\+(.|\r?\n)|[^\\\n])*")),
+        seq("/*", regexp(r"[^*]*\*+([^/*][^*]*\*+)*"), "/")
+    ))
+}
+"#,
+        );
 
         let (prepared_json, _) = ReplCache::prepare(grammar, "comment").expect("prepare succeeds");
 

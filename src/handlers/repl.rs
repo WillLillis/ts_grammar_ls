@@ -50,7 +50,7 @@ use tower_lsp::lsp_types::{
     ExecuteCommandParams, MessageActionItem, MessageType, Position, ShowDocumentParams, Url,
 };
 
-use crate::document::DefKind;
+use crate::document::{DefKind, Module};
 use crate::repl::{ReplMeta, ReplSession};
 use crate::server::Backend;
 
@@ -146,27 +146,63 @@ fn open_repl(backend: &Backend, params: &ExecuteCommandParams) -> Option<serde_j
     }))
 }
 
+/// A hidden rule (leading `_`) can never be a start rule: codegen rejects it
+/// with `InternSymbolsError::HiddenStartRule`, so the REPL can't compile one.
+fn is_hidden_rule(name: &str) -> bool {
+    name.starts_with('_')
+}
+
+/// First rule in `module` that could legally serve as a start rule.
+fn first_start_candidate(module: &Module) -> Option<String> {
+    module
+        .definitions
+        .as_ref()?
+        .iter()
+        .find(|d| {
+            matches!(d.kind, DefKind::Rule | DefKind::OverrideRule) && !is_hidden_rule(&d.name)
+        })
+        .map(|d| d.name.clone())
+}
+
 /// Cursor-aware rule pick: if `position` falls inside a `rule X { ... }`
-/// declaration in the grammar's analysis, return `X`. Otherwise return
-/// the first `Rule` / `OverrideRule` definition in source order, which
-/// is what `InputGrammar::normalize` treats as the implicit start.
+/// declaration, return `X`. Otherwise fall back to the grammar's implicit
+/// start rule.
+///
+/// The fallback deliberately walks to the root of the inherit chain rather
+/// than using this file's first declaration. `InputGrammar::normalize` treats
+/// `variables[0]` as the implicit start, and variables are ordered base-first,
+/// so for an inheriting grammar the start lives in the *base*. tree-sitter-cpp
+/// is the motivating case: it never declares `translation_unit` (it inherits
+/// it from C), and its own first declaration is `override rule _top_level_item`
+/// - hidden, so codegen refuses it and the REPL used to fail to compile with
+/// nothing but a `warn!` to show for it.
+///
+/// Hidden rules are skipped in both paths for the same reason: picking one
+/// can only ever produce a compile failure.
 fn resolve_default_rule(backend: &Backend, args: &OpenReplArgs) -> Option<String> {
     let analysis = backend.get_analysis(&args.uri)?;
-    let defs = analysis.definitions.as_ref()?;
 
-    if let Some(pos) = args.position {
-        let offset = crate::text::position_to_offset(&analysis.rope, pos)?;
-        if let Some(def) = defs.iter().find(|d| {
-            matches!(d.kind, DefKind::Rule | DefKind::OverrideRule)
-                && d.full_span.start <= offset
-                && offset < d.full_span.end
-        }) {
-            return Some(def.name.clone());
-        }
+    if let Some(pos) = args.position
+        && let Some(offset) = crate::text::position_to_offset(&analysis.rope, pos)
+        && let Some(def) = analysis.definitions.as_ref().and_then(|defs| {
+            defs.iter().find(|d| {
+                matches!(d.kind, DefKind::Rule | DefKind::OverrideRule)
+                    && d.full_span.start <= offset
+                    && offset < d.full_span.end
+            })
+        })
+        && !is_hidden_rule(&def.name)
+    {
+        return Some(def.name.clone());
     }
-    defs.iter()
-        .find(|d| matches!(d.kind, DefKind::Rule | DefKind::OverrideRule))
-        .map(|d| d.name.clone())
+
+    // Root of the inherit chain first (that's where `variables[0]` comes
+    // from), then this file as a fallback for non-inheriting grammars.
+    let mut root = &*analysis;
+    while let Some(base) = root.base_module.as_deref() {
+        root = base;
+    }
+    first_start_candidate(root).or_else(|| first_start_candidate(&analysis))
 }
 
 /// Stable input-buffer URI for a given grammar URI. Hashing the
@@ -501,6 +537,15 @@ fn spawn_compile(backend: &Backend, input_uri: crate::repl::ReplInputUri) {
     };
     let (json, key) = prepared;
 
+    // A grammar with `externals:` backed by a custom scanner generates a
+    // `parser.c` that references `tree_sitter_<lang>_external_scanner_*`.
+    // Those symbols live in the grammar's own `src/scanner.c`, which the
+    // REPL's generated build dir doesn't otherwise contain.
+    let scanner = grammar_uri
+        .to_file_path()
+        .ok()
+        .and_then(|p| crate::repl::find_scanner(&p));
+
     // Compare against last_key. If the session was just recompiled for
     // the same key (e.g. concurrent did_change events arrived), skip.
     {
@@ -516,7 +561,7 @@ fn spawn_compile(backend: &Backend, input_uri: crate::repl::ReplInputUri) {
     let client = backend.client.clone();
     tokio::spawn(async move {
         tracing::info!("repl: compile start key={key}");
-        match cache.get_or_compile(key.clone(), json).await {
+        match cache.get_or_compile(key.clone(), json, scanner).await {
             Ok(language) => {
                 tracing::info!("repl: compile done key={key}");
                 // Stash the freshly compiled language on the session
@@ -542,6 +587,17 @@ fn spawn_compile(backend: &Backend, input_uri: crate::repl::ReplInputUri) {
             }
             Err(e) => {
                 tracing::warn!("repl: compile failed: {e}");
+                // Surface it on the input buffer too. A compile failure is
+                // otherwise completely silent: the REPL just sits there with
+                // a stale (or empty) tree and no indication why, which is
+                // exactly what made the hidden-start-rule case so hard to
+                // diagnose.
+                publish_repl_error(
+                    &client,
+                    &input_uri,
+                    &format!("REPL failed to build a parser for rule `{rule_name}`: {e}"),
+                )
+                .await;
             }
         }
     });
@@ -663,6 +719,30 @@ async fn update_tree_buffer(
             document_changes: None,
             change_annotations: None,
         })
+        .await;
+}
+
+/// Report a REPL-level failure (compile, codegen) on the input buffer itself.
+/// Anchored at the top of the buffer since the fault is in the grammar/rule
+/// selection, not in anything the user typed here.
+async fn publish_repl_error(
+    client: &tower_lsp::Client,
+    input_uri: &crate::repl::ReplInputUri,
+    message: &str,
+) {
+    let zero = tower_lsp::lsp_types::Position::new(0, 0);
+    client
+        .publish_diagnostics(
+            input_uri.as_url().clone(),
+            vec![tower_lsp::lsp_types::Diagnostic {
+                range: tower_lsp::lsp_types::Range::new(zero, zero),
+                severity: Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+                source: Some("ts_grammar_ls".into()),
+                message: message.to_owned(),
+                ..Default::default()
+            }],
+            None,
+        )
         .await;
 }
 

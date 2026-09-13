@@ -17,6 +17,10 @@ enum Commands {
     GenerateCheck(GenerateCheck),
     /// Format one or more .tsg files.
     Format(Format),
+    /// Run lints against a grammar file (or grammar.tsg in a directory).
+    /// Helpers reached through inherit / import are linted via the same
+    /// pass - no need to list them separately.
+    Lint(Lint),
 }
 
 #[derive(Args)]
@@ -27,6 +31,18 @@ struct GenerateCheck {
     /// compile pipeline without a second subprocess hop.
     #[arg(long)]
     write_to: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct Lint {
+    /// Grammar file to lint, or a directory containing `grammar.tsg`.
+    path: PathBuf,
+    /// Disable a lint by name (e.g. `alias-over-supertype`). Repeatable.
+    #[arg(long, value_name = "NAME")]
+    allow: Vec<String>,
+    /// Apply each finding's suggested fix in place, rewriting the file.
+    #[arg(long)]
+    fix: bool,
 }
 
 #[derive(Args)]
@@ -61,6 +77,13 @@ async fn main() {
                     &fmt.paths,
                     fmt.check,
                     fmt.config.as_deref(),
+                ));
+            }
+            Commands::Lint(args) => {
+                std::process::exit(ts_grammar_ls::cli::lint::run(
+                    &args.path,
+                    &args.allow,
+                    args.fix,
                 ));
             }
         }

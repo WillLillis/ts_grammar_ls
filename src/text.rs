@@ -2,11 +2,15 @@ use ropey::Rope;
 use tower_lsp::lsp_types::{Position, Range};
 use tree_sitter_generate::nativedsl::ast::Span;
 
-/// User-writable DSL type names. Mirrors the set the core parser accepts in
-/// `parse_type` (`rule_t`, `str_t`, `int_t`, `module_t`, plus the generic
-/// `list_t<...>` and `obj_t<...>`). Used by semantic-token classification and
-/// completion to flag identifiers that name a DSL type.
-pub const DSL_TYPE_NAMES: &[&str] = &["rule_t", "str_t", "int_t", "module_t", "list_t", "obj_t"];
+/// User-writable DSL type names.
+///
+/// Mirrors the set the core parser accepts in `parse_type` (`rule_t`, `str_t`,
+/// `int_t`, `module_t`, plus the generic `list_t<...>`, `obj_t<...>`, and
+/// `tuple_t<...>`). Used by semantic-token classification and completion to
+/// flag identifiers that name a DSL type.
+pub const DSL_TYPE_NAMES: &[&str] = &[
+    "rule_t", "str_t", "int_t", "module_t", "list_t", "obj_t", "tuple_t",
+];
 
 /// Convert a byte offset to an LSP `Position`.
 #[must_use]
@@ -111,6 +115,67 @@ pub fn word_at_offset(text: &str, offset: u32) -> Option<&str> {
     if word.is_empty() { None } else { Some(word) }
 }
 
+/// Span of the `index`-th identifier at or after `from`, skipping whitespace
+/// and `//` line comments between words.
+///
+/// `Node::Rule`, `Node::Let`, and `Node::Forward` intern their name as a
+/// `StrId` and keep only the *declaration's* span, so the name's own span is
+/// not recoverable from the AST. Every one of those forms is
+/// `<keyword..> <name>`, and only keywords, whitespace, and comments can
+/// precede the name -- so counting identifiers from the declaration start
+/// lands on it exactly. Callers pass the number of leading keywords as
+/// `index` (`let x` / `expect x` -> 1, `rule x` -> 1, `override rule x` -> 2).
+///
+/// A leading `r#` is skipped so the returned span covers just the bare name,
+/// matching what the lexer spans for a raw identifier.
+#[must_use]
+pub fn nth_ident_span(source: &str, from: u32, index: usize) -> Option<Span> {
+    let bytes = source.as_bytes();
+    let is_start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
+    let is_continue = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut pos = from as usize;
+    let mut seen = 0usize;
+
+    loop {
+        // Whitespace and `//` comments can repeat in any order before a word.
+        loop {
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            if pos + 1 < bytes.len() && bytes[pos] == b'/' && bytes[pos + 1] == b'/' {
+                pos += 2;
+                while pos < bytes.len() && bytes[pos] != b'\n' {
+                    pos += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        if pos >= bytes.len() {
+            return None;
+        }
+        // `r#name`: the lexer spans only the bare name, so start past `r#`.
+        if bytes[pos] == b'r'
+            && pos + 2 < bytes.len()
+            && bytes[pos + 1] == b'#'
+            && is_start(bytes[pos + 2])
+        {
+            pos += 2;
+        }
+        if !is_start(bytes[pos]) {
+            return None;
+        }
+        let start = pos;
+        while pos < bytes.len() && is_continue(bytes[pos]) {
+            pos += 1;
+        }
+        if seen == index {
+            return Some(Span::from_usize(start, pos));
+        }
+        seen += 1;
+    }
+}
+
 /// Check if the identifier at `offset` is a grammar config field
 /// (inside the grammar block span and followed by `:`).
 #[must_use]
@@ -190,7 +255,7 @@ pub fn at_grammar_config_field_arg(
     while i > 0 {
         i -= 1;
         match tokens[i].kind {
-            TokenKind::Ident | TokenKind::Comment => {}
+            TokenKind::Ident => {}
             TokenKind::Comma => saw_comma = true,
             TokenKind::LParen => {
                 return saw_comma && i > 0 && tokens[i - 1].kind == TokenKind::KwGrammarConfig;
@@ -254,7 +319,7 @@ pub fn at_cfg_flag_arg(
     while i > 0 {
         i -= 1;
         match tokens[i].kind {
-            TokenKind::Ident | TokenKind::Comment => {}
+            TokenKind::Ident => {}
             TokenKind::LParen => {
                 if i < 3 {
                     return false;
@@ -333,10 +398,7 @@ mod tests {
             Some(line1_offset)
         );
         // The byte after the only real `\n` (== '2') must report at (1, 0).
-        assert_eq!(
-            offset_to_position(&rope, line1_offset),
-            Position::new(1, 0)
-        );
+        assert_eq!(offset_to_position(&rope, line1_offset), Position::new(1, 0));
         // And the line count itself: 3 ropey "lines" (2 LF + EOF empty).
         assert_eq!(rope.len_lines(), 3);
     }
@@ -347,10 +409,7 @@ mod tests {
         let rope = Rope::from_str(text);
         // 'b' starts at byte 3 (after "a\r\n") and should be at (1, 0).
         let b_offset = text.find('b').unwrap() as u32;
-        assert_eq!(
-            offset_to_position(&rope, b_offset),
-            Position::new(1, 0)
-        );
+        assert_eq!(offset_to_position(&rope, b_offset), Position::new(1, 0));
         assert_eq!(
             position_to_offset(&rope, Position::new(1, 0)),
             Some(b_offset)
@@ -382,7 +441,11 @@ mod tests {
     }
 
     fn lex(source: &str) -> Vec<tree_sitter_generate::nativedsl::lexer::Token> {
-        tree_sitter_generate::nativedsl::lexer::Lexer::new(source)
+        let (documents, id) = crate::analysis::document_map_for_source(
+            std::path::Path::new("/tmp/text-test.tsg"),
+            source,
+        );
+        tree_sitter_generate::nativedsl::lexer::Lexer::new(documents.document(id))
             .tokenize()
             .unwrap()
     }
@@ -463,5 +526,63 @@ mod tests {
 
         let foo_offset = source.find("foo").unwrap() as u32;
         assert_eq!(qualified_access_module(&tokens, source, foo_offset), None);
+    }
+
+    /// Resolve `nth_ident_span` to its text so the cases below read as
+    /// "which identifier does index N land on".
+    fn nth_ident<'s>(source: &'s str, index: usize) -> Option<&'s str> {
+        let s = nth_ident_span(source, 0, index)?;
+        Some(&source[s.start as usize..s.end as usize])
+    }
+
+    /// The declaration forms whose name span the AST no longer carries. The
+    /// index is the count of leading keywords, so these pin the contract
+    /// `analysis::decl_name_span` relies on.
+    #[test]
+    fn nth_ident_span_declaration_forms() {
+        assert_eq!(nth_ident("rule foo { \"x\" }", 1), Some("foo"));
+        assert_eq!(nth_ident("override rule foo { \"x\" }", 2), Some("foo"));
+        assert_eq!(nth_ident("let foo = 1", 1), Some("foo"));
+        assert_eq!(nth_ident("expect foo", 1), Some("foo"));
+    }
+
+    /// A comment may sit between the keyword and the name; it's skipped like
+    /// whitespace rather than counted as a word.
+    #[test]
+    fn nth_ident_span_skips_comments_before_the_name() {
+        assert_eq!(nth_ident("rule // note\n foo { \"x\" }", 1), Some("foo"));
+        assert_eq!(
+            nth_ident("override // a\n rule // b\n foo { \"x\" }", 2),
+            Some("foo"),
+        );
+    }
+
+    /// A raw identifier's span covers only the bare name, matching what the
+    /// lexer emits for `r#let` (it advances past `r#` and resets the start).
+    #[test]
+    fn nth_ident_span_raw_identifier_excludes_prefix() {
+        assert_eq!(nth_ident("rule r#let { \"x\" }", 1), Some("let"));
+        // A bare `r` is an ordinary identifier, not a raw-ident prefix.
+        assert_eq!(nth_ident("rule r { \"x\" }", 1), Some("r"));
+    }
+
+    /// Keywords are legal names (`expect_ident_or_kw` accepts them), so the
+    /// scan must count words positionally rather than looking for a
+    /// non-keyword.
+    #[test]
+    fn nth_ident_span_keyword_as_name() {
+        assert_eq!(nth_ident("rule rule { \"x\" }", 1), Some("rule"));
+        assert_eq!(nth_ident("let let = 1", 1), Some("let"));
+    }
+
+    /// Running off the end yields `None` so callers fall back to the
+    /// declaration span rather than indexing past the buffer.
+    #[test]
+    fn nth_ident_span_out_of_range() {
+        assert_eq!(nth_ident("rule foo { \"x\" }", 9), None);
+        assert_eq!(nth_ident("rule", 1), None);
+        assert_eq!(nth_ident("", 0), None);
+        // Punctuation where a name should be: no identifier to land on.
+        assert_eq!(nth_ident("rule { \"x\" }", 1), None);
     }
 }

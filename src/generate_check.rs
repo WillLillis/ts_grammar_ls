@@ -4,7 +4,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tree_sitter_generate::{
-    ALLOC_HEADER, ARRAY_HEADER, PARSER_HEADER, generate_parser_for_grammar,
+    ALLOC_HEADER, ARRAY_HEADER, OptLevel, PARSER_HEADER, generate_parser_for_grammar,
 };
 
 /// Run the upstream codegen pipeline on `grammar_json` and lay out the
@@ -24,7 +24,8 @@ use tree_sitter_generate::{
 /// (`Codegen`) or an IO failure on the artifact writes (`Io`).
 pub fn generate_to_dir(dir: &Path, grammar_json: &str) -> Result<(), GenerateToDirError> {
     let (_name, parser_c) =
-        generate_parser_for_grammar(grammar_json, None).map_err(GenerateToDirError::Codegen)?;
+        generate_parser_for_grammar(grammar_json, None, OptLevel::default(), &mut Vec::new())
+            .map_err(GenerateToDirError::Codegen)?;
     let src = dir.join("src");
     let headers = src.join("tree_sitter");
     std::fs::create_dir_all(&headers)
@@ -89,17 +90,37 @@ pub fn run(write_to: Option<&Path>) {
     let mut json = String::new();
     std::io::stdin().read_to_string(&mut json).unwrap();
 
-    let result = match write_to {
-        Some(dir) => generate_to_dir(dir, &json),
-        // Validation-only path: still produce artifacts (cheap) but throw
-        // them away. Routes through the same error surface.
-        None => generate_parser_for_grammar(&json, None)
-            .map(|_| ())
-            .map_err(GenerateToDirError::Codegen),
-    };
+    // REPL artifact path: warnings aren't consumed here, so keep the simple
+    // error-or-success contract (raw error JSON on failure).
+    if let Some(dir) = write_to {
+        if let Err(e) = generate_to_dir(dir, &json) {
+            println!("{}", serde_json::to_string(&e).unwrap());
+            std::process::exit(1);
+        }
+        return;
+    }
 
-    if let Err(e) = result {
-        println!("{}", serde_json::to_string(&e).unwrap());
+    // Validation path (the live server's generate-check). Always emit the
+    // structured envelope so success-path warnings - e.g. unnecessary
+    // conflicts - reach the parent, which can't recompute them itself.
+    let mut diagnostics = Vec::new();
+    let error = generate_parser_for_grammar(&json, None, OptLevel::default(), &mut diagnostics)
+        .err()
+        .map(GenerateToDirError::Codegen);
+    let failed = error.is_some();
+    let output = GenerateCheckOutput { diagnostics, error };
+    println!("{}", serde_json::to_string(&output).unwrap());
+    if failed {
         std::process::exit(1);
     }
+}
+
+/// One-line JSON the validation-path `generate-check` subprocess prints.
+///
+/// Carries codegen diagnostics (warnings like unnecessary conflicts, surfaced
+/// even on success) plus the fatal error, if any.
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct GenerateCheckOutput {
+    pub diagnostics: Vec<tree_sitter_generate::Diagnostic>,
+    pub error: Option<GenerateToDirError>,
 }

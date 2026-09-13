@@ -316,7 +316,7 @@ for (<bindings>) in <iterable> { <body> }
 Iterate over a list of tuples, producing a `choice` of the body for each \
 element.
 ```
-let ops: list_rule_t = [(\"&&\", 2), (\"||\", 1)]
+let ops: list_t<tuple_t<str_t, int_t>> = [(\"&&\", 2), (\"||\", 1)]
 rule binary_expr {
     choice(for (op: str_t, p: int_t) in ops {
         prec_left(p, seq(_expression, op, _expression))
@@ -461,8 +461,8 @@ pub const TYPE_LIST_T: &str = "\
 list_t<T>
 ```
 A list with elements of type `T`. The element type is required: `list_t<rule_t>`, \
-`list_t<str_t>`, `list_t<int_t>`, or `list_t<list_t<X>>` (triple nesting is \
-rejected at parse time).";
+`list_t<str_t>`, `list_t<int_t>`, `list_t<tuple_t<...>>`, or `list_t<list_t<X>>` \
+(triple nesting is rejected at parse time).";
 
 pub const TYPE_OBJ_T: &str = "\
 ```
@@ -471,6 +471,16 @@ obj_t<T>
 An object literal with values of type `T`. The element type is required and \
 must be non-Object (`obj_t<obj_t<X>>` is structurally impossible). Typically \
 indexed via `obj.field` access.";
+
+pub const TYPE_TUPLE_T: &str = "\
+```
+tuple_t<A, B, ...>
+```
+A fixed-arity bundle of scalar values (`rule_t` / `str_t` / `int_t`), e.g. \
+`tuple_t<str_t, int_t>`. Arity is 2 to 4 - there is no grouping operator, so \
+`(a)` is not a tuple. Used as the element type of a for-loop iterable: a \
+`list_t<tuple_t<...>>` is destructured by a multi-binding `for`. Tuples also \
+nest in lists and objects (`list_t<tuple_t<...>>`, `obj_t<tuple_t<...>>`).";
 
 // ---------------------------------------------------------------------------
 // Lookup
@@ -530,6 +540,7 @@ pub fn builtin_hover(name: &str) -> Option<&'static str> {
         "module_t" => TYPE_MODULE_T,
         "list_t" => TYPE_LIST_T,
         "obj_t" => TYPE_OBJ_T,
+        "tuple_t" => TYPE_TUPLE_T,
         _ => return None,
     })
 }

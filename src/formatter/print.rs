@@ -6,15 +6,13 @@
 
 use super::doc::{DocArena, DocId, DocNode};
 
-/// Project-wide default indent (matches `FormattingConfig::default()`).
-pub const DEFAULT_INDENT_WIDTH: usize = 4;
-/// Project-wide default line budget (matches `FormattingConfig::default()`).
-pub const DEFAULT_MAX_WIDTH: usize = 100;
+#[cfg(test)]
+const DEFAULT_INDENT_WIDTH: usize = 4;
+#[cfg(test)]
+const DEFAULT_MAX_WIDTH: usize = 100;
 
-/// Render a Doc using the default indent (4) and width (100). Convenient
-/// for tests and one-off uses where the caller doesn't need custom layout.
-#[must_use]
-pub fn render(arena: &DocArena, root: DocId) -> String {
+#[cfg(test)]
+fn render(arena: &DocArena, root: DocId) -> String {
     render_with_opts(arena, root, DEFAULT_INDENT_WIDTH, DEFAULT_MAX_WIDTH)
 }
 
@@ -147,9 +145,7 @@ impl RenderState<'_> {
     /// remaining line budget, emit a space; otherwise emit a newline.
     fn emit_packed(&mut self, id: DocId) {
         let children: Vec<DocId> = match self.arena.get(id) {
-            DocNode::Concat { start, len } => {
-                self.arena.concat_children(*start, *len).to_vec()
-            }
+            DocNode::Concat { start, len } => self.arena.concat_children(*start, *len).to_vec(),
             _ => vec![id],
         };
         let mut i = 0;

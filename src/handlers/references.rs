@@ -96,7 +96,13 @@ fn bare_name_external_references(
     }
 
     // Cursor file + open dependents.
-    add_bare_name_refs_in_file(&mut locations, cursor_uri, cursor_analysis, target_path, word);
+    add_bare_name_refs_in_file(
+        &mut locations,
+        cursor_uri,
+        cursor_analysis,
+        target_path,
+        word,
+    );
     let dep_uris: Vec<Url> = backend
         .dependents
         .get(target_path)
@@ -104,13 +110,7 @@ fn bare_name_external_references(
         .unwrap_or_default();
     for dep_uri in dep_uris {
         if let Some(dep_analysis) = backend.analysis_for_uri(&dep_uri) {
-            add_bare_name_refs_in_file(
-                &mut locations,
-                &dep_uri,
-                &dep_analysis,
-                target_path,
-                word,
-            );
+            add_bare_name_refs_in_file(&mut locations, &dep_uri, &dep_analysis, target_path, word);
         }
     }
 

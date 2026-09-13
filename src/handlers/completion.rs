@@ -49,9 +49,16 @@ const TYPE_KEYWORDS: &[(&str, &str)] = &[
     ("rule_t", "Rule expression type"),
     ("str_t", "String type"),
     ("int_t", "Integer type"),
-    ("module_t", "Any module reference (import or inherit result)"),
+    (
+        "module_t",
+        "Any module reference (import or inherit result)",
+    ),
     ("list_t", "Generic list type, e.g. list_t<rule_t>"),
     ("obj_t", "Generic object type, e.g. obj_t<list_t<rule_t>>"),
+    (
+        "tuple_t",
+        "Fixed-arity tuple of scalars, e.g. tuple_t<str_t, int_t>",
+    ),
 ];
 
 /// Grammar config fields with their types, matching the typecheck module's field access.
@@ -83,9 +90,13 @@ pub fn completion(backend: &Backend, params: &CompletionParams) -> Option<Comple
         (doc.text.clone(), offset)
     };
     let analysis = backend.get_analysis(uri)?;
-    let current_tokens = tree_sitter_generate::nativedsl::lexer::Lexer::new(&source)
-        .tokenize()
-        .ok();
+    let current_tokens = crate::analysis::uri_to_grammar_path(uri)
+        .map(|path| crate::analysis::document_map_for_source(&path, &source))
+        .and_then(|(documents, id)| {
+            tree_sitter_generate::nativedsl::lexer::Lexer::new(documents.document(id))
+                .tokenize()
+                .ok()
+        });
     let tokens = current_tokens.as_deref().unwrap_or_default();
 
     // Find the token just before the cursor position.
@@ -199,9 +210,9 @@ fn qualified_member_item(d: &Definition, module_name: &str) -> Option<Completion
             CompletionItemKind::MODULE,
             format!("{} {} ({module_name})", d.kind.label(), d.name),
         ),
-        DefKind::External => (
+        DefKind::Forward => (
             CompletionItemKind::CLASS,
-            format!("external {} ({module_name})", d.name),
+            format!("expect {} ({module_name})", d.name),
         ),
         DefKind::ObjectKey { .. } | DefKind::Parameter { .. } => return None,
     };
@@ -271,7 +282,7 @@ fn global_def_item(def: &Definition) -> Option<CompletionItem> {
         }
         DefKind::Function { signature } => (CompletionItemKind::FUNCTION, signature.clone()),
         DefKind::Let { .. } => (CompletionItemKind::VARIABLE, format!("let {}", def.name)),
-        DefKind::External => (CompletionItemKind::CLASS, format!("external {}", def.name)),
+        DefKind::Forward => (CompletionItemKind::CLASS, format!("expect {}", def.name)),
         DefKind::Import
         | DefKind::Inherit
         | DefKind::ObjectKey { .. }
@@ -350,8 +361,7 @@ fn complete_object_field_from_tokens(
                                 .get(j + 1)
                                 .is_some_and(|t| t.kind == TokenKind::Colon) =>
                     {
-                        let key =
-                            &text[tokens[j].span.start as usize..tokens[j].span.end as usize];
+                        let key = &text[tokens[j].span.start as usize..tokens[j].span.end as usize];
                         items.push(CompletionItem {
                             label: key.into(),
                             kind: Some(CompletionItemKind::FIELD),
@@ -377,7 +387,12 @@ fn cfg_flag_items(flags: &[crate::document::CfgFlag]) -> Vec<CompletionItem> {
             label: f.name.clone(),
             kind: Some(CompletionItemKind::CONSTANT),
             detail: Some(
-                if f.enabled { "cfg flag (enabled)" } else { "cfg flag (disabled)" }.into(),
+                if f.enabled {
+                    "cfg flag (enabled)"
+                } else {
+                    "cfg flag (disabled)"
+                }
+                .into(),
             ),
             ..Default::default()
         })
